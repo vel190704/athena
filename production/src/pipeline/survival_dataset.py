@@ -1,11 +1,10 @@
-"""Tensor plumbing for survival-analysis training data (Module 7 prep).
+"""Tensor plumbing for DeepHit survival-analysis training data (Module 7 prep).
 
-Scope note: this module only transforms an ALREADY-COMPUTED tabular
-(features, duration, event) possession-level dataset into PyTorch tensors
-for a DataLoader. It does NOT derive duration/event from raw StatsBomb
-event chains (walking a possession forward to find its terminating shot or
-turnover/out-of-bounds) -- that possession-chain labeling logic is a
-distinct, harder problem deferred to a follow-up milestone.
+Scope note: this module transforms an ALREADY-COMPUTED possession-chain
+dataset -- features (Milestone 3) + chain dicts (Milestone 5's
+build_possession_chains) -- into discretized-time PyTorch tensors for a
+DataLoader. It does not derive duration/event/censor_reason itself; that
+possession-chain labeling logic lives in chain_builder.py.
 """
 
 import torch
@@ -21,28 +20,75 @@ FEATURE_KEYS = (
     "space_behind_defending_line",
 )
 
+# DeepHit (ADR-001) requires discretizing time into fixed-width bins. A
+# 60-second horizon in 5-second bins gives 12 bins. These are tunable
+# hyperparameters to be validated against real possession-duration
+# statistics in a later milestone, not derived constants.
+MAX_DURATION_SECONDS = 60.0
+BIN_SIZE_SECONDS = 5.0
+NUM_BINS = int(MAX_DURATION_SECONDS // BIN_SIZE_SECONDS)  # 12
+
 
 class TacticalSurvivalDataset(Dataset):
-    """Wraps precomputed (features, duration, event) possession-level data.
+    """Wraps (features, chain) possession-level pairs into discretized-time
+    DeepHit training tensors.
 
-    `durations` and `events` are assumed already derived upstream (e.g. by
-    walking possession chains to their terminating shot or turnover -- not
-    implemented here); this class only performs the list-of-dicts /
-    list-of-scalars -> tensor conversion needed to feed a DataLoader.
+    `features` and `chains` are two parallel, same-order, same-length
+    lists: the i-th feature dict corresponds to the i-th chain dict (the
+    output of production/src/pipeline/chain_builder.py:build_possession_chains).
     """
 
-    def __init__(self, features: list[dict], durations, events):
-        if not (len(features) == len(durations) == len(events)):
+    def __init__(self, features: list[dict], chains: list[dict]):
+        if len(features) != len(chains):
             raise ValueError(
-                f"features ({len(features)}), durations ({len(durations)}), and "
-                f"events ({len(events)}) must all have equal length"
+                f"features ({len(features)}) and chains ({len(chains)}) must have equal length"
             )
+
+        self.features = features
+
+        durations = []
+        event_flags = []
+        horizon_censored_count = 0
+
+        for chain in chains:
+            # Milestone 5 found real chains with duration_seconds == 0 (a
+            # legitimate consequence of StatsBomb's 1-second minute/second
+            # timestamp resolution for very fast phases, not a bug). Floor
+            # to a tiny positive epsilon BEFORE validation so those chains
+            # remain usable instead of being rejected outright.
+            raw_duration = max(1.0, chain["duration_seconds"])
+
+            event_flag = chain["event_flag"]
+            # Horizon-censoring: the model only reasons within
+            # MAX_DURATION_SECONDS (NUM_BINS bins). A chain whose real
+            # duration exceeds that horizon cannot be credited with an
+            # observed event even if `event_flag` says a shot occurred,
+            # because the model is never shown a time bin past the
+            # horizon to place that probability mass on. This is a
+            # deliberate modeling decision, not an incidental clamp: such
+            # samples are treated as right-censored at the horizon, same
+            # as any other administrative censoring reason.
+            if raw_duration >= MAX_DURATION_SECONDS:
+                if event_flag == 1:
+                    horizon_censored_count += 1
+                event_flag = 0
+
+            durations.append(raw_duration)
+            event_flags.append(event_flag)
+
+        if horizon_censored_count > 0:
+            print(
+                f"[TacticalSurvivalDataset] {horizon_censored_count} of {len(chains)} chains "
+                f"had a real shot beyond the {MAX_DURATION_SECONDS}s horizon; event_flag "
+                "forced to 0 (horizon-censored)."
+            )
+
         if any(d <= 0 for d in durations):
             raise ValueError("all durations must be > 0")
 
-        self.features = features
         self.durations = durations
-        self.events = events
+        self.events = event_flags
+        self.duration_bins = [min(int(d // BIN_SIZE_SECONDS), NUM_BINS - 1) for d in durations]
 
     def __len__(self) -> int:
         return len(self.features)
@@ -53,10 +99,7 @@ class TacticalSurvivalDataset(Dataset):
             [feature_dict[key] for key in FEATURE_KEYS], dtype=torch.float32
         )  # [num_features]
 
-        # 0-dimensional scalar tensors: the standard convention for most
-        # survival-analysis libraries (including pycox's DeepHit), which
-        # this project is expected to eventually use.
-        duration_tensor = torch.tensor(self.durations[idx], dtype=torch.float32)
+        duration_bin_tensor = torch.tensor(self.duration_bins[idx], dtype=torch.long)
         event_tensor = torch.tensor(self.events[idx], dtype=torch.float32)
 
-        return features_tensor, duration_tensor, event_tensor
+        return features_tensor, duration_bin_tensor, event_tensor
