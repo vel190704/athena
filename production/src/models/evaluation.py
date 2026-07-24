@@ -1,11 +1,14 @@
 """Time-dependent Brier Score evaluation for the single-risk DeepHit model
-(Milestone 7).
+(Milestone 7), and single-sample cumulative incidence prediction for the
+counterfactual simulator (Milestone 13).
 
 Uses the SAME inclusive-cumsum survival convention as DeepHitLoss:
 S(t) = 1 - cumsum(PMF up to and including bin t).
 """
 
 import torch
+
+from production.src.pipeline.survival_dataset import FEATURE_KEYS
 
 
 def calculate_brier_score(
@@ -82,3 +85,42 @@ def calculate_brier_score(
         return float("nan"), num_excluded  # every sample was censored at/before time_bin
 
     return included_sq_err.mean().item(), num_excluded
+
+
+def predict_cumulative_incidence(
+    model: torch.nn.Module,
+    features_dict: dict,
+    normalization_mean: torch.Tensor,
+    normalization_std: torch.Tensor,
+    time_bin: int = 3,
+) -> float:
+    """Cumulative incidence -- 1 - S(time_bin) -- for a single feature dict,
+    under a trained single-risk DeepHit model.
+
+    Named for what it actually computes: the cumulative incidence (CDF) of
+    the event occurring by `time_bin`, NOT "hazard," which technically
+    refers to the instantaneous hazard rate -- a different quantity DeepHit
+    doesn't directly output. Keep this naming distinction in any code or
+    printed output that consumes this function.
+
+    Applies the SAME normalization convention used at training time --
+    `(x - normalization_mean) / normalization_std` -- using TRAINING-split-
+    derived stats the caller passes in. This function does NOT recompute
+    normalization statistics from the single sample given here; doing so
+    would be statistically meaningless (a single point has no spread) and
+    would silently diverge from the scale the model was actually trained on.
+    """
+    features_tensor = torch.tensor(
+        [features_dict[key] for key in FEATURE_KEYS], dtype=torch.float32
+    ).unsqueeze(0)  # [1, num_features]
+
+    normalized_features = (features_tensor - normalization_mean) / normalization_std
+
+    model.eval()
+    with torch.no_grad():
+        predictions = model(normalized_features)  # [1, num_bins] PMF
+
+    survival = 1.0 - torch.cumsum(predictions, dim=1)  # same convention as DeepHitLoss/Brier
+    survival_at_t = survival[0, time_bin].item()
+
+    return 1.0 - survival_at_t
