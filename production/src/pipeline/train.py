@@ -1,19 +1,25 @@
-"""Milestone 7/8: end-to-end DeepHit training, baseline validation, and
-MLflow experiment tracking.
+"""Milestone 7/8/9/10: end-to-end DeepHit training, baseline validation,
+MLflow experiment tracking, dataset scaling, and (per ADR-009) NO
+direction/coordinate transformation.
 
-Fetches multiple real StatsBomb matches, extracts spatial features
-(Milestone 3) and possession-chain survival labels (Milestone 5), trains
-the single-risk DeepHit model (Milestone 6A/6B) on the aggregate, evaluates
-with a time-dependent Brier Score (Milestone 7 Step 1), and logs the whole
-run -- params, metrics, model, and normalization stats -- to MLflow
-(Milestone 8) so a future run can be meaningfully compared against this
-baseline.
+Fetches real StatsBomb matches via a competition-wide batch pull (Milestone
+9, scaled up from 5 hardcoded matches), extracts spatial features
+(Milestone 3, both periods -- ADR-009 found StatsBomb's raw coordinates are
+already oriented relative to the acting team's own attacking-left-to-right
+perspective, so no flip is applied) and possession-chain survival labels
+(Milestone 5, both periods as of Milestone 9), trains the single-risk
+DeepHit model (Milestone 6A/6B) on the aggregate, evaluates with a
+time-dependent Brier Score (Milestone 7 Step 1), and logs the whole run --
+params, metrics, model, and normalization stats -- to MLflow (Milestone 8)
+so this run can be compared against the Milestone 9 baseline and the
+Milestone 10 forced-flip run that ADR-009 supersedes.
 
 Run as: python -m production.src.pipeline.train
 Then:   mlflow ui   (from the project root, to inspect results visually)
 
 No hyperparameter tuning (Optuna, etc.) here -- this is passive, reproducible
-logging of the current baseline.
+logging of the effect of more data and correctly-handled coordinates on the
+existing baseline MLP.
 """
 
 import json
@@ -36,6 +42,7 @@ import torch
 from torch.utils.data import DataLoader, random_split
 
 from production.src.ingestion.statsbomb_io import (
+    batch_extract_valid_matches,
     fetch_match_360,
     fetch_match_events,
     parse_360_frame,
@@ -55,21 +62,20 @@ from production.src.spatial.control import BiomechanicalPitchControl
 
 MLFLOW_EXPERIMENT_NAME = "project-athena-deephit"
 
-# Real StatsBomb open-data World Cup 2022 match IDs, tried in order until
-# NUM_MATCHES_NEEDED valid ones (both events AND 360 data present) are
-# collected -- mirrors Milestone 3's find_valid_match_id verification
-# rather than assuming any fixed subset works.
-CANDIDATE_MATCH_IDS = [
-    3857276,  # Canada vs Morocco
-    3857271,  # England vs Iran
-    3857296,  # Croatia vs Belgium
-    3857274,  # Netherlands vs Ecuador
-    3857255,  # Japan vs Spain
-    3857272,  # England vs United States
-    3857278,  # Iran vs United States
-    3857277,  # Morocco vs Croatia
-]
-NUM_MATCHES_NEEDED = 5
+# World Cup 2022 (competition_id=43, season_id=106), scaled from Milestone
+# 8's 5 hardcoded matches to a batch pull across the whole competition.
+COMPETITION_ID = 43
+SEASON_ID = 106
+NUM_MATCHES_NEEDED = 20
+
+# Possession chains are built across both halves (Milestone 9). Period-2
+# chains contribute trainable feature samples with NO coordinate
+# transformation (ADR-009): StatsBomb's raw event/360 coordinates are
+# already oriented relative to the acting team's own attacking-left-to-right
+# perspective, so feature_extractor.py's old period-1-only restriction was
+# simply removed, not replaced with a flip. See build_training_data()'s
+# per-match print for the period-1 vs period-2 match-rate this produces.
+CHAIN_BUILDER_PERIODS = (1, 2)
 
 NUM_EPOCHS = 50
 LEARNING_RATE = 1e-3
@@ -80,58 +86,52 @@ BRIER_TIME_BINS = (3, 6)  # 15s and 30s, at BIN_SIZE_SECONDS=5.0
 
 SMALL_DATASET_WARNING_THRESHOLD = 500
 
+# Milestone 9 baseline (20 matches, period-1-only -- chain-building already
+# covered both periods, but feature_extractor.py still gated on period==1
+# at the time, dataset_size=1545) and the Milestone 10 forced-flip run
+# (same 20 matches, period-2 included but with an INCORRECT forced
+# coordinate flip that ADR-009 found to systematically mis-orient period-2
+# frames, dataset_size=3198), printed alongside this run's numbers for
+# direct reference.
+MILESTONE_9_BASELINE_BRIER_15S = 0.0907
+MILESTONE_9_BASELINE_BRIER_30S = 0.1744
+MILESTONE_9_BASELINE_DATASET_SIZE = 1545
 
-def _resolve_valid_match_ids(candidate_ids: list[int], count: int) -> list[int]:
-    """Collect the first `count` candidates with BOTH events and 360 data.
-
-    Rate-limiting is already handled inside statsbomb_io._fetch_json (a
-    time.sleep(0.5) after every real network fetch, never after a cache
-    hit) -- no need to duplicate that delay here.
-    """
-    valid_ids = []
-    for match_id in candidate_ids:
-        events = fetch_match_events(match_id)
-        if events is None:
-            continue
-        frames = fetch_match_360(match_id)
-        if frames is None:
-            continue
-        valid_ids.append(match_id)
-        if len(valid_ids) == count:
-            break
-
-    if len(valid_ids) < count:
-        raise ValueError(
-            f"only found {len(valid_ids)} valid matches among {len(candidate_ids)} "
-            f"candidates; needed {count}"
-        )
-    return valid_ids
+MILESTONE_10_FORCED_FLIP_BRIER_15S = 0.0956
+MILESTONE_10_FORCED_FLIP_BRIER_30S = 0.1874
+MILESTONE_10_FORCED_FLIP_DATASET_SIZE = 3198
 
 
 def _match_chains_with_features(match_id: int, engine: BiomechanicalPitchControl):
-    """Pair each period-1 possession chain (Milestone 5) with a spatial
-    feature vector (Milestone 3) extracted from ONE representative event in
-    that chain -- the first event in the chain that has an associated 360
-    freeze-frame (chains built purely from raw events have no guaranteed
-    360 coverage for every single event; a chain with no 360-covered event
-    at all is skipped, since there's no tactical snapshot to featurize).
+    """Pair each possession chain (Milestone 5/9, both periods by default)
+    with a spatial feature vector (Milestone 3) extracted from ONE
+    representative event in that chain -- the first event in the chain that
+    has an associated 360 freeze-frame (chains built purely from raw events
+    have no guaranteed 360 coverage for every single event; a chain with no
+    360-covered event at all is skipped, since there's no tactical snapshot
+    to featurize).
+
+    Per ADR-009, no direction lookup or coordinate flip is applied -- every
+    representative event's frame goes straight to extract_features. A
+    chain is only skipped here if it has no 360-covered event at all.
     """
     events = fetch_match_events(match_id)
     frames = fetch_match_360(match_id)
     frames_by_event_uuid = {f["event_uuid"]: f for f in frames}
 
-    chains = build_possession_chains(events)
+    chains = build_possession_chains(events, periods=CHAIN_BUILDER_PERIODS)
 
-    events_by_possession = defaultdict(list)
+    events_by_period_possession = defaultdict(list)
     for e in events:
-        if e["period"] == 1:
-            events_by_possession[e["possession"]].append(e)
-    for group in events_by_possession.values():
+        if e["period"] in CHAIN_BUILDER_PERIODS:
+            events_by_period_possession[(e["period"], e["possession"])].append(e)
+    for group in events_by_period_possession.values():
         group.sort(key=lambda e: e["index"])
 
     matched_features, matched_chains = [], []
+    matched_by_period = defaultdict(int)
     for chain in chains:
-        chain_events = events_by_possession.get(chain["chain_id"], [])
+        chain_events = events_by_period_possession.get((chain["period"], chain["chain_id"]), [])
 
         rep_event, rep_frame = None, None
         for e in chain_events:
@@ -144,19 +144,30 @@ def _match_chains_with_features(match_id: int, engine: BiomechanicalPitchControl
 
         parsed = parse_360_frame(rep_event, rep_frame)
         features = extract_features(parsed, engine)
-        if features is None:  # only possible if period != 1, which can't happen here
-            continue
 
         matched_features.append(features)
         matched_chains.append(chain)
+        matched_by_period[chain["period"]] += 1
 
-    print(f"  match {match_id}: {len(matched_chains)}/{len(chains)} chains matched to a 360 frame")
+    print(
+        f"  match {match_id}: {len(matched_chains)}/{len(chains)} chains matched to a "
+        f"360 frame + features (by period: {dict(matched_by_period)})"
+    )
+
+    # Light precaution at this data scale (not yet a strict necessity, but
+    # establishes the pattern before dataset sizes grow further): drop
+    # references to this match's raw fetched JSON before returning, rather
+    # than letting them linger for the caller's next iteration.
+    del events, frames, chains, events_by_period_possession
+
     return matched_features, matched_chains
 
 
 def build_training_data():
-    match_ids = _resolve_valid_match_ids(CANDIDATE_MATCH_IDS, NUM_MATCHES_NEEDED)
-    print(f"Resolved {len(match_ids)} valid matches: {match_ids}")
+    match_ids = batch_extract_valid_matches(
+        competition_id=COMPETITION_ID, season_id=SEASON_ID, num_matches=NUM_MATCHES_NEEDED
+    )
+    print(f"Resolved {len(match_ids)} valid matches (requested {NUM_MATCHES_NEEDED}): {match_ids}")
 
     engine = BiomechanicalPitchControl()
     all_features, all_chains = [], []
@@ -172,13 +183,14 @@ def train_and_evaluate():
     torch.manual_seed(RANDOM_SEED)
 
     features, chains, match_ids = build_training_data()
+    match_count = len(match_ids)
     dataset_size = len(features)
-    print(f"\nTotal (feature, chain) pairs across {NUM_MATCHES_NEEDED} matches: {dataset_size}")
+    print(f"\nTotal (feature, chain) pairs across {match_count} matches: {dataset_size}")
     if dataset_size < SMALL_DATASET_WARNING_THRESHOLD:
         print(
-            f"NOTE: {dataset_size} samples from {NUM_MATCHES_NEEDED} matches' first-half "
-            "possession chains is a small dataset -- fine for a baseline smoke test, but the "
-            "Brier Score numbers below should not be over-interpreted as a validated model."
+            f"NOTE: {dataset_size} samples from {match_count} matches is a small dataset -- fine "
+            "for a baseline smoke test, but the Brier Score numbers below should not be "
+            "over-interpreted as a validated model."
         )
 
     dataset = TacticalSurvivalDataset(features, chains)
@@ -234,6 +246,20 @@ def train_and_evaluate():
                 "random_seed": RANDOM_SEED,
                 "match_ids": ",".join(str(m) for m in match_ids),
                 "feature_key_order": ",".join(FEATURE_KEYS),
+                # Milestone 9 scale-up metadata: distinguishes this run from
+                # the Milestone 8 baseline (5 hardcoded matches, period-1
+                # only) in the MLflow UI. match_count is the ACTUAL number
+                # of valid matches found, which may be less than requested.
+                "match_count": len(match_ids),
+                "dataset_size": dataset_size,
+                "periods_included": ",".join(str(p) for p in CHAIN_BUILDER_PERIODS),
+                # ADR-009: named for what it actually is -- no coordinate
+                # transform is applied; StatsBomb's native per-actor frame
+                # is trusted as-is. Distinguishes this run from the
+                # Milestone 10 forced-flip run, which mis-oriented period-2
+                # frames by applying a coordinate flip this ADR found to be
+                # unnecessary and incorrect.
+                "coordinate_convention": "statsbomb_per_actor_native",
             }
         )
 
@@ -297,6 +323,21 @@ def train_and_evaluate():
 
         brier_15s, excluded_15s = briers[3]
         brier_30s, excluded_30s = briers[6]
+
+        print(
+            f"\nComparison vs Milestone 9 baseline (20 matches, period-1-only, "
+            f"dataset_size={MILESTONE_9_BASELINE_DATASET_SIZE}):"
+        )
+        print(f"  Brier @ 15s: {brier_15s:.4f} (baseline: {MILESTONE_9_BASELINE_BRIER_15S:.4f})")
+        print(f"  Brier @ 30s: {brier_30s:.4f} (baseline: {MILESTONE_9_BASELINE_BRIER_30S:.4f})")
+
+        print(
+            f"\nComparison vs Milestone 10 forced-flip run (20 matches, both periods but with "
+            f"the INCORRECT forced coordinate flip ADR-009 removed, "
+            f"dataset_size={MILESTONE_10_FORCED_FLIP_DATASET_SIZE}):"
+        )
+        print(f"  Brier @ 15s: {brier_15s:.4f} (baseline: {MILESTONE_10_FORCED_FLIP_BRIER_15S:.4f})")
+        print(f"  Brier @ 30s: {brier_30s:.4f} (baseline: {MILESTONE_10_FORCED_FLIP_BRIER_30S:.4f})")
         mlflow.log_metrics(
             {
                 "train_loss": final_epoch_loss,

@@ -2,14 +2,20 @@
 features for the survival-analysis modeling stage (Module 7, later
 milestone).
 
-Scope restriction: only period == 1 (first half) frames are processed.
-StatsBomb does not normalize attacking direction across halves -- a team
-attacking left-to-right in the first half attacks right-to-left in the
-second -- so raw x-coordinate thresholds like "final third" (x > 66.0) or
-"defending line" are only meaningful while direction of play is held
-constant within a frame. Normalizing attacking direction across periods so
-second-half frames can be included too is deferred; flag as a candidate for
-ADR-002.
+Convention (ADR-009, superseding Milestone 10 / ADR-003): NO direction
+correction is applied here. StatsBomb's raw event `location` and 360
+freeze-frame coordinates are already recorded relative to the ACTING
+team's own attacking-left-to-right perspective, in both halves -- verified
+empirically via goal-kick clustering, turnover-coordinate mirroring,
+own-goal event pairs, and (for freeze-frame data specifically) goalkeeper
+position clustering by teammate flag (see ADR-009). The ATTACKING team
+(the team whose action/chain this frame represents -- `is_teammate` in the
+parsed frame) already moves toward INCREASING x by construction of the raw
+data itself, so the DEFENDING team's own goal is at x=0 (they are defending
+against the attacking team's advance toward x=100) with no flip needed.
+Every x-coordinate threshold below (final third, defending line) relies on
+this already-consistent orientation. Both periods are included; neither is
+excluded or transformed.
 """
 
 import torch
@@ -59,16 +65,16 @@ def _team_control(engine, pos, vel, fatigue, pitch_grid, ball_pos):
     return active_coords, team_control
 
 
-def extract_features(frame: dict, engine: BiomechanicalPitchControl | None = None) -> dict | None:
+def extract_features(frame: dict, engine: BiomechanicalPitchControl | None = None) -> dict:
     """Extract scalar pitch-control features from one parsed 360 frame.
 
-    `frame` is the dict returned by statsbomb_io.parse_360_frame. Returns
-    None for any frame outside period 1 (see module docstring) so callers
-    can filter a stream of frames with `if features is None: continue`.
+    `frame` is the dict returned by statsbomb_io.parse_360_frame. Per
+    ADR-009, no direction inference or coordinate flip is applied here --
+    StatsBomb's raw coordinates are already oriented relative to the
+    acting team's own attacking-left-to-right perspective in both periods,
+    so every frame (either period) is used as-is after the ADR-002 rescale
+    that already happened in parse_360_frame.
     """
-    if frame["period"] != 1:
-        return None
-
     if engine is None:
         engine = BiomechanicalPitchControl()
 
@@ -133,18 +139,26 @@ def extract_features(frame: dict, engine: BiomechanicalPitchControl | None = Non
     defending_control_near_ball = def_control[near_ball_mask].sum()
     attacking_control_final_third = att_control[final_third_mask].sum()
 
+    # Under the "attacking team moves toward increasing x" convention, the
+    # defending team's own goal is at x=0 (not x=100, which is the goal the
+    # ATTACKING team is trying to score in). "The defensive line" is the
+    # most advanced (highest-x) defender -- how far up the pitch, away from
+    # their own goal, the defense has pushed -- and "space behind the
+    # line" is the tactically exploitable gap between that line and their
+    # own goal at x=0, i.e. cells with x < highest_defending_x. (A HIGHER
+    # defensive line means MORE exploitable space behind it, matching the
+    # standard football-tactics reading of a "high line" as riskier.)
     defending_positions = player_pos[defending_mask]
     if defending_positions.shape[0] > 0:
         highest_defending_x = defending_positions[:, 0].max()
     else:
-        # No visible defenders in this frame: there is no defender to
-        # establish a line, so treat it as sitting at the very back (x=0),
-        # meaning "behind the line" spans essentially the whole pitch.
-        # def_control is already all-zero in this branch, so the result
-        # stays a large-but-finite number rather than being undefined.
-        highest_defending_x = torch.tensor(0.0)
+        # No visible defenders in this frame: there is no line at all, so
+        # treat the entire pitch up to the attacking end as exploitable
+        # (maximal vulnerability) rather than reporting zero space behind a
+        # nonexistent line. def_control is already all-zero in this branch.
+        highest_defending_x = torch.tensor(PITCH_LENGTH)
 
-    behind_line_mask = active_coords[:, 0] > highest_defending_x
+    behind_line_mask = active_coords[:, 0] < highest_defending_x
     space_behind_defending_line = (1.0 - def_control[behind_line_mask]).sum()
 
     return {

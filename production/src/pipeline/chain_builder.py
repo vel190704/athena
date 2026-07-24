@@ -1,4 +1,5 @@
-"""Possession chain builder and censoring classifier (Milestone 5).
+"""Possession chain builder and censoring classifier (Milestone 5, expanded
+to both periods in Milestone 9).
 
 Groups StatsBomb events into possession chains using StatsBomb's OWN
 `possession` field (NOT re-derived from event-type transitions), then
@@ -6,6 +7,16 @@ classifies how each chain terminates -- shot ("event") vs one of several
 censored-termination reasons -- for later survival-analysis duration
 labeling. This module only produces (duration, event_flag, censor_reason)
 labels; it does not touch survival_dataset.py's tensor plumbing.
+
+Period-boundary finding (Milestone 9, verified against match 3857276):
+StatsBomb's `possession` counter does NOT reset at half-time -- it keeps
+incrementing across periods, AND the exact possession value active at the
+half-time whistle (85, in this match) is reused for BOTH the trailing
+"Pass" + "Half End" events of period 1 and the "Half Start" events that
+open period 2. Grouping by `possession` alone would silently merge these
+into one chain spanning the half-time boundary. Grouping by the tuple
+`(period, possession)` instead makes that structurally impossible, rather
+than relying on a special-case check to catch it after the fact.
 
 Real-data findings (verified against StatsBomb open-data match 3857276,
 period 1) that shaped the rules below:
@@ -122,56 +133,70 @@ def _classify_chain(
     return 0, "other"
 
 
-def build_possession_chains(events: list) -> list[dict]:
-    """Group period-1 StatsBomb events into possession chains and classify
-    how each one terminates.
+def build_possession_chains(events: list, periods: tuple = (1, 2)) -> list[dict]:
+    """Group StatsBomb events (across `periods`) into possession chains and
+    classify how each one terminates.
 
-    Uses StatsBomb's own `possession` field as the grouping key -- this
-    function classifies HOW a chain ends, it does not re-derive WHEN
-    possession changes.
+    Uses StatsBomb's own `possession` field, combined with `period`, as the
+    grouping key -- this function classifies HOW a chain ends, it does not
+    re-derive WHEN possession changes. `periods` defaults to `(1, 2)` (both
+    halves); pass `periods=(1,)` to restore the original period-1-only scope.
+
+    Each period is processed as its own independent, self-contained
+    sequence: a period's last chain always gets `next_chain_events=None`
+    for classification purposes, so a chain can never be compared against
+    the following period's first chain (which would otherwise risk
+    misclassifying period 1's final chain as a turnover against period 2's
+    team, or letting a period's own `half_end` chain get missed). This also
+    means `half_end` is applied per period independently -- with both
+    periods processed, expect roughly two `half_end` chains per match, one
+    per half.
     """
-    period1_events = [e for e in events if e["period"] == 1]
+    relevant_events = [e for e in events if e["period"] in periods]
 
     groups = defaultdict(list)
-    for e in period1_events:
-        groups[e["possession"]].append(e)
+    for e in relevant_events:
+        groups[(e["period"], e["possession"])].append(e)
     for chain_events in groups.values():
         chain_events.sort(key=lambda e: e["index"])
 
-    chain_ids = sorted(groups.keys())
-
-    # Pre-kickoff administrative bookkeeping (Starting XI, Half Start) is
-    # grouped under its own possession id but carries no on-pitch location
-    # data -- it is not a real possession of play, so it's excluded here.
-    chain_ids = [cid for cid in chain_ids if any("location" in e for e in groups[cid])]
+    # Pre-kickoff/pre-second-half administrative bookkeeping (Starting XI,
+    # Half Start, Tactical Shift) is grouped under its own possession id but
+    # carries no on-pitch location data -- it is not a real possession of
+    # play, so it's excluded here.
+    valid_keys = {key for key in groups if any("location" in e for e in groups[key])}
 
     other_count = 0
     chains = []
-    for i, chain_id in enumerate(chain_ids):
-        chain_events = groups[chain_id]
-        is_last = i == len(chain_ids) - 1
-        next_chain_events = groups[chain_ids[i + 1]] if not is_last else None
+    for period in periods:
+        period_keys = sorted(key for key in valid_keys if key[0] == period)
 
-        event_flag, censor_reason = _classify_chain(chain_events, next_chain_events, is_last)
-        if censor_reason == "other":
-            other_count += 1
+        for i, key in enumerate(period_keys):
+            chain_events = groups[key]
+            is_last = i == len(period_keys) - 1
+            next_chain_events = groups[period_keys[i + 1]] if not is_last else None
 
-        start = chain_events[0]
-        end = chain_events[-1]
-        start_total_seconds = start["minute"] * 60 + start["second"]
-        end_total_seconds = end["minute"] * 60 + end["second"]
+            event_flag, censor_reason = _classify_chain(chain_events, next_chain_events, is_last)
+            if censor_reason == "other":
+                other_count += 1
 
-        chains.append(
-            {
-                "chain_id": chain_id,
-                "team": chain_events[0]["possession_team"]["name"],
-                "start_minute": float(start["minute"]),
-                "end_minute": float(end["minute"]),
-                "duration_seconds": float(end_total_seconds - start_total_seconds),
-                "event_flag": event_flag,
-                "censor_reason": censor_reason,
-            }
-        )
+            start = chain_events[0]
+            end = chain_events[-1]
+            start_total_seconds = start["minute"] * 60 + start["second"]
+            end_total_seconds = end["minute"] * 60 + end["second"]
+
+            chains.append(
+                {
+                    "chain_id": key[1],  # the raw StatsBomb possession value
+                    "period": key[0],
+                    "team": chain_events[0]["possession_team"]["name"],
+                    "start_minute": float(start["minute"]),
+                    "end_minute": float(end["minute"]),
+                    "duration_seconds": float(end_total_seconds - start_total_seconds),
+                    "event_flag": event_flag,
+                    "censor_reason": censor_reason,
+                }
+            )
 
     if other_count > 0:
         print(f"[chain_builder] {other_count} of {len(chains)} chains classified as 'other'")

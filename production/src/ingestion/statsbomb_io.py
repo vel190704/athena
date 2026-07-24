@@ -12,12 +12,17 @@ from pathlib import Path
 
 import requests
 import torch
+from tqdm import tqdm
 
 EVENTS_URL_TEMPLATE = (
     "https://raw.githubusercontent.com/statsbomb/open-data/master/data/events/{match_id}.json"
 )
 THREE_SIXTY_URL_TEMPLATE = (
     "https://raw.githubusercontent.com/statsbomb/open-data/master/data/three-sixty/{match_id}.json"
+)
+MATCHES_URL_TEMPLATE = (
+    "https://raw.githubusercontent.com/statsbomb/open-data/master/data/matches/"
+    "{competition_id}/{season_id}.json"
 )
 
 CACHE_DIR = Path("data/raw")
@@ -71,6 +76,69 @@ def fetch_match_360(match_id: int):
     """Fetch (and cache) the 360 freeze-frame JSON for `match_id`, or None if absent."""
     url = THREE_SIXTY_URL_TEMPLATE.format(match_id=match_id)
     return _fetch_json(url, _cache_path(match_id, "360"))
+
+
+def _matches_cache_path(competition_id: int, season_id: int) -> Path:
+    return CACHE_DIR / f"matches_{competition_id}_{season_id}.json"
+
+
+def fetch_competition_matches(competition_id: int, season_id: int) -> list[dict]:
+    """Fetch (and cache) the full list of match objects for a competition
+    and season.
+
+    Each element of the returned list is a full match OBJECT (with fields
+    like `match_id`, `home_team`, `away_team`, ...) -- this endpoint does
+    NOT return a bare list of match_id integers, which was verified against
+    a live fetch before writing this function.
+    """
+    url = MATCHES_URL_TEMPLATE.format(competition_id=competition_id, season_id=season_id)
+    matches = _fetch_json(url, _matches_cache_path(competition_id, season_id))
+    if matches is None:
+        raise ValueError(
+            f"no match list found for competition_id={competition_id}, season_id={season_id}"
+        )
+    return matches
+
+
+def batch_extract_valid_matches(competition_id: int, season_id: int, num_matches: int) -> list[int]:
+    """Return up to `num_matches` match_ids from a competition/season that
+    have BOTH events and 360 data present, reusing the same validity check
+    and disk cache as `find_valid_match_id`.
+
+    Stops as soon as `num_matches` valid matches are found rather than
+    exhaustively checking every match in the competition. If the whole
+    competition has fewer than `num_matches` valid matches, returns however
+    many were found and prints a warning instead of raising.
+    """
+    matches = fetch_competition_matches(competition_id, season_id)
+    candidate_match_ids = [m["match_id"] for m in matches]
+
+    valid_ids = []
+    progress = tqdm(candidate_match_ids, desc="Verifying match validity (events + 360 data)")
+    for match_id in progress:
+        if len(valid_ids) >= num_matches:
+            break
+
+        events = fetch_match_events(match_id)
+        if events is None:
+            continue
+        frames = fetch_match_360(match_id)
+        if frames is None:
+            continue
+
+        valid_ids.append(match_id)
+        progress.set_postfix(valid=len(valid_ids))
+
+    progress.close()
+
+    if len(valid_ids) < num_matches:
+        print(
+            f"WARNING: only found {len(valid_ids)} valid matches (events + 360 data both "
+            f"present) out of {len(candidate_match_ids)} total in competition_id="
+            f"{competition_id}, season_id={season_id}; requested {num_matches}."
+        )
+
+    return valid_ids
 
 
 def find_valid_match_id(candidate_ids: list[int]) -> int:
@@ -131,4 +199,9 @@ def parse_360_frame(event_data: dict, frame_data: dict) -> dict:
         "is_teammate": is_teammate,
         "event_type": event_data["type"]["name"],
         "period": event_data["period"],
+        # The acting player's team (same team `is_teammate` is relative to
+        # above) -- Milestone 10's direction-normalization lookup keys on
+        # team identity, not just period, since attacking direction is
+        # inferred per team.
+        "team": event_data["team"]["name"],
     }
