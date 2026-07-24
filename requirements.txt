@@ -7,3 +7,7 @@ tqdm
 mlflow
 torch-geometric
 captum
+fastapi
+uvicorn
+websockets
+httpx2
