@@ -81,14 +81,54 @@ NUM_MATCHES_NEEDED = 20
 CHAIN_BUILDER_PERIODS = (1, 2)
 
 NUM_EPOCHS = 50
-LEARNING_RATE = 1e-3
+LEARNING_RATE = 1e-3  # MLP only -- already stable in Milestone 12, deliberately left untouched
 BATCH_SIZE = 32
 TRAIN_FRACTION = 0.8
 RANDOM_SEED = 42
 BRIER_TIME_BINS = (3, 6)  # 15s and 30s, at BIN_SIZE_SECONDS=5.0
 GNN_HIDDEN_DIM = 64
 
+# Milestone 12B: GNN-specific optimization stabilization. Milestone 12
+# found the GNN's training loss spiking from 3.07 to 4.58 around epoch 20
+# and never recovering (exploding gradients), caught only by eyeballing a
+# printed log every 10 epochs. These three changes are bundled together
+# (gradient-norm clipping, weight decay, and a 10x lower learning rate) and
+# applied ONLY to the GNN -- the MLP was already stable and is left with
+# its Milestone 12 optimizer config (plain Adam, lr=1e-3, no clipping, no
+# weight decay) so it remains a clean, unchanged reference point. Because
+# all three are bundled, if this run comes back stable we won't know which
+# change mattered most -- isolating that is optional future work, not
+# required here. A fully symmetric ablation (applying the same three
+# changes to the MLP too) would also confirm the MLP isn't secretly
+# benefiting from a learning rate that happens to suit it, but that's a
+# lower-priority check since the MLP was already performing well and
+# stably.
+GNN_LEARNING_RATE = 1e-4
+GNN_WEIGHT_DECAY = 1e-4
+GRAD_CLIP_MAX_NORM = 1.0
+
+# Step 2.2: flags residual instability rather than relying on manually
+# eyeballing the printed log (which is exactly how Milestone 12's GNN
+# blowup was originally caught, too late). A single-epoch train-loss
+# INCREASE exceeding this fraction of the prior epoch's loss value fires
+# an explicit warning instead of silently proceeding as if training was
+# smooth.
+INSTABILITY_THRESHOLD_FRACTION = 0.5
+
+# Step 2.3: periodic (not just final) validation-loss logging, so the full
+# train-vs-val curve is inspectable afterward -- this is what lets Step 3
+# distinguish overfitting (train smooth/low, val diverging) from true
+# instability (both curves erratic).
+VAL_LOSS_LOG_INTERVAL_EPOCHS = 5
+
 SMALL_DATASET_WARNING_THRESHOLD = 500
+
+# Milestone 12's unstable GNN run (exploding gradients, never diagnosed
+# automatically -- see the module docstring), kept for direct comparison
+# in this run's final printout. Not deleted or overwritten in MLflow.
+MILESTONE_12_UNSTABLE_GNN_RUN_ID = "68d3ade44aea4f9e9259c7ef1a4c9ace"
+MILESTONE_12_UNSTABLE_GNN_BRIER_15S = 0.1070
+MILESTONE_12_UNSTABLE_GNN_BRIER_30S = 0.2258
 
 # Milestone 9 baseline (20 matches, period-1-only -- chain-building already
 # covered both periods, but feature_extractor.py still gated on period==1
@@ -201,9 +241,42 @@ def _normalize_graph_batch(scalar_batch, graph_batch, mean, std):
     return graph_batch
 
 
+def _check_for_instability(model_type: str, epoch_losses: list[float]) -> bool:
+    """Programmatic replacement for eyeballing the printed log (which is
+    exactly how Milestone 12's GNN blowup was originally caught, too late).
+
+    Returns True (and prints an explicit WARNING) if any single-epoch loss
+    increase exceeds INSTABILITY_THRESHOLD_FRACTION of the prior epoch's
+    loss value; otherwise returns False silently.
+    """
+    max_relative_increase = 0.0
+    culprit_epoch = None
+    for i in range(1, len(epoch_losses)):
+        prev_loss, curr_loss = epoch_losses[i - 1], epoch_losses[i]
+        if prev_loss <= 0:
+            continue
+        relative_increase = (curr_loss - prev_loss) / prev_loss
+        if relative_increase > max_relative_increase:
+            max_relative_increase = relative_increase
+            culprit_epoch = i + 1  # 1-indexed epoch number
+
+    fired = max_relative_increase > INSTABILITY_THRESHOLD_FRACTION
+    if fired:
+        print(
+            f"[{model_type}] WARNING: residual training instability detected -- loss "
+            f"increased by {max_relative_increase:.1%} at epoch {culprit_epoch} "
+            f"(threshold: single-epoch relative increase > {INSTABILITY_THRESHOLD_FRACTION:.0%})."
+        )
+    return fired
+
+
 def _train_and_log_model(
     model_type: str,
     model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    lr: float,
+    weight_decay: float,
+    clip_grad_norm: bool,
     input_fn,
     normalize_args: tuple,
     train_loader: DataLoader,
@@ -214,22 +287,36 @@ def _train_and_log_model(
     dataset_size: int,
     extra_params: dict,
     normalization_artifact: dict,
-) -> dict:
+    run_tags: dict | None = None,
+) -> dict | None:
     """Shared training/eval/logging loop for both the MLP and the GNN --
     factored out so the two models run through IDENTICAL epoch counts,
-    optimizer settings, loss function, Brier calculation, and MLflow
-    logging conventions, differing only in `model`, `input_fn` (how to pull
-    this model's representation out of a (scalar_batch, graph_batch) pair
-    and normalize it), and `extra_params` (model-specific MLflow params).
+    loss function, Brier calculation, and MLflow logging conventions,
+    differing only in `model`/`optimizer` (each model's optimizer is built
+    by the caller, so the MLP's Milestone-12 config -- lr=1e-3, no weight
+    decay -- can stay untouched while the GNN gets Milestone 12B's
+    stabilization bundle), `input_fn` (how to pull this model's
+    representation out of a (scalar_batch, graph_batch) pair and
+    normalize it), `clip_grad_norm` (GNN-only, see module docstring), and
+    `extra_params`/`run_tags` (model-specific MLflow metadata).
+
+    Returns None if training hit a NaN/Inf loss (unchanged from Milestone
+    12); otherwise a dict of final metrics. The Step 2.2 instability check
+    is reported via a printed WARNING but does NOT itself abort training --
+    the caller decides how to react to it (see train_and_evaluate).
     """
     loss_fn = DeepHitLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
     with mlflow.start_run(run_name=f"{model_type.lower()}_run") as run:
+        if run_tags:
+            mlflow.set_tags(run_tags)
+
         mlflow.log_params(
             {
                 "model_type": model_type,
-                "lr": LEARNING_RATE,
+                "lr": lr,
+                "weight_decay": weight_decay,
+                "gradient_clipping": clip_grad_norm,
                 "epochs": NUM_EPOCHS,
                 "train_size": n_train,
                 "val_size": n_val,
@@ -256,6 +343,8 @@ def _train_and_log_model(
             f"\n[{model_type}] Training for {NUM_EPOCHS} epochs on {n_train} samples "
             f"({n_val} held out for validation)..."
         )
+        epoch_losses: list[float] = []
+        val_loss_history: dict[int, float] = {}
         final_epoch_loss = None
         for epoch in range(1, NUM_EPOCHS + 1):
             model.train()
@@ -276,16 +365,42 @@ def _train_and_log_model(
                     return None
 
                 loss.backward()
+                if clip_grad_norm:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=GRAD_CLIP_MAX_NORM)
                 optimizer.step()
 
                 epoch_loss_total += loss.item()
                 num_batches += 1
 
             final_epoch_loss = epoch_loss_total / num_batches
+            epoch_losses.append(final_epoch_loss)
+            # Step 2.1: full per-epoch history, not just a final value --
+            # inspectable in the MLflow UI even if nobody was watching the
+            # console at the right moment.
+            mlflow.log_metric("train_loss", final_epoch_loss, step=epoch)
+
             if epoch % 10 == 0 or epoch == 1:
                 print(f"  [{model_type}] epoch {epoch:3d}/{NUM_EPOCHS}: training loss = {final_epoch_loss:.4f}")
 
+            # Step 2.3: periodic validation loss during training (not just
+            # the final one) -- this is what lets Step 3 distinguish
+            # overfitting (train smooth/low, val diverging) from true
+            # instability (both curves erratic).
+            if epoch % VAL_LOSS_LOG_INTERVAL_EPOCHS == 0 or epoch == NUM_EPOCHS:
+                model.eval()
+                with torch.no_grad():
+                    val_scalar, val_graph, val_duration_bins, val_events = val_batch
+                    val_input = input_fn(val_scalar, val_graph, *normalize_args)
+                    epoch_val_loss = loss_fn(model(val_input), val_duration_bins, val_events).item()
+                val_loss_history[epoch] = epoch_val_loss
+                mlflow.log_metric("val_loss", epoch_val_loss, step=epoch)
+
         print(f"[{model_type}] Final training loss: {final_epoch_loss:.4f}")
+
+        # Step 2.2: programmatic instability check, not a manual glance at
+        # the printed log.
+        instability_warning_fired = _check_for_instability(model_type, epoch_losses)
+        mlflow.log_param("instability_warning_fired", instability_warning_fired)
 
         model.eval()
         with torch.no_grad():
@@ -307,15 +422,15 @@ def _train_and_log_model(
 
         brier_15s, excluded_15s = briers[3]
         brier_30s, excluded_30s = briers[6]
+        train_val_gap = val_loss.item() - final_epoch_loss
 
         mlflow.log_metrics(
             {
-                "train_loss": final_epoch_loss,
-                "val_loss": val_loss.item(),
                 "val_brier_15s": brier_15s,
                 "val_brier_30s": brier_30s,
                 "excluded_15s": excluded_15s,
                 "excluded_30s": excluded_30s,
+                "train_val_loss_gap": train_val_gap,
             }
         )
 
@@ -349,6 +464,11 @@ def _train_and_log_model(
         "brier_30s": brier_30s,
         "excluded_15s": excluded_15s,
         "excluded_30s": excluded_30s,
+        "train_val_gap": train_val_gap,
+        "instability_warning_fired": instability_warning_fired,
+        "epoch_losses": epoch_losses,
+        "val_loss_history": val_loss_history,
+        "run_id": run.info.run_id,
     }
 
 
@@ -427,9 +547,17 @@ def train_and_evaluate():
     mlflow.set_experiment(MLFLOW_EXPERIMENT_NAME)
 
     mlp_model = DeepHitSurvivalModel(num_features=len(FEATURE_KEYS), num_bins=NUM_BINS)
+    # MLP's optimizer is left EXACTLY as in Milestone 12 -- plain Adam,
+    # lr=1e-3, no weight decay, no gradient clipping -- so it remains a
+    # clean, unchanged reference point (it was already stable).
+    mlp_optimizer = torch.optim.Adam(mlp_model.parameters(), lr=LEARNING_RATE)
     mlp_results = _train_and_log_model(
         model_type="MLP",
         model=mlp_model,
+        optimizer=mlp_optimizer,
+        lr=LEARNING_RATE,
+        weight_decay=0.0,
+        clip_grad_norm=False,
         input_fn=_normalize_scalar_batch,
         normalize_args=(feature_mean, feature_std),
         train_loader=train_loader,
@@ -447,9 +575,21 @@ def train_and_evaluate():
     )
 
     gnn_model = GNNDeepHitSurvivalModel(num_node_features=7, num_bins=NUM_BINS, hidden_dim=GNN_HIDDEN_DIM)
+    # Milestone 12B stabilization bundle (GNN only -- see module docstring
+    # for why all three are bundled together and applied asymmetrically):
+    # lower learning rate, weight decay, and gradient-norm clipping (the
+    # clipping itself is applied inside _train_and_log_model's loop, gated
+    # on clip_grad_norm=True below).
+    gnn_optimizer = torch.optim.Adam(
+        gnn_model.parameters(), lr=GNN_LEARNING_RATE, weight_decay=GNN_WEIGHT_DECAY
+    )
     gnn_results = _train_and_log_model(
         model_type="GNN",
         model=gnn_model,
+        optimizer=gnn_optimizer,
+        lr=GNN_LEARNING_RATE,
+        weight_decay=GNN_WEIGHT_DECAY,
+        clip_grad_norm=True,
         input_fn=_normalize_graph_batch,
         normalize_args=(graph_feature_mean, graph_feature_std),
         train_loader=train_loader,
@@ -462,6 +602,13 @@ def train_and_evaluate():
             "same_team_radius": DEFAULT_SAME_TEAM_RADIUS,
             "opponent_radius": DEFAULT_OPPONENT_RADIUS,
             "hidden_dim": GNN_HIDDEN_DIM,
+        },
+        run_tags={
+            "supersedes_run_id": MILESTONE_12_UNSTABLE_GNN_RUN_ID,
+            "supersedes_note": (
+                "Milestone 12B stabilization (grad clipping + weight decay + lower lr) "
+                "of Milestone 12's exploding-gradient GNN run; that run is kept, not deleted."
+            ),
         },
         normalization_artifact={
             "graph_continuous_feature_order": ["x", "y", "dist_to_ball"],
@@ -484,16 +631,114 @@ def train_and_evaluate():
         f"Brier @ 15s = {MILESTONE_10_FORCED_FLIP_BRIER_15S:.4f}, "
         f"Brier @ 30s = {MILESTONE_10_FORCED_FLIP_BRIER_30S:.4f}"
     )
+    print(
+        f"Comparison vs Milestone 12 UNSTABLE GNN run (exploding gradients, run_id="
+        f"{MILESTONE_12_UNSTABLE_GNN_RUN_ID}, kept in MLflow, not deleted): "
+        f"Brier @ 15s = {MILESTONE_12_UNSTABLE_GNN_BRIER_15S:.4f}, "
+        f"Brier @ 30s = {MILESTONE_12_UNSTABLE_GNN_BRIER_30S:.4f}"
+    )
 
-    if mlp_results is not None and gnn_results is not None:
-        print("\n=== RQ4: MLP (scalar features) vs GNN (graph representation) ===")
-        print(f"{'Model':<6} {'Brier@15s':>10} {'Brier@30s':>10}")
-        print(f"{'MLP':<6} {mlp_results['brier_15s']:>10.4f} {mlp_results['brier_30s']:>10.4f}")
-        print(f"{'GNN':<6} {gnn_results['brier_15s']:>10.4f} {gnn_results['brier_30s']:>10.4f}")
+    # --- Step 3/4: diagnose what actually happened before concluding RQ4 ---
+    print("\n=== Step 3: Stability diagnosis ===")
+    if mlp_results is None or gnn_results is None:
         print(
-            "NOTE: MLP and GNN are not matched in raw parameter count/capacity -- a caveat for "
-            "interpreting this comparison, not something to fix now."
+            "One or both models hit a NaN/Inf loss and training was aborted outright -- "
+            "see the [MODEL] NaN/Inf message above. No RQ4 conclusion can be drawn."
         )
+    else:
+        mlp_unstable = mlp_results["instability_warning_fired"]
+        gnn_unstable = gnn_results["instability_warning_fired"]
+        print(f"MLP instability warning fired: {mlp_unstable}")
+        print(f"GNN instability warning fired: {gnn_unstable}")
+
+        if gnn_unstable:
+            print(
+                "\nSTOP: the GNN still triggered the residual-instability warning despite the "
+                "Milestone 12B stabilization bundle (gradient clipping, weight decay, lr=1e-4). "
+                "Reporting this honestly rather than forcing an RQ4 conclusion. The loss curve "
+                f"(by epoch) was logged to MLflow under run_id={gnn_results['run_id']} for "
+                "inspection. Further fixes (an even lower learning rate, batch normalization "
+                "between the SAGEConv layers) are follow-up work, not attempted further in this "
+                "run per the task's explicit scope."
+            )
+            print(f"GNN per-epoch train loss: {gnn_results['epoch_losses']}")
+        else:
+            print("Both models completed all 50 epochs without the instability warning firing.")
+
+            mlp_gap = mlp_results["train_val_gap"]
+            gnn_gap = gnn_results["train_val_gap"]
+            print(
+                f"\nTrain/val loss gap -- MLP: {mlp_gap:+.4f} (train={mlp_results['train_loss']:.4f}, "
+                f"val={mlp_results['val_loss']:.4f})"
+            )
+            print(
+                f"Train/val loss gap -- GNN: {gnn_gap:+.4f} (train={gnn_results['train_loss']:.4f}, "
+                f"val={gnn_results['val_loss']:.4f})"
+            )
+
+            gnn_brier_worse = (
+                gnn_results["brier_15s"] > mlp_results["brier_15s"]
+                and gnn_results["brier_30s"] > mlp_results["brier_30s"]
+            )
+            if gnn_brier_worse and gnn_gap <= mlp_gap + 0.05:
+                print(
+                    "\nThe GNN's train loss is now low/smooth and its train/val gap is comparable "
+                    "to (not meaningfully worse than) the MLP's, yet its Brier Score remains "
+                    "substantially worse. This looks like a DATA-LIMITED result, not an "
+                    "optimization-limited one: 2,558 training samples is a modest dataset for a "
+                    "2-layer GraphSAGE model's capacity relative to the 4-feature MLP. This is a "
+                    "genuinely different, equally valid finding for RQ4 -- not a non-result."
+                )
+            elif gnn_brier_worse:
+                print(
+                    "\nThe GNN's train/val gap is noticeably wider than the MLP's, suggesting some "
+                    "residual overfitting or optimization difficulty beyond pure data scale -- "
+                    "interpret the Brier comparison below with that in mind."
+                )
+
+            print("\n=== RQ4 comparison table ===")
+            print(f"{'Model':<24} {'Brier@15s':>10} {'Brier@30s':>10}")
+            print(f"{'MLP':<24} {mlp_results['brier_15s']:>10.4f} {mlp_results['brier_30s']:>10.4f}")
+            print(f"{'GNN (stabilized)':<24} {gnn_results['brier_15s']:>10.4f} {gnn_results['brier_30s']:>10.4f}")
+            print(
+                f"{'GNN (Milestone 12, unstable)':<24} {MILESTONE_12_UNSTABLE_GNN_BRIER_15S:>10.4f} "
+                f"{MILESTONE_12_UNSTABLE_GNN_BRIER_30S:>10.4f}"
+            )
+            print(
+                "NOTE: MLP and GNN are not matched in raw parameter count/capacity -- a caveat for "
+                "interpreting this comparison, not something to fix now. The MLP's optimizer "
+                "(lr=1e-3, no weight decay/clipping) was also left untouched while the GNN got a "
+                "3-part stabilization bundle -- a fully symmetric ablation (applying the same "
+                "bundle to the MLP) would further confirm the MLP isn't secretly benefiting from a "
+                "learning rate that happens to suit it, but is lower priority since it was already "
+                "stable."
+            )
+
+            print("\n=== RQ4 conclusion ===")
+            if not gnn_brier_worse:
+                print(
+                    "The GNN is stable AND competitive with or better than the MLP baseline at "
+                    "both horizons -- RQ4 supports graph representations outperforming the "
+                    "handcrafted scalar features in this setting."
+                )
+            elif gnn_gap <= mlp_gap + 0.05:
+                print(
+                    "The GNN is now stable but still underperforms the MLP at both horizons. Given "
+                    "the comparable train/val gap, this looks like a data-scale limitation rather "
+                    "than an optimization failure -- RQ4's answer here is a HEDGED 'not yet': the "
+                    "handcrafted scalar features currently outperform this graph representation, "
+                    "but more training data (not more tuning) is the most promising next lever "
+                    "before treating this as a settled negative result, consistent with the "
+                    "README's framing of RQs as working hypotheses rather than settled truths."
+                )
+            else:
+                print(
+                    "The GNN is now stable but still underperforms the MLP, with a wider train/val "
+                    "gap than the MLP's -- some residual overfitting/optimization difficulty likely "
+                    "remains beyond pure data scale. RQ4's answer here is a HEDGED 'not yet', with "
+                    "more diagnosis (not a flat verdict) warranted before concluding graphs "
+                    "underperform scalar features in general."
+                )
 
     print(f"\nMLflow experiment: {MLFLOW_EXPERIMENT_NAME}")
     print("Run `mlflow ui` from the project root to inspect results visually.")
