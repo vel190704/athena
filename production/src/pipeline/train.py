@@ -130,38 +130,68 @@ INSTABILITY_THRESHOLD_FRACTION = 0.5
 # instability (both curves erratic).
 VAL_LOSS_LOG_INTERVAL_EPOCHS = 5
 
+# Milestone 14B: strengthened instability detector. Milestone 14's own MLP
+# run is direct proof the single-epoch spike check (>50%) has a real blind
+# spot: that run's train loss climbed from 3.30 to 5.07 over epochs 5-50 --
+# NO single epoch-to-epoch jump ever exceeded 50% -- while val_loss went
+# bit-for-bit frozen at 4.843820095062256 for the final 25 epochs. Directly
+# probing the trained model afterward confirmed its softmax had saturated
+# to ~1.0 on the last time bin regardless of input. These three additional
+# signals are designed specifically to catch that failure mode next time,
+# not a hypothetical one.
+CUMULATIVE_DRIFT_WINDOW_EPOCHS = 20
+CUMULATIVE_DRIFT_THRESHOLD_FRACTION = 0.30  # >30% increase over the window fires a warning
+
+# Output-saturation check: TWO independent signals, since either alone can
+# miss a real collapse. Batch variance catches "every sample gets the same
+# output"; entropy catches the subtler case where outputs still differ
+# slightly across samples but each individual prediction has collapsed to
+# a near one-hot spike.
+SATURATION_VARIANCE_THRESHOLD = 1e-6  # near-0 batch variance -> same output regardless of input
+SATURATION_ENTROPY_THRESHOLD = 0.1  # near-0 mean entropy (max possible is ln(12)=2.485) -> near one-hot
+
 SMALL_DATASET_WARNING_THRESHOLD = 500
 
-# Milestone 12's unstable GNN run (exploding gradients, never diagnosed
-# automatically -- see the module docstring), kept for direct comparison
-# in this run's final printout. Not deleted or overwritten in MLflow.
-MILESTONE_12_UNSTABLE_GNN_RUN_ID = "68d3ade44aea4f9e9259c7ef1a4c9ace"
-MILESTONE_12_UNSTABLE_GNN_BRIER_15S = 0.1070
-MILESTONE_12_UNSTABLE_GNN_BRIER_30S = 0.2258
-
-# Milestone 9 baseline (20 matches, period-1-only -- chain-building already
-# covered both periods, but feature_extractor.py still gated on period==1
-# at the time, dataset_size=1545) and the Milestone 10 forced-flip run
-# (same 20 matches, period-2 included but with an INCORRECT forced
-# coordinate flip that ADR-009 found to systematically mis-orient period-2
-# frames, dataset_size=3198), printed alongside this run's numbers for
-# direct reference.
-MILESTONE_9_BASELINE_BRIER_15S = 0.0907
-MILESTONE_9_BASELINE_BRIER_30S = 0.1744
-MILESTONE_9_BASELINE_DATASET_SIZE = 1545
-
-MILESTONE_10_FORCED_FLIP_BRIER_15S = 0.0956
-MILESTONE_10_FORCED_FLIP_BRIER_30S = 0.1874
-MILESTONE_10_FORCED_FLIP_DATASET_SIZE = 3198
-
-# Milestone 12B's STABILIZED single-competition (World Cup 2022 only)
-# MLP/GNN pair -- the direct "prior small-dataset numbers" this milestone's
-# multi-competition run is meant to be compared against (Step 2.4).
-MILESTONE_12B_DATASET_SIZE = 3198
+# Milestone 12B's STABILIZED single-competition (World Cup 2022 only) MLP
+# Brier Scores -- used below as the sanity-floor ceiling for judging
+# whether the Milestone 14B stabilized MLP is genuinely learning well.
 MILESTONE_12B_MLP_BRIER_15S = 0.0846
 MILESTONE_12B_MLP_BRIER_30S = 0.1720
-MILESTONE_12B_GNN_BRIER_15S = 0.1051
-MILESTONE_12B_GNN_BRIER_30S = 0.2042
+
+# Milestone 14's multi-competition run (8,074 samples): the MLP SILENTLY
+# COLLAPSED (softmax saturated to the last time bin regardless of input --
+# see the CUMULATIVE_DRIFT/SATURATION comment above) while the GNN, using
+# the Milestone 12B stabilization bundle, trained normally. Kept here as
+# historical reference rows, NOT retrained/overwritten -- that MLflow run
+# stays as the record of this discovery.
+MILESTONE_14_DATASET_SIZE = 8074
+MILESTONE_14_MLP_COLLAPSED_RUN_ID = "07f3ef56e13d434aa02a5b832de610c4"
+MILESTONE_14_MLP_COLLAPSED_BRIER_15S = 0.1263
+MILESTONE_14_MLP_COLLAPSED_BRIER_30S = 0.2571
+MILESTONE_14_GNN_STABLE_RUN_ID = "8267bc29a3e54d9d92e146de9b4de145"
+MILESTONE_14_GNN_STABLE_BRIER_15S = 0.1127
+MILESTONE_14_GNN_STABLE_BRIER_30S = 0.1905
+
+# Milestone 14B Step 2: apply the SAME stabilization bundle used for the
+# GNN to the MLP, as a first attempt -- NOT assumed to be correct just
+# because it avoids collapse symptoms; train_and_evaluate() explicitly
+# checks the MLP is actually learning well (meaningful loss decrease, sane
+# Brier Scores), not merely "not collapsed."
+MLP_STABILIZED_LR = 1e-4
+MLP_STABILIZED_WEIGHT_DECAY = 1e-4
+
+# Step 2.3: robustness check -- a second MLP weight-init seed, to
+# distinguish "one-off bad initialization" from "systematic issue with the
+# larger, more heterogeneous dataset." The train/val SPLIT seed (RANDOM_SEED,
+# via split_generator) stays fixed at 42 for both -- only each run's model
+# weight initialization differs, isolating exactly one variable.
+MLP_ROBUSTNESS_CHECK_SEEDS = (42, 43)
+
+# A stabilized-MLP run whose final Brier is drastically worse than this
+# floor is undertrained, not merely "a bit worse" -- flagged explicitly in
+# Step 2.2's health check rather than silently accepted.
+MLP_SANITY_BRIER_15S_CEILING = MILESTONE_12B_MLP_BRIER_15S * 2.5
+MLP_SANITY_BRIER_30S_CEILING = MILESTONE_12B_MLP_BRIER_30S * 2.5
 
 
 def _match_chains_with_features(match_id: int, engine: BiomechanicalPitchControl):
@@ -398,6 +428,11 @@ def _train_and_log_model(
         epoch_losses: list[float] = []
         val_loss_history: dict[int, float] = {}
         final_epoch_loss = None
+        # Warning flags: latched True the first time any signal fires,
+        # across the whole run (not just the last epoch checked).
+        cumulative_drift_fired = False
+        saturation_fired = False
+        frozen_val_loss_fired = False
         for epoch in range(1, NUM_EPOCHS + 1):
             model.train()
             epoch_loss_total = 0.0
@@ -434,25 +469,100 @@ def _train_and_log_model(
             if epoch % 10 == 0 or epoch == 1:
                 print(f"  [{model_type}] epoch {epoch:3d}/{NUM_EPOCHS}: training loss = {final_epoch_loss:.4f}")
 
-            # Step 2.3: periodic validation loss during training (not just
-            # the final one) -- this is what lets Step 3 distinguish
-            # overfitting (train smooth/low, val diverging) from true
-            # instability (both curves erratic).
+            # Signal 2 (Milestone 14B): cumulative/windowed drift check.
+            # Compares against the loss CUMULATIVE_DRIFT_WINDOW_EPOCHS
+            # epochs prior, not just the immediately preceding epoch --
+            # this is what would have caught Milestone 14's actual failure
+            # (a steady, sub-spike-threshold climb across many epochs).
+            if epoch % VAL_LOSS_LOG_INTERVAL_EPOCHS == 0 and epoch > CUMULATIVE_DRIFT_WINDOW_EPOCHS:
+                prior_loss = epoch_losses[epoch - CUMULATIVE_DRIFT_WINDOW_EPOCHS - 1]
+                drift_fraction = (
+                    (final_epoch_loss - prior_loss) / prior_loss if prior_loss > 0 else 0.0
+                )
+                mlflow.log_metric("cumulative_drift_fraction", drift_fraction, step=epoch)
+                if drift_fraction > CUMULATIVE_DRIFT_THRESHOLD_FRACTION:
+                    cumulative_drift_fired = True
+                    print(
+                        f"[{model_type}] CUMULATIVE DRIFT WARNING at epoch {epoch}: loss increased "
+                        f"by {drift_fraction:.1%} over the last {CUMULATIVE_DRIFT_WINDOW_EPOCHS} "
+                        f"epochs (from {prior_loss:.4f} at epoch {epoch - CUMULATIVE_DRIFT_WINDOW_EPOCHS} "
+                        f"to {final_epoch_loss:.4f} now) -- exceeds the "
+                        f"{CUMULATIVE_DRIFT_THRESHOLD_FRACTION:.0%} threshold. This is exactly the "
+                        "failure mode a single-epoch spike check misses."
+                    )
+
+            # Step 2.3 / Signal 3: periodic validation loss AND output-
+            # saturation check (two independent sub-signals: batch variance
+            # and mean per-sample entropy -- see module-level comment).
             if epoch % VAL_LOSS_LOG_INTERVAL_EPOCHS == 0 or epoch == NUM_EPOCHS:
                 model.eval()
                 with torch.no_grad():
                     val_scalar, val_graph, val_duration_bins, val_events = val_batch
                     val_input = input_fn(val_scalar, val_graph, *normalize_args)
-                    epoch_val_loss = loss_fn(model(val_input), val_duration_bins, val_events).item()
-                val_loss_history[epoch] = epoch_val_loss
+                    epoch_val_predictions = model(val_input)
+                    epoch_val_loss = loss_fn(
+                        epoch_val_predictions, val_duration_bins, val_events
+                    ).item()
+
+                    batch_variance = epoch_val_predictions.var(dim=0).mean().item()
+                    per_sample_entropy = -(
+                        epoch_val_predictions * torch.log(epoch_val_predictions.clamp(min=1e-8))
+                    ).sum(dim=1)
+                    mean_entropy = per_sample_entropy.mean().item()
+
                 mlflow.log_metric("val_loss", epoch_val_loss, step=epoch)
+                mlflow.log_metric("output_batch_variance", batch_variance, step=epoch)
+                mlflow.log_metric("output_mean_entropy", mean_entropy, step=epoch)
+
+                if (
+                    batch_variance < SATURATION_VARIANCE_THRESHOLD
+                    or mean_entropy < SATURATION_ENTROPY_THRESHOLD
+                ):
+                    saturation_fired = True
+                    print(
+                        f"[{model_type}] SATURATION WARNING at epoch {epoch}: output batch "
+                        f"variance={batch_variance:.2e} (threshold <{SATURATION_VARIANCE_THRESHOLD:.0e}), "
+                        f"mean entropy={mean_entropy:.4f} (threshold <{SATURATION_ENTROPY_THRESHOLD}) -- "
+                        "predictions have collapsed to a near-constant or near-one-hot output "
+                        "regardless of input."
+                    )
+
+                # Signal 4 (backstop, weakest of the four -- see module
+                # docstring comment): bit-for-bit frozen val_loss. Only
+                # fires after the model has ALREADY fully saturated; exact
+                # floating-point equality across resumed computation is
+                # what confirmed Milestone 14's collapse, well after the
+                # drift had already started.
+                if val_loss_history:
+                    previous_check_epoch = max(val_loss_history.keys())
+                    if val_loss_history[previous_check_epoch] == epoch_val_loss:
+                        frozen_val_loss_fired = True
+                        print(
+                            f"[{model_type}] FROZEN VAL LOSS WARNING at epoch {epoch}: val_loss is "
+                            f"bit-for-bit identical to epoch {previous_check_epoch}'s value "
+                            f"({epoch_val_loss}) -- the weakest of these signals, since it only "
+                            "fires after the model has already fully saturated."
+                        )
+                val_loss_history[epoch] = epoch_val_loss
 
         print(f"[{model_type}] Final training loss: {final_epoch_loss:.4f}")
 
-        # Step 2.2: programmatic instability check, not a manual glance at
-        # the printed log.
-        instability_warning_fired = _check_for_instability(model_type, epoch_losses)
+        # Signal 1: single-epoch spike check (Milestone 12B, retained).
+        spike_fired = _check_for_instability(model_type, epoch_losses)
+
+        instability_warning_fired = (
+            spike_fired or cumulative_drift_fired or saturation_fired or frozen_val_loss_fired
+        )
+        mlflow.log_param("spike_warning_fired", spike_fired)
+        mlflow.log_param("cumulative_drift_warning_fired", cumulative_drift_fired)
+        mlflow.log_param("saturation_warning_fired", saturation_fired)
+        mlflow.log_param("frozen_val_loss_warning_fired", frozen_val_loss_fired)
         mlflow.log_param("instability_warning_fired", instability_warning_fired)
+        print(
+            f"[{model_type}] Warning summary -- spike: {spike_fired}, cumulative_drift: "
+            f"{cumulative_drift_fired}, saturation: {saturation_fired}, frozen_val_loss: "
+            f"{frozen_val_loss_fired}"
+        )
 
         model.eval()
         with torch.no_grad():
@@ -518,6 +628,10 @@ def _train_and_log_model(
         "excluded_30s": excluded_30s,
         "train_val_gap": train_val_gap,
         "instability_warning_fired": instability_warning_fired,
+        "spike_fired": spike_fired,
+        "cumulative_drift_fired": cumulative_drift_fired,
+        "saturation_fired": saturation_fired,
+        "frozen_val_loss_fired": frozen_val_loss_fired,
         "epoch_losses": epoch_losses,
         "val_loss_history": val_loss_history,
         "run_id": run.info.run_id,
@@ -601,43 +715,71 @@ def train_and_evaluate():
     mlflow.set_tracking_uri("file:./mlruns")
     mlflow.set_experiment(MLFLOW_EXPERIMENT_NAME)
 
-    mlp_model = DeepHitSurvivalModel(num_features=len(FEATURE_KEYS), num_bins=NUM_BINS)
-    # MLP's optimizer is left EXACTLY as in Milestone 12 -- plain Adam,
-    # lr=1e-3, no weight decay, no gradient clipping -- so it remains a
-    # clean, unchanged reference point (it was already stable).
-    mlp_optimizer = torch.optim.Adam(mlp_model.parameters(), lr=LEARNING_RATE)
-    mlp_results = _train_and_log_model(
-        model_type="MLP",
-        model=mlp_model,
-        optimizer=mlp_optimizer,
-        lr=LEARNING_RATE,
-        weight_decay=0.0,
-        clip_grad_norm=False,
-        input_fn=_normalize_scalar_batch,
-        normalize_args=(feature_mean, feature_std),
-        train_loader=train_loader,
-        val_batch=val_batch,
-        n_train=n_train,
-        n_val=n_val,
-        match_ids=match_ids,
-        dataset_size=dataset_size,
-        extra_params={
-            "dataset_scale": "multi_competition",
-            "competition_season_pairs": competition_season_summary,
-        },
-        normalization_artifact={
-            "feature_key_order": list(FEATURE_KEYS),
-            "mean": feature_mean.tolist(),
-            "std": feature_std.tolist(),
-        },
-    )
+    # === Milestone 14B Step 2: MLP stabilization (same bundle as the GNN),
+    # PLUS a second weight-init seed as a robustness check. train_loader is
+    # the SAME shared object across every call below (as in every prior
+    # milestone's MLP-vs-GNN comparison) -- its shuffle order naturally
+    # differs call-to-call as its internal generator advances, but the
+    # train/val SPLIT itself (train_set/val_set, from split_generator) is
+    # held fixed at RANDOM_SEED=42 for every run in this function. Only
+    # each MLP run's WEIGHT INITIALIZATION seed differs (42 vs 43),
+    # isolating exactly the one variable Step 2.3 asks about.
+    print("\n=== Milestone 14B Step 2: MLP stabilization + robustness check ===")
+    mlp_seed_results: dict[int, dict | None] = {}
+    for seed in MLP_ROBUSTNESS_CHECK_SEEDS:
+        torch.manual_seed(seed)
+        mlp_model_seeded = DeepHitSurvivalModel(num_features=len(FEATURE_KEYS), num_bins=NUM_BINS)
+        mlp_optimizer_seeded = torch.optim.Adam(
+            mlp_model_seeded.parameters(),
+            lr=MLP_STABILIZED_LR,
+            weight_decay=MLP_STABILIZED_WEIGHT_DECAY,
+        )
+        mlp_seed_results[seed] = _train_and_log_model(
+            model_type="MLP",
+            model=mlp_model_seeded,
+            optimizer=mlp_optimizer_seeded,
+            lr=MLP_STABILIZED_LR,
+            weight_decay=MLP_STABILIZED_WEIGHT_DECAY,
+            clip_grad_norm=True,
+            input_fn=_normalize_scalar_batch,
+            normalize_args=(feature_mean, feature_std),
+            train_loader=train_loader,
+            val_batch=val_batch,
+            n_train=n_train,
+            n_val=n_val,
+            match_ids=match_ids,
+            dataset_size=dataset_size,
+            extra_params={
+                "dataset_scale": "multi_competition",
+                "competition_season_pairs": competition_season_summary,
+                "stabilization_bundle": True,
+                "saturation_check_v2": True,
+                "init_seed": seed,
+            },
+            run_tags={
+                "supersedes_run_id": MILESTONE_14_MLP_COLLAPSED_RUN_ID,
+                "supersedes_note": (
+                    "Milestone 14B stabilization (grad clipping + weight decay + lower lr) of "
+                    "Milestone 14's softmax-saturated MLP run; that run is kept, not deleted."
+                ),
+                "init_seed": str(seed),
+            },
+            normalization_artifact={
+                "feature_key_order": list(FEATURE_KEYS),
+                "mean": feature_mean.tolist(),
+                "std": feature_std.tolist(),
+            },
+        )
 
+    # Reset the global RNG state before constructing the GNN, so its own
+    # initialization isn't accidentally coupled to wherever the MLP seed
+    # loop left the global generator.
+    torch.manual_seed(RANDOM_SEED)
+
+    # === Milestone 14B Step 3: GNN retrain, NOW with the exact same
+    # hyperparameters as the MLP (both use the stabilization bundle) --
+    # addresses the asymmetry noted (but not fixed) in Milestones 12B/14.
     gnn_model = GNNDeepHitSurvivalModel(num_node_features=7, num_bins=NUM_BINS, hidden_dim=GNN_HIDDEN_DIM)
-    # Milestone 12B stabilization bundle (GNN only -- see module docstring
-    # for why all three are bundled together and applied asymmetrically):
-    # lower learning rate, weight decay, and gradient-norm clipping (the
-    # clipping itself is applied inside _train_and_log_model's loop, gated
-    # on clip_grad_norm=True below).
     gnn_optimizer = torch.optim.Adam(
         gnn_model.parameters(), lr=GNN_LEARNING_RATE, weight_decay=GNN_WEIGHT_DECAY
     )
@@ -662,12 +804,16 @@ def train_and_evaluate():
             "hidden_dim": GNN_HIDDEN_DIM,
             "dataset_scale": "multi_competition",
             "competition_season_pairs": competition_season_summary,
+            "stabilization_bundle": True,
+            "saturation_check_v2": True,
+            "init_seed": RANDOM_SEED,
         },
         run_tags={
-            "supersedes_run_id": MILESTONE_12_UNSTABLE_GNN_RUN_ID,
+            "supersedes_run_id": MILESTONE_14_GNN_STABLE_RUN_ID,
             "supersedes_note": (
-                "Milestone 12B stabilization (grad clipping + weight decay + lower lr) "
-                "of Milestone 12's exploding-gradient GNN run; that run is kept, not deleted."
+                "Milestone 14B retrain (identical hyperparameters to the stabilized MLP, "
+                "strengthened instability detector) of Milestone 14's already-stable GNN run, "
+                "for a properly symmetric comparison."
             ),
         },
         normalization_artifact={
@@ -679,143 +825,164 @@ def train_and_evaluate():
 
     print(f"\nDataset size: {dataset_size} total samples ({n_train} train / {n_val} val)")
 
-    print(
-        f"\nComparison vs Milestone 9 baseline (20 matches, period-1-only, "
-        f"dataset_size={MILESTONE_9_BASELINE_DATASET_SIZE}): "
-        f"Brier @ 15s = {MILESTONE_9_BASELINE_BRIER_15S:.4f}, "
-        f"Brier @ 30s = {MILESTONE_9_BASELINE_BRIER_30S:.4f}"
-    )
-    print(
-        f"Comparison vs Milestone 10 forced-flip run (dataset_size="
-        f"{MILESTONE_10_FORCED_FLIP_DATASET_SIZE}): "
-        f"Brier @ 15s = {MILESTONE_10_FORCED_FLIP_BRIER_15S:.4f}, "
-        f"Brier @ 30s = {MILESTONE_10_FORCED_FLIP_BRIER_30S:.4f}"
-    )
-    print(
-        f"Comparison vs Milestone 12 UNSTABLE GNN run (exploding gradients, run_id="
-        f"{MILESTONE_12_UNSTABLE_GNN_RUN_ID}, kept in MLflow, not deleted): "
-        f"Brier @ 15s = {MILESTONE_12_UNSTABLE_GNN_BRIER_15S:.4f}, "
-        f"Brier @ 30s = {MILESTONE_12_UNSTABLE_GNN_BRIER_30S:.4f}"
-    )
-
-    # --- Step 3/4: diagnose what actually happened before concluding RQ4 ---
-    print("\n=== Step 3: Stability diagnosis ===")
-    if mlp_results is None or gnn_results is None:
+    # === Step 3.2: did ANY of the four warning signals fire, for either
+    # model, across BOTH MLP seeds? ===
+    print("\n=== Step 3: warning summary across all runs (strengthened detector) ===")
+    any_warnings_anywhere = False
+    for seed, results in mlp_seed_results.items():
+        if results is None:
+            print(f"MLP (seed={seed}): training ABORTED (NaN/Inf loss).")
+            any_warnings_anywhere = True
+            continue
         print(
-            "One or both models hit a NaN/Inf loss and training was aborted outright -- "
-            "see the [MODEL] NaN/Inf message above. No RQ4 conclusion can be drawn."
+            f"MLP (seed={seed}): spike={results['spike_fired']}, "
+            f"cumulative_drift={results['cumulative_drift_fired']}, "
+            f"saturation={results['saturation_fired']}, "
+            f"frozen_val_loss={results['frozen_val_loss_fired']}"
+        )
+        any_warnings_anywhere = any_warnings_anywhere or results["instability_warning_fired"]
+
+    if gnn_results is None:
+        print("GNN: training ABORTED (NaN/Inf loss).")
+        any_warnings_anywhere = True
+    else:
+        print(
+            f"GNN: spike={gnn_results['spike_fired']}, "
+            f"cumulative_drift={gnn_results['cumulative_drift_fired']}, "
+            f"saturation={gnn_results['saturation_fired']}, "
+            f"frozen_val_loss={gnn_results['frozen_val_loss_fired']}"
+        )
+        any_warnings_anywhere = any_warnings_anywhere or gnn_results["instability_warning_fired"]
+
+    # seed=RANDOM_SEED (42) is the canonical/headline stabilized MLP result
+    # (matching the split/GNN seed, for direct comparability); the other
+    # seed is the Step 2.3 robustness cross-check, reported alongside but
+    # not gating the RQ4 comparison itself.
+    primary_mlp_results = mlp_seed_results[RANDOM_SEED]
+    robustness_seed = next(s for s in MLP_ROBUSTNESS_CHECK_SEEDS if s != RANDOM_SEED)
+    robustness_mlp_results = mlp_seed_results[robustness_seed]
+
+    # === Step 2.2: is the stabilized MLP genuinely HEALTHY, not merely
+    # "not collapsed"? Three explicit criteria. ===
+    mlp_healthy = False
+    if primary_mlp_results is not None and not primary_mlp_results["instability_warning_fired"]:
+        first_loss = primary_mlp_results["epoch_losses"][0]
+        last_loss = primary_mlp_results["epoch_losses"][-1]
+        loss_decreased_meaningfully = (first_loss - last_loss) > 0.1 * first_loss
+        brier_in_sane_range = (
+            primary_mlp_results["brier_15s"] <= MLP_SANITY_BRIER_15S_CEILING
+            and primary_mlp_results["brier_30s"] <= MLP_SANITY_BRIER_30S_CEILING
+        )
+        mlp_healthy = loss_decreased_meaningfully and brier_in_sane_range
+        print(
+            f"\nMLP (seed={RANDOM_SEED}) health check: no instability warnings=True, loss "
+            f"decreased meaningfully={loss_decreased_meaningfully} ({first_loss:.4f} -> "
+            f"{last_loss:.4f}), Brier in sane range (<= {MLP_SANITY_BRIER_15S_CEILING:.4f} / "
+            f"{MLP_SANITY_BRIER_30S_CEILING:.4f})={brier_in_sane_range} (actual: "
+            f"{primary_mlp_results['brier_15s']:.4f} / {primary_mlp_results['brier_30s']:.4f})"
+        )
+        if not brier_in_sane_range:
+            print(
+                "WARNING: the 'same hyperparameters as the GNN' recipe produced a STABLE but "
+                "apparently UNDERTRAINED MLP (Brier far worse than the Milestone 12B sanity "
+                "floor) -- lr=1e-4 was tuned for SAGEConv's specific instability, not validated "
+                "as appropriate for this MLP. The 'purely architectural, hyperparameter-neutral' "
+                "comparison assumption does NOT hold cleanly here."
+            )
+    elif primary_mlp_results is not None:
+        print(f"\nMLP (seed={RANDOM_SEED}) still triggered an instability warning -- see summary above.")
+    else:
+        print(f"\nMLP (seed={RANDOM_SEED}) training was aborted (NaN/Inf loss).")
+
+    print(f"\nRobustness check (seed={robustness_seed}):")
+    if robustness_mlp_results is not None:
+        print(
+            f"  final train loss: {robustness_mlp_results['train_loss']:.4f}, any warning fired: "
+            f"{robustness_mlp_results['instability_warning_fired']}, Brier@15s/30s: "
+            f"{robustness_mlp_results['brier_15s']:.4f} / {robustness_mlp_results['brier_30s']:.4f}"
+        )
+        print(
+            "  (systematic-vs-one-off read: both seeds " +
+            ("avoided every warning" if not any(
+                mlp_seed_results[s]["instability_warning_fired"] for s in MLP_ROBUSTNESS_CHECK_SEEDS
+                if mlp_seed_results[s] is not None
+            ) else "did NOT both avoid every warning") +
+            " -- see per-seed detail above.)"
         )
     else:
-        mlp_unstable = mlp_results["instability_warning_fired"]
-        gnn_unstable = gnn_results["instability_warning_fired"]
-        print(f"MLP instability warning fired: {mlp_unstable}")
-        print(f"GNN instability warning fired: {gnn_unstable}")
+        print("  training ABORTED (NaN/Inf loss).")
 
-        if gnn_unstable:
+    # === Step 3.4: four-row comparison table ===
+    print("\n=== Step 3.4: four-way comparison (Milestone 14 vs Milestone 14B) ===")
+    print(f"{'Model (run)':<48} {'Dataset':>8} {'Brier@15s':>10} {'Brier@30s':>10}")
+    print(
+        f"{'MLP (Milestone 14, COLLAPSED, for the record)':<48} {MILESTONE_14_DATASET_SIZE:>8} "
+        f"{MILESTONE_14_MLP_COLLAPSED_BRIER_15S:>10.4f} {MILESTONE_14_MLP_COLLAPSED_BRIER_30S:>10.4f}"
+    )
+    print(
+        f"{'GNN (Milestone 14, stable)':<48} {MILESTONE_14_DATASET_SIZE:>8} "
+        f"{MILESTONE_14_GNN_STABLE_BRIER_15S:>10.4f} {MILESTONE_14_GNN_STABLE_BRIER_30S:>10.4f}"
+    )
+    if primary_mlp_results is not None:
+        print(
+            f"{'MLP (Milestone 14B, stabilized)':<48} {dataset_size:>8} "
+            f"{primary_mlp_results['brier_15s']:>10.4f} {primary_mlp_results['brier_30s']:>10.4f}"
+        )
+    else:
+        print(f"{'MLP (Milestone 14B, stabilized)':<48} {dataset_size:>8} {'ABORTED':>10} {'ABORTED':>10}")
+    if gnn_results is not None:
+        print(
+            f"{'GNN (Milestone 14B, same hyperparams as MLP)':<48} {dataset_size:>8} "
+            f"{gnn_results['brier_15s']:>10.4f} {gnn_results['brier_30s']:>10.4f}"
+        )
+    else:
+        print(f"{'GNN (Milestone 14B, same hyperparams as MLP)':<48} {dataset_size:>8} {'ABORTED':>10} {'ABORTED':>10}")
+
+    # === Step 5: conditional RQ4 conclusion -- ONLY if evidence quality supports one ===
+    print("\n=== Step 5: RQ4 conclusion (conditional on evidence quality) ===")
+    if any_warnings_anywhere:
+        print(
+            "At least one run (MLP seed 42, MLP seed 43, or GNN) triggered an instability "
+            "warning under the strengthened detector, or aborted outright. Per Milestone 12B's "
+            "precedent: NOT issuing an RQ4 conclusion this run. Report the blocker, fix it, "
+            "re-run -- do not force a verdict."
+        )
+    elif not mlp_healthy:
+        print(
+            "No instability warnings fired, but the stabilized MLP does not pass the 'genuinely "
+            "learning well' health check above -- it may be stable-but-undertrained rather than a "
+            "fair comparison point. NOT issuing an RQ4 conclusion this run. The 'same "
+            "hyperparameters for both models' approach needs its own dedicated tuning pass for "
+            "the MLP before this comparison is trustworthy."
+        )
+    else:
+        gnn_better_or_comparable = (
+            gnn_results["brier_15s"] <= primary_mlp_results["brier_15s"] * 1.1
+            and gnn_results["brier_30s"] <= primary_mlp_results["brier_30s"] * 1.1
+        )
+        print(
+            f"Both models are confirmed genuinely healthy: no warnings fired (spike, cumulative "
+            f"drift, saturation, or frozen-val-loss) across both MLP seeds and the GNN, and the "
+            f"MLP's loss decreased meaningfully with a sane Brier Score. MLP Brier@15s/30s = "
+            f"{primary_mlp_results['brier_15s']:.4f} / {primary_mlp_results['brier_30s']:.4f}; "
+            f"GNN = {gnn_results['brier_15s']:.4f} / {gnn_results['brier_30s']:.4f}."
+        )
+        if gnn_better_or_comparable:
             print(
-                "\nSTOP: the GNN still triggered the residual-instability warning despite the "
-                "Milestone 12B stabilization bundle (gradient clipping, weight decay, lr=1e-4). "
-                "Reporting this honestly rather than forcing an RQ4 conclusion. The loss curve "
-                f"(by epoch) was logged to MLflow under run_id={gnn_results['run_id']} for "
-                "inspection. Further fixes (an even lower learning rate, batch normalization "
-                "between the SAGEConv layers) are follow-up work, not attempted further in this "
-                "run per the task's explicit scope."
+                "The GNN is competitive with or better than the (now genuinely healthy) MLP at "
+                "this scale, using IDENTICAL hyperparameters for both -- real, if still "
+                "single-run, evidence in favor of graph representations for RQ4. Given this "
+                "project's history of surprises at exactly this comparison step (Milestones 12, "
+                "14), this should be read as one data point, not a settled verdict -- consistent "
+                "with the README's framing of RQs as working hypotheses."
             )
-            print(f"GNN per-epoch train loss: {gnn_results['epoch_losses']}")
         else:
-            print("Both models completed all 50 epochs without the instability warning firing.")
-
-            mlp_gap = mlp_results["train_val_gap"]
-            gnn_gap = gnn_results["train_val_gap"]
             print(
-                f"\nTrain/val loss gap -- MLP: {mlp_gap:+.4f} (train={mlp_results['train_loss']:.4f}, "
-                f"val={mlp_results['val_loss']:.4f})"
+                "The MLP outperforms the GNN even with both confirmed healthy and using identical "
+                "hyperparameters -- RQ4's answer here leans toward the handcrafted scalar "
+                "features, though still hedged given how often this exact comparison has moved "
+                "across milestones as data scale and stabilization changed."
             )
-            print(
-                f"Train/val loss gap -- GNN: {gnn_gap:+.4f} (train={gnn_results['train_loss']:.4f}, "
-                f"val={gnn_results['val_loss']:.4f})"
-            )
-
-            gnn_brier_worse = (
-                gnn_results["brier_15s"] > mlp_results["brier_15s"]
-                and gnn_results["brier_30s"] > mlp_results["brier_30s"]
-            )
-            if gnn_brier_worse and gnn_gap <= mlp_gap + 0.05:
-                print(
-                    "\nThe GNN's train loss is now low/smooth and its train/val gap is comparable "
-                    "to (not meaningfully worse than) the MLP's, yet its Brier Score remains "
-                    "substantially worse. This looks like a DATA-LIMITED result, not an "
-                    f"optimization-limited one: {n_train} training samples may still be a modest "
-                    "dataset for a 2-layer GraphSAGE model's capacity relative to the 4-feature "
-                    "MLP. This is a genuinely different, equally valid finding for RQ4 -- not a "
-                    "non-result."
-                )
-            elif gnn_brier_worse:
-                print(
-                    "\nThe GNN's train/val gap is noticeably wider than the MLP's, suggesting some "
-                    "residual overfitting or optimization difficulty beyond pure data scale -- "
-                    "interpret the Brier comparison below with that in mind."
-                )
-
-            print("\n=== Step 2.4: MLP vs GNN, multi-competition vs Milestone 12B small-dataset ===")
-            print(f"{'Model (dataset)':<42} {'Dataset size':>12} {'Brier@15s':>10} {'Brier@30s':>10}")
-            print(
-                f"{'MLP (multi-competition)':<42} {dataset_size:>12} "
-                f"{mlp_results['brier_15s']:>10.4f} {mlp_results['brier_30s']:>10.4f}"
-            )
-            print(
-                f"{'GNN (multi-competition, stabilized)':<42} {dataset_size:>12} "
-                f"{gnn_results['brier_15s']:>10.4f} {gnn_results['brier_30s']:>10.4f}"
-            )
-            print(
-                f"{'MLP (Milestone 12B, single-competition)':<42} {MILESTONE_12B_DATASET_SIZE:>12} "
-                f"{MILESTONE_12B_MLP_BRIER_15S:>10.4f} {MILESTONE_12B_MLP_BRIER_30S:>10.4f}"
-            )
-            print(
-                f"{'GNN (Milestone 12B, single-competition)':<42} {MILESTONE_12B_DATASET_SIZE:>12} "
-                f"{MILESTONE_12B_GNN_BRIER_15S:>10.4f} {MILESTONE_12B_GNN_BRIER_30S:>10.4f}"
-            )
-            print(
-                f"  (for reference: GNN Milestone 12 UNSTABLE run, dataset_size="
-                f"{MILESTONE_10_FORCED_FLIP_DATASET_SIZE}: Brier@15s="
-                f"{MILESTONE_12_UNSTABLE_GNN_BRIER_15S:.4f}, Brier@30s="
-                f"{MILESTONE_12_UNSTABLE_GNN_BRIER_30S:.4f})"
-            )
-            print(
-                "NOTE: MLP and GNN are not matched in raw parameter count/capacity -- a caveat for "
-                "interpreting this comparison, not something to fix now. The MLP's optimizer "
-                "(lr=1e-3, no weight decay/clipping) was also left untouched while the GNN got a "
-                "3-part stabilization bundle -- a fully symmetric ablation (applying the same "
-                "bundle to the MLP) would further confirm the MLP isn't secretly benefiting from a "
-                "learning rate that happens to suit it, but is lower priority since it was already "
-                "stable."
-            )
-
-            print("\n=== RQ4 conclusion ===")
-            if not gnn_brier_worse:
-                print(
-                    "The GNN is stable AND competitive with or better than the MLP baseline at "
-                    "both horizons -- RQ4 supports graph representations outperforming the "
-                    "handcrafted scalar features in this setting."
-                )
-            elif gnn_gap <= mlp_gap + 0.05:
-                print(
-                    "The GNN is now stable but still underperforms the MLP at both horizons. Given "
-                    "the comparable train/val gap, this looks like a data-scale limitation rather "
-                    "than an optimization failure -- RQ4's answer here is a HEDGED 'not yet': the "
-                    "handcrafted scalar features currently outperform this graph representation, "
-                    "but more training data (not more tuning) is the most promising next lever "
-                    "before treating this as a settled negative result, consistent with the "
-                    "README's framing of RQs as working hypotheses rather than settled truths."
-                )
-            else:
-                print(
-                    "The GNN is now stable but still underperforms the MLP, with a wider train/val "
-                    "gap than the MLP's -- some residual overfitting/optimization difficulty likely "
-                    "remains beyond pure data scale. RQ4's answer here is a HEDGED 'not yet', with "
-                    "more diagnosis (not a flat verdict) warranted before concluding graphs "
-                    "underperform scalar features in general."
-                )
 
     print(f"\nMLflow experiment: {MLFLOW_EXPERIMENT_NAME}")
     print("Run `mlflow ui` from the project root to inspect results visually.")
