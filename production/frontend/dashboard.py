@@ -1,4 +1,12 @@
-"""Milestone 17 (Module 3/9 UI): Project Athena's live tactical dashboard.
+"""Milestones 17 & 19 (Module 3/9 UI): Project Athena's tactical dashboard.
+
+Two independent panels share this one script:
+
+  1. "Tactical What-If Simulator" (Milestone 19) -- a plain synchronous
+     REST call to `/simulate` (Milestone 18), triggered by "Run Simulation".
+     Fast, request/response, no blocking loop.
+  2. "Live Tactical Threat Monitor" (Milestone 17) -- a WebSocket stream,
+     triggered by "Start Stream". See the ARCHITECTURAL DECISION below.
 
 ARCHITECTURAL DECISION -- read before modifying this file:
 
@@ -26,9 +34,20 @@ deliberately, per Milestone 17's spec) is that the loop is NOT
 interactively stoppable mid-run: Streamlit cannot process a new "Stop"
 button click while the script is blocked inside this loop's `recv()`
 calls. Instead, the loop is bounded up front by an explicit max-duration
-and max-message-count control (Step 2.1), and simply ends on its own after
-that -- an honest alternative to a Stop button that would not actually
-work while the script is blocked.
+and max-message-count control, and simply ends on its own after that -- an
+honest alternative to a Stop button that would not actually work while the
+script is blocked.
+
+PERMANENT CONSEQUENCE FOR MILESTONE 19 (do not paper over this): because
+that blocking loop occupies the ENTIRE script execution while it runs,
+Streamlit cannot process ANY other widget interaction -- including the
+What-If panel's "Run Simulation" button -- until the loop ends. The two
+panels are laid out on the same page for convenience, but they are NOT
+usable at the same time: whichever action was clicked (Start Stream, or
+Run Simulation) is the only one that runs in that script execution. This
+is a real, permanent limitation of the single-blocking-loop architecture,
+not a bug to fix or a scenario to engineer around -- it is documented here
+and surfaced directly in the UI caption below.
 
 Do NOT "fix" this by moving the loop into session_state, a background
 thread, or an st.fragment/rerun-driven poll unless you have specifically
@@ -40,23 +59,36 @@ import json
 import time
 
 import pandas as pd
+import requests
 import streamlit as st
 import websocket
 
+DEFAULT_REST_BASE_URL = "http://127.0.0.1:8000"
 DEFAULT_WS_URL = "ws://127.0.0.1:8000/ws/tactical-stream"
 DEFAULT_MATCH_ID = "3857276"
 MAX_THREAT_BUFFER_LEN = 60
 MAX_ALERT_BUFFER_LEN = 20
 RECV_TIMEOUT_SECONDS = 10.0  # how long to wait for a single message before treating the stream as stalled
+SIMULATE_REQUEST_TIMEOUT_SECONDS = 5.0  # mandatory -- see What-If section below
+TACTICAL_ACTIONS = ["high_press", "drop_deep", "force_wide", "no_change"]
 
 st.set_page_config(page_title="Project Athena: Live Tactical Threat Monitor", layout="wide")
 st.title("Project Athena: Live Tactical Threat Monitor")
+st.caption(
+    "Note: the What-If Simulator and the Live Stream cannot run at the same time -- "
+    "the live stream (if started) will block interaction with this panel until it finishes. "
+    "See this file's module docstring for why."
+)
 
-# --- Sidebar: connection + run-bound controls (Step 2.1) -------------------
+# --- Sidebar: connection settings, shared by both panels -------------------
 with st.sidebar:
-    st.header("Stream Settings")
+    st.header("Connection Settings")
+    rest_base_url = st.text_input("REST API Base URL", value=DEFAULT_REST_BASE_URL)
     ws_url = st.text_input("WebSocket URL", value=DEFAULT_WS_URL)
     match_id = st.text_input("Match ID", value=DEFAULT_MATCH_ID)
+
+    st.divider()
+    st.header("Live Stream Settings")
     max_duration_seconds = st.number_input(
         "Max stream duration (seconds)", min_value=1, max_value=3600, value=300
     )
@@ -65,7 +97,81 @@ with st.sidebar:
     )
     start_clicked = st.button("Start Stream", type="primary")
 
-# --- Main layout: status line + two columns (chart / alerts) --------------
+# ============================================================================
+# Panel 1: Tactical What-If Simulator (Milestone 19) -- rendered/checked
+# FIRST, before the live-stream section below. This ordering matters, not
+# just visually: on any script execution where "Run Simulation" was clicked,
+# this panel's single fast REST call runs and completes here, and execution
+# then falls through the (unclicked) "Start Stream" button below and the
+# script ends normally. On a script execution where "Start Stream" was
+# clicked instead, this panel's button check below is simply False and is
+# skipped in a single line, before execution reaches the live section's
+# blocking loop. Neither panel's code has to "wait" on the other in either
+# case -- but see the module docstring: this does NOT mean both can be
+# triggered in the same run. Only one button click is being processed per
+# script execution, ever.
+# ============================================================================
+st.header("Tactical What-If Simulator")
+
+action = st.selectbox("Tactical Action", TACTICAL_ACTIONS)
+minute = st.number_input("Match Minute", min_value=0, value=10, step=1)
+run_simulation_clicked = st.button("Run Simulation")
+
+simulation_result_placeholder = st.empty()
+
+if run_simulation_clicked:
+    simulation_result_placeholder.info("Running simulation...")
+    try:
+        response = requests.get(
+            f"{rest_base_url}/simulate",
+            params={"match_id": match_id, "minute": int(minute), "action": action},
+            timeout=SIMULATE_REQUEST_TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+        result = response.json()
+    except requests.exceptions.Timeout:
+        simulation_result_placeholder.error(
+            f"Request timed out after {SIMULATE_REQUEST_TIMEOUT_SECONDS:.0f}s -- the backend at "
+            f"{rest_base_url} did not respond in time."
+        )
+    except requests.exceptions.ConnectionError:
+        simulation_result_placeholder.error(
+            f"Backend unreachable at {rest_base_url} -- confirm the FastAPI server is running "
+            "(uvicorn production.src.serving.api:app)."
+        )
+    except requests.exceptions.HTTPError as exc:
+        simulation_result_placeholder.error(f"Simulation request failed: {exc}")
+    except Exception as exc:
+        simulation_result_placeholder.error(f"Simulation request failed: {exc}")
+    else:
+        baseline = result["baseline_threat_15s"]
+        simulated = result["simulated_threat_15s"]
+        delta = result["delta"]
+
+        with simulation_result_placeholder.container():
+            metric_cols = st.columns(3)
+            metric_cols[0].metric("Baseline Threat (15s)", f"{baseline * 100:.2f}%")
+            metric_cols[1].metric("Simulated Threat (15s)", f"{simulated * 100:.2f}%")
+            # delta_color="inverse" is deliberate: st.metric's DEFAULT
+            # coloring shows a positive delta as green ("good news"), which
+            # is backwards here -- a positive delta means predicted THREAT
+            # went UP. "inverse" makes an increase render red/warning and a
+            # decrease render green/reassuring, matching what the number
+            # actually means tactically.
+            metric_cols[2].metric(
+                "Delta (simulated - baseline)",
+                f"{delta * 100:+.2f} pp",
+                delta=f"{delta * 100:+.2f} pp",
+                delta_color="inverse",
+            )
+
+st.divider()
+
+# ============================================================================
+# Panel 2: Live Tactical Threat Monitor (Milestone 17) -- unchanged.
+# ============================================================================
+st.header("Live Tactical Threat Monitor")
+
 status_placeholder = st.empty()
 chart_col, alerts_col = st.columns(2)
 

@@ -200,7 +200,14 @@ async def tactical_stream(
         pass
 
 
-def _find_qualifying_frame_for_minute(match_id: int, minute: int):
+def _find_qualifying_frame_for_minute(
+    match_id: int,
+    minute: int,
+    *,
+    period: int | None = None,
+    team_id: int | None = None,
+    max_minute: int | None = None,
+):
     """Finds the first event, in PERIOD-AWARE order, with a `minute` value
     `>= minute` that also has an associated 360 freeze-frame.
 
@@ -216,21 +223,46 @@ def _find_qualifying_frame_for_minute(match_id: int, minute: int):
     function resolves the ambiguity by always preferring a period-1 match
     over a period-2 match at the same minute value.
 
+    Optional keyword-only filters (added for Milestone 20's oracle
+    validator; all default to the exact Milestone 18 `/simulate` behavior
+    when omitted, so this remains a genuine extension, not a fork):
+      - `period`: if given, ONLY that period is searched (no period-1-then-
+        period-2 fallback at all). Milestone 20 always knows a
+        substitution's own period up front, so there is no ambiguity left
+        to resolve the way the `None` case above does -- and searching
+        both periods anyway would risk a false cross-period match (a
+        period-1 event satisfying `minute >= X` purely because periods 1
+        and 2's raw minute ranges overlap, even though period 1 already
+        ended before period 2 began in real time).
+      - `team_id`: if given, only events whose acting team
+        (`event["team"]["id"]`) matches are considered.
+      - `max_minute`: if given, only events with `minute < max_minute` are
+        considered (exclusive upper bound) -- used by the oracle validator
+        to guarantee a "pre-substitution" frame search can never cross past
+        the substitution's own minute and accidentally return a
+        post-substitution event.
+
     Returns (event, frame_data), or None if no qualifying frame exists
-    anywhere in the match.
+    anywhere in the searched scope.
     """
     events = fetch_match_events(match_id)
     frames = fetch_match_360(match_id)
     frames_by_event_uuid = {f["event_uuid"]: f for f in frames}
 
-    for period in (1, 2):
+    periods_to_search = (period,) if period is not None else (1, 2)
+
+    for search_period in periods_to_search:
         for event in events:
-            if event["period"] != period:
+            if event["period"] != search_period:
                 continue
             if "location" not in event:
                 continue
             event_minute = event.get("minute")
             if event_minute is None or event_minute < minute:
+                continue
+            if max_minute is not None and event_minute >= max_minute:
+                continue
+            if team_id is not None and event.get("team", {}).get("id") != team_id:
                 continue
             frame_data = frames_by_event_uuid.get(event["id"])
             if frame_data is None:

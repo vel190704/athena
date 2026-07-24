@@ -49,6 +49,7 @@ from production.src.ingestion.statsbomb_io import (
     find_360_competitions,
     parse_360_frame,
 )
+from production.src.models.deep_ensemble import DeepEnsembleDeepHit, compute_disentangled_ensemble_loss
 from production.src.models.deephit import DeepHitSurvivalModel
 from production.src.models.deephit_loss import DeepHitLoss
 from production.src.models.evaluation import calculate_brier_score
@@ -192,6 +193,23 @@ MLP_ROBUSTNESS_CHECK_SEEDS = (42, 43)
 # Step 2.2's health check rather than silently accepted.
 MLP_SANITY_BRIER_15S_CEILING = MILESTONE_12B_MLP_BRIER_15S * 2.5
 MLP_SANITY_BRIER_30S_CEILING = MILESTONE_12B_MLP_BRIER_30S * 2.5
+
+# Milestone 14B's canonical (seed=42) stabilized single-MLP Brier Scores,
+# on this same multi-competition dataset -- the baseline Milestone 21's
+# Deep Ensemble is compared against. NOT re-derived here (that run is not
+# retrained/overwritten); kept as a literal reference constant, same
+# pattern as MILESTONE_14_*/MILESTONE_12B_* above.
+MILESTONE_14B_MLP_RUN_ID = "e2c42aeed7374c398643298a1580a08c"
+MILESTONE_14B_MLP_BRIER_15S = 0.09422525763511658
+MILESTONE_14B_MLP_BRIER_30S = 0.1588379144668579
+
+# Milestone 21: Deep Ensemble uncertainty quantification (ADR-004 -- a Deep
+# Ensemble, NOT a true Batch Ensemble; see that ADR for why). Uses the SAME
+# stabilization bundle as the Milestone 14B MLP/GNN (lr, weight decay,
+# gradient clipping) -- a new architecture gets this safety net applied,
+# not skipped, per this project's history of silent training failures at
+# this exact data scale (Milestone 14).
+DEEP_ENSEMBLE_M = 5
 
 
 def _match_chains_with_features(match_id: int, engine: BiomechanicalPitchControl):
@@ -638,6 +656,271 @@ def _train_and_log_model(
     }
 
 
+def _train_and_log_deep_ensemble(
+    model: DeepEnsembleDeepHit,
+    optimizer: torch.optim.Optimizer,
+    train_loader: DataLoader,
+    val_batch: tuple,
+    n_train: int,
+    n_val: int,
+    match_ids: list[int],
+    dataset_size: int,
+    normalization_mean: torch.Tensor,
+    normalization_std: torch.Tensor,
+    normalization_artifact: dict,
+    run_tags: dict | None = None,
+) -> dict | None:
+    """Deep Ensemble analog of `_train_and_log_model`. Kept as a separate
+    function rather than folded into the shared loop above: that loop's
+    body assumes a single `[B, num_bins]` prediction tensor goes straight
+    into one `DeepHitLoss` call, but the ensemble's per-member gradient
+    disentanglement (Step 2.3/ADR-004) requires a genuinely different loop
+    body -- a [M, B, num_bins] forward pass and a Python loop over M
+    independent loss computations (see `compute_disentangled_ensemble_loss`)
+    -- so forcing it through the same `input_fn`/single-loss shape would
+    obscure, not clarify, that difference.
+
+    Per Step 2.3: the strengthened Milestone 14B instability detector
+    (spike, cumulative drift, saturation/entropy, frozen-val-loss) is
+    applied to the ensemble's MEAN prediction's train/val loss trajectory
+    -- i.e., the same `compute_disentangled_ensemble_loss` value already
+    used for backprop (itself an average across members), and `mean_pmf`
+    (the members' averaged PMF) for the saturation/entropy check. Ensemble
+    DIVERSITY is a separate, dedicated metric (Step 2.4), not something
+    this reused detector is expected to catch on its own.
+    """
+    loss_fn = DeepHitLoss()
+    M = model.M
+
+    with mlflow.start_run(run_name="deep_ensemble_run") as run:
+        if run_tags:
+            mlflow.set_tags(run_tags)
+
+        mlflow.log_params(
+            {
+                "model_type": "DeepEnsemble_MLP",
+                "M": M,
+                "lr": MLP_STABILIZED_LR,
+                "weight_decay": MLP_STABILIZED_WEIGHT_DECAY,
+                "gradient_clipping": True,
+                "epochs": NUM_EPOCHS,
+                "train_size": n_train,
+                "val_size": n_val,
+                "alpha": loss_fn.alpha,
+                "sigma": loss_fn.sigma,
+                "num_bins": NUM_BINS,
+                "bin_size": BIN_SIZE_SECONDS,
+                "random_seed": RANDOM_SEED,
+                "match_ids": ",".join(str(m) for m in match_ids),
+                "feature_key_order": ",".join(FEATURE_KEYS),
+                "match_count": len(match_ids),
+                "dataset_size": dataset_size,
+                "periods_included": ",".join(str(p) for p in CHAIN_BUILDER_PERIODS),
+                "coordinate_convention": "statsbomb_per_actor_native",
+                "stabilization_bundle": True,
+                "saturation_check_v2": True,
+                "ensemble_kind": "deep_ensemble_not_batch_ensemble",  # see ADR-004
+            }
+        )
+
+        print(
+            f"\n[DeepEnsemble] Training M={M} independent members for {NUM_EPOCHS} epochs on "
+            f"{n_train} samples ({n_val} held out for validation)..."
+        )
+
+        epoch_losses: list[float] = []
+        val_loss_history: dict[int, float] = {}
+        final_epoch_loss = None
+        cumulative_drift_fired = False
+        saturation_fired = False
+        frozen_val_loss_fired = False
+
+        for epoch in range(1, NUM_EPOCHS + 1):
+            model.train()
+            epoch_loss_total = 0.0
+            num_batches = 0
+
+            for batch_idx, (scalar_batch, graph_batch, duration_bins_batch, events_batch) in enumerate(
+                train_loader
+            ):
+                normalized_input = (scalar_batch - normalization_mean) / normalization_std
+
+                optimizer.zero_grad()
+                pmf_per_member = model(normalized_input)  # [M, B, num_bins] -- BROADCAST, see model docstring
+                loss = compute_disentangled_ensemble_loss(
+                    pmf_per_member, duration_bins_batch, events_batch, loss_fn
+                )
+
+                if not torch.isfinite(loss):
+                    print(f"[DeepEnsemble] NaN/Inf loss at epoch {epoch}, batch {batch_idx}. Stopping.")
+                    return None
+
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=GRAD_CLIP_MAX_NORM)
+                optimizer.step()
+
+                epoch_loss_total += loss.item()
+                num_batches += 1
+
+            final_epoch_loss = epoch_loss_total / num_batches
+            epoch_losses.append(final_epoch_loss)
+            mlflow.log_metric("train_loss", final_epoch_loss, step=epoch)
+
+            if epoch % 10 == 0 or epoch == 1:
+                print(f"  [DeepEnsemble] epoch {epoch:3d}/{NUM_EPOCHS}: mean-member training loss = {final_epoch_loss:.4f}")
+
+            if epoch % VAL_LOSS_LOG_INTERVAL_EPOCHS == 0 and epoch > CUMULATIVE_DRIFT_WINDOW_EPOCHS:
+                prior_loss = epoch_losses[epoch - CUMULATIVE_DRIFT_WINDOW_EPOCHS - 1]
+                drift_fraction = (
+                    (final_epoch_loss - prior_loss) / prior_loss if prior_loss > 0 else 0.0
+                )
+                mlflow.log_metric("cumulative_drift_fraction", drift_fraction, step=epoch)
+                if drift_fraction > CUMULATIVE_DRIFT_THRESHOLD_FRACTION:
+                    cumulative_drift_fired = True
+                    print(
+                        f"[DeepEnsemble] CUMULATIVE DRIFT WARNING at epoch {epoch}: mean-member loss "
+                        f"increased by {drift_fraction:.1%} over the last "
+                        f"{CUMULATIVE_DRIFT_WINDOW_EPOCHS} epochs."
+                    )
+
+            if epoch % VAL_LOSS_LOG_INTERVAL_EPOCHS == 0 or epoch == NUM_EPOCHS:
+                model.eval()
+                with torch.no_grad():
+                    val_scalar, val_graph, val_duration_bins, val_events = val_batch
+                    val_input = (val_scalar - normalization_mean) / normalization_std
+                    val_pmf_per_member = model(val_input)
+                    epoch_val_loss = compute_disentangled_ensemble_loss(
+                        val_pmf_per_member, val_duration_bins, val_events, loss_fn
+                    ).item()
+
+                    val_mean_pmf = val_pmf_per_member.mean(dim=0)  # [B, num_bins]
+                    batch_variance = val_mean_pmf.var(dim=0).mean().item()
+                    per_sample_entropy = -(
+                        val_mean_pmf * torch.log(val_mean_pmf.clamp(min=1e-8))
+                    ).sum(dim=1)
+                    mean_entropy = per_sample_entropy.mean().item()
+
+                mlflow.log_metric("val_loss", epoch_val_loss, step=epoch)
+                mlflow.log_metric("output_batch_variance", batch_variance, step=epoch)
+                mlflow.log_metric("output_mean_entropy", mean_entropy, step=epoch)
+
+                if (
+                    batch_variance < SATURATION_VARIANCE_THRESHOLD
+                    or mean_entropy < SATURATION_ENTROPY_THRESHOLD
+                ):
+                    saturation_fired = True
+                    print(
+                        f"[DeepEnsemble] SATURATION WARNING at epoch {epoch}: mean-prediction batch "
+                        f"variance={batch_variance:.2e}, mean entropy={mean_entropy:.4f} -- the "
+                        "ensemble's AVERAGED output has collapsed to a near-constant or near-one-hot "
+                        "distribution regardless of input."
+                    )
+
+                if val_loss_history:
+                    previous_check_epoch = max(val_loss_history.keys())
+                    if val_loss_history[previous_check_epoch] == epoch_val_loss:
+                        frozen_val_loss_fired = True
+                        print(
+                            f"[DeepEnsemble] FROZEN VAL LOSS WARNING at epoch {epoch}: val_loss is "
+                            f"bit-for-bit identical to epoch {previous_check_epoch}'s value "
+                            f"({epoch_val_loss})."
+                        )
+                val_loss_history[epoch] = epoch_val_loss
+
+        print(f"[DeepEnsemble] Final mean-member training loss: {final_epoch_loss:.4f}")
+
+        spike_fired = _check_for_instability("DeepEnsemble", epoch_losses)
+        instability_warning_fired = (
+            spike_fired or cumulative_drift_fired or saturation_fired or frozen_val_loss_fired
+        )
+        mlflow.log_param("spike_warning_fired", spike_fired)
+        mlflow.log_param("cumulative_drift_warning_fired", cumulative_drift_fired)
+        mlflow.log_param("saturation_warning_fired", saturation_fired)
+        mlflow.log_param("frozen_val_loss_warning_fired", frozen_val_loss_fired)
+        mlflow.log_param("instability_warning_fired", instability_warning_fired)
+        print(
+            f"[DeepEnsemble] Warning summary -- spike: {spike_fired}, cumulative_drift: "
+            f"{cumulative_drift_fired}, saturation: {saturation_fired}, frozen_val_loss: "
+            f"{frozen_val_loss_fired}"
+        )
+
+        model.eval()
+        with torch.no_grad():
+            val_scalar, val_graph, val_duration_bins, val_events = val_batch
+            val_input = (val_scalar - normalization_mean) / normalization_std
+
+            mean_pmf, std_cumulative_incidence, per_member_cumulative_incidence = model.predict_with_uncertainty(
+                val_input, time_bin=3
+            )
+            val_loss = compute_disentangled_ensemble_loss(
+                model(val_input), val_duration_bins, val_events, loss_fn
+            )
+            print(f"[DeepEnsemble] Validation loss (mean-member): {val_loss.item():.4f}")
+
+            briers = {}
+            for time_bin in BRIER_TIME_BINS:
+                brier, num_excluded = calculate_brier_score(
+                    mean_pmf, val_duration_bins, val_duration_bins, val_events, time_bin
+                )
+                seconds = time_bin * 5.0
+                print(f"  [DeepEnsemble] time_bin={time_bin} ({seconds:.0f}s): Brier Score (mean PMF) = {brier:.4f}")
+                briers[time_bin] = (brier, num_excluded)
+
+            # Step 2.4: diversity metric -- mean, across the validation set,
+            # of each sample's cross-member standard deviation of
+            # cumulative incidence at time_bin=3. A collapsed (non-diverse)
+            # ensemble would show this near zero; logged explicitly so that
+            # would be visible in MLflow, not just assumed away.
+            diversity_std_ci_15s = std_cumulative_incidence.mean().item()
+            print(f"[DeepEnsemble] Diversity metric (mean std of per-member CI@15s across val set): {diversity_std_ci_15s:.6f}")
+
+        brier_15s, excluded_15s = briers[3]
+        brier_30s, excluded_30s = briers[6]
+        train_val_gap = val_loss.item() - final_epoch_loss
+
+        mlflow.log_metrics(
+            {
+                "val_brier_15s": brier_15s,
+                "val_brier_30s": brier_30s,
+                "excluded_15s": excluded_15s,
+                "excluded_30s": excluded_30s,
+                "train_val_loss_gap": train_val_gap,
+                "ensemble_diversity_std_ci_15s": diversity_std_ci_15s,
+            }
+        )
+
+        mlflow.pytorch.log_model(model, name="deep_ensemble_model", serialization_format="pickle")
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as tmp_file:
+            json.dump(normalization_artifact, tmp_file, indent=2)
+            tmp_file_path = tmp_file.name
+        try:
+            mlflow.log_artifact(tmp_file_path, artifact_path="normalization")
+        finally:
+            os.remove(tmp_file_path)
+
+        print(f"[DeepEnsemble] MLflow run ID: {run.info.run_id}")
+
+    return {
+        "train_loss": final_epoch_loss,
+        "val_loss": val_loss.item(),
+        "brier_15s": brier_15s,
+        "brier_30s": brier_30s,
+        "excluded_15s": excluded_15s,
+        "excluded_30s": excluded_30s,
+        "train_val_gap": train_val_gap,
+        "instability_warning_fired": instability_warning_fired,
+        "spike_fired": spike_fired,
+        "cumulative_drift_fired": cumulative_drift_fired,
+        "saturation_fired": saturation_fired,
+        "frozen_val_loss_fired": frozen_val_loss_fired,
+        "diversity_std_ci_15s": diversity_std_ci_15s,
+        "epoch_losses": epoch_losses,
+        "val_loss_history": val_loss_history,
+        "run_id": run.info.run_id,
+    }
+
+
 def train_and_evaluate():
     torch.manual_seed(RANDOM_SEED)
 
@@ -822,6 +1105,85 @@ def train_and_evaluate():
             "std": graph_feature_std.tolist(),
         },
     )
+
+    # Reset the global RNG state before constructing the ensemble, same
+    # reasoning as before the GNN above: its M independent members'
+    # initialization shouldn't be accidentally coupled to wherever the GNN
+    # training loop left the global generator.
+    torch.manual_seed(RANDOM_SEED)
+
+    # === Milestone 21: Deep Ensemble uncertainty quantification (ADR-004).
+    # Same split, same normalization, same stabilization bundle as the
+    # Milestone 14B MLP/GNN -- only the model and its per-member-
+    # disentangled loss loop differ (see _train_and_log_deep_ensemble).
+    print(f"\n=== Milestone 21: Deep Ensemble (M={DEEP_ENSEMBLE_M}) training ===")
+    deep_ensemble_model = DeepEnsembleDeepHit(
+        num_features=len(FEATURE_KEYS), num_bins=NUM_BINS, M=DEEP_ENSEMBLE_M
+    )
+    deep_ensemble_optimizer = torch.optim.Adam(
+        deep_ensemble_model.parameters(),
+        lr=MLP_STABILIZED_LR,
+        weight_decay=MLP_STABILIZED_WEIGHT_DECAY,
+    )
+    deep_ensemble_results = _train_and_log_deep_ensemble(
+        model=deep_ensemble_model,
+        optimizer=deep_ensemble_optimizer,
+        train_loader=train_loader,
+        val_batch=val_batch,
+        n_train=n_train,
+        n_val=n_val,
+        match_ids=match_ids,
+        dataset_size=dataset_size,
+        normalization_mean=feature_mean,
+        normalization_std=feature_std,
+        normalization_artifact={
+            "feature_key_order": list(FEATURE_KEYS),
+            "mean": feature_mean.tolist(),
+            "std": feature_std.tolist(),
+        },
+        run_tags={
+            "baseline_single_mlp_run_id": MILESTONE_14B_MLP_RUN_ID,
+            "baseline_note": (
+                "Deep Ensemble (ADR-004 -- NOT a true Batch Ensemble), compared against the "
+                "Milestone 14B single-MLP baseline. ~5x parameters/compute vs. that baseline, "
+                "so this is not an equal-capacity comparison (same caveat as the Milestone 12 "
+                "MLP-vs-GNN comparison)."
+            ),
+        },
+    )
+
+    print("\n=== Milestone 21: Deep Ensemble warning summary + baseline comparison ===")
+    if deep_ensemble_results is None:
+        print("DeepEnsemble: training ABORTED (NaN/Inf loss).")
+    else:
+        print(
+            f"DeepEnsemble: spike={deep_ensemble_results['spike_fired']}, "
+            f"cumulative_drift={deep_ensemble_results['cumulative_drift_fired']}, "
+            f"saturation={deep_ensemble_results['saturation_fired']}, "
+            f"frozen_val_loss={deep_ensemble_results['frozen_val_loss_fired']}"
+        )
+        print(
+            f"DeepEnsemble diversity metric (mean std of per-member CI@15s): "
+            f"{deep_ensemble_results['diversity_std_ci_15s']:.6f}"
+        )
+        print(
+            f"\n{'Model':<40} {'Params (approx)':>16} {'Brier@15s':>10} {'Brier@30s':>10}"
+        )
+        print(
+            f"{'Single MLP (Milestone 14B, seed=42)':<40} {'1x':>16} "
+            f"{MILESTONE_14B_MLP_BRIER_15S:>10.4f} {MILESTONE_14B_MLP_BRIER_30S:>10.4f}"
+        )
+        print(
+            f"{f'Deep Ensemble (M={DEEP_ENSEMBLE_M}, mean PMF)':<40} {f'~{DEEP_ENSEMBLE_M}x':>16} "
+            f"{deep_ensemble_results['brier_15s']:>10.4f} {deep_ensemble_results['brier_30s']:>10.4f}"
+        )
+        print(
+            "NOTE: this is NOT an equal-capacity comparison -- the Deep Ensemble has ~"
+            f"{DEEP_ENSEMBLE_M}x the parameters and training/inference compute of the single MLP "
+            "(same caveat already established for the Milestone 12 MLP-vs-GNN comparison). A "
+            "lower ensemble Brier Score is evidence the mean-PMF prediction is at least as good, "
+            "not evidence the ensembling technique itself is more parameter-efficient."
+        )
 
     print(f"\nDataset size: {dataset_size} total samples ({n_train} train / {n_val} val)")
 
