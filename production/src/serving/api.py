@@ -13,11 +13,26 @@ main per-frame `threat` stream.
 """
 
 import asyncio
+import os
 from contextlib import asynccontextmanager
+from typing import Literal
+
+# Must be set before the lifespan handler's first MlflowClient() call (this
+# project's mlflow version treats the file-store backend as read-only
+# "maintenance mode" otherwise). Test files set this themselves before
+# importing this module, but this is the actual `uvicorn ...:app`
+# entrypoint, so it needs to set it too rather than depend on a test
+# harness having already done so.
+os.environ.setdefault("MLFLOW_ALLOW_FILE_STORE", "true")
 
 import torch
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 
+from production.src.ingestion.statsbomb_io import (
+    fetch_match_360,
+    fetch_match_events,
+    parse_360_frame,
+)
 from production.src.models.explainer import (
     _cumulative_incidence_forward,
     build_tactical_prompt,
@@ -26,6 +41,7 @@ from production.src.models.explainer import (
     load_deterministic_mlp,
 )
 from production.src.pipeline.feature_extractor import extract_features
+from production.src.pipeline.simulator import perturb_features
 from production.src.pipeline.survival_dataset import FEATURE_KEYS
 from production.src.serving.simulator import live_match_stream
 
@@ -182,3 +198,96 @@ async def tactical_stream(
             previous_threat_15s = cumulative_incidence
     except WebSocketDisconnect:
         pass
+
+
+def _find_qualifying_frame_for_minute(match_id: int, minute: int):
+    """Finds the first event, in PERIOD-AWARE order, with a `minute` value
+    `>= minute` that also has an associated 360 freeze-frame.
+
+    "Period-aware order" means: scan period 1 (in its own event order)
+    first, in full, THEN scan period 2 -- never a single ordering that
+    treats the raw event list as already globally minute-sorted across
+    both periods. This matters because StatsBomb's raw `minute` field does
+    NOT reset to 0 at half-time, but the two periods' minute RANGES still
+    overlap near the interval boundary (e.g. this project's cached match
+    has period 1 running 0-50, including first-half stoppage time, while
+    period 2 starts back at 45) -- so a requested minute in that overlap
+    (e.g. 47) is genuinely ambiguous under a naive single ordering. This
+    function resolves the ambiguity by always preferring a period-1 match
+    over a period-2 match at the same minute value.
+
+    Returns (event, frame_data), or None if no qualifying frame exists
+    anywhere in the match.
+    """
+    events = fetch_match_events(match_id)
+    frames = fetch_match_360(match_id)
+    frames_by_event_uuid = {f["event_uuid"]: f for f in frames}
+
+    for period in (1, 2):
+        for event in events:
+            if event["period"] != period:
+                continue
+            if "location" not in event:
+                continue
+            event_minute = event.get("minute")
+            if event_minute is None or event_minute < minute:
+                continue
+            frame_data = frames_by_event_uuid.get(event["id"])
+            if frame_data is None:
+                continue
+            return event, frame_data
+
+    return None
+
+
+@app.get("/simulate")
+async def simulate(
+    match_id: int,
+    minute: int,
+    action: Literal["high_press", "drop_deep", "force_wide", "no_change"],
+):
+    """Counterfactual "what if" endpoint (Module 8 / RQ5), exposed as a
+    REST GET so a single tactical action can be queried interactively
+    rather than only through the batch simulator tests (Milestone 13/14).
+
+    Deliberately reuses the EXISTING, already-validated pipeline functions
+    unchanged -- `parse_360_frame`, `extract_features`, `perturb_features`,
+    and this module's own `_predict_cumulative_incidence_sync` (the same
+    helper the `/ws/tactical-stream` WebSocket endpoint uses, which itself
+    wraps the Milestone 15 `_cumulative_incidence_forward` convention) --
+    rather than a parallel/simplified extraction path. `extract_features`
+    specifically encodes ADR-002's coordinate rescaling and ADR-009's
+    no-direction-flip convention; reimplementing any part of this here
+    would risk silently drifting from those already-validated conventions.
+
+    `action` is a `Literal`, so FastAPI/pydantic itself rejects an invalid
+    value with a 422 before this function body ever runs -- there is no
+    manual validation to fall through incorrectly.
+    """
+    result = _find_qualifying_frame_for_minute(match_id, minute)
+    if result is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No 360 freeze-frame found at or after minute {minute} for match {match_id}",
+        )
+    event, frame_data = result
+
+    parsed_frame = parse_360_frame(event, frame_data)
+    baseline_features = extract_features(parsed_frame)
+    simulated_features = perturb_features(baseline_features, action)
+
+    baseline_threat_15s, _ = await asyncio.to_thread(
+        _predict_cumulative_incidence_sync, baseline_features
+    )
+    simulated_threat_15s, _ = await asyncio.to_thread(
+        _predict_cumulative_incidence_sync, simulated_features
+    )
+
+    return {
+        "match_id": match_id,
+        "minute": minute,
+        "action": action,
+        "baseline_threat_15s": baseline_threat_15s,
+        "simulated_threat_15s": simulated_threat_15s,
+        "delta": simulated_threat_15s - baseline_threat_15s,
+    }

@@ -11,3 +11,5 @@ fastapi
 uvicorn
 websockets
 httpx2
+streamlit
+websocket-client
