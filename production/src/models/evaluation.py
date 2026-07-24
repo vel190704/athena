@@ -124,3 +124,37 @@ def predict_cumulative_incidence(
     survival_at_t = survival[0, time_bin].item()
 
     return 1.0 - survival_at_t
+
+
+def predict_cumulative_incidence_graph(
+    model: torch.nn.Module,
+    graph_data,
+    normalization_mean: torch.Tensor,
+    normalization_std: torch.Tensor,
+    time_bin: int = 3,
+) -> float:
+    """Graph-representation counterpart to `predict_cumulative_incidence`,
+    for the GNN (Milestone 14). Same 1 - S(time_bin) definition and naming
+    rationale -- see that function's docstring.
+
+    `graph_data` is a single (ungrouped) PyG `Data` object, e.g. from
+    `graph_builder.build_graph_from_frame`. Only the continuous node-feature
+    columns ([x, y, dist_to_ball] -- indices 0, 1, 6) are standardized,
+    using the SAME training-split-derived mean/std the GNN was trained
+    with; vx/vy and the is_attacker/is_defender flags are left untouched,
+    matching Milestone 12's normalization rule. `graph_data` itself is not
+    mutated -- a modified clone is built and passed to the model.
+    """
+    normalized_data = graph_data.clone()
+    x = normalized_data.x.clone()
+    x[:, [0, 1, 6]] = (x[:, [0, 1, 6]] - normalization_mean) / normalization_std
+    normalized_data.x = x
+
+    model.eval()
+    with torch.no_grad():
+        predictions = model(normalized_data)  # [1, num_bins] PMF (single graph, no .batch set)
+
+    survival = 1.0 - torch.cumsum(predictions, dim=1)
+    survival_at_t = survival[0, time_bin].item()
+
+    return 1.0 - survival_at_t

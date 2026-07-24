@@ -46,6 +46,7 @@ from production.src.ingestion.statsbomb_io import (
     batch_extract_valid_matches,
     fetch_match_360,
     fetch_match_events,
+    find_360_competitions,
     parse_360_frame,
 )
 from production.src.models.deephit import DeepHitSurvivalModel
@@ -65,11 +66,19 @@ from production.src.spatial.control import BiomechanicalPitchControl
 
 MLFLOW_EXPERIMENT_NAME = "project-athena-deephit"
 
-# World Cup 2022 (competition_id=43, season_id=106), scaled from Milestone
-# 8's 5 hardcoded matches to a batch pull across the whole competition.
-COMPETITION_ID = 43
-SEASON_ID = 106
-NUM_MATCHES_NEEDED = 20
+# Milestone 14: scaled from a single competition (World Cup 2022 only,
+# Milestones 8-12B) to ALL competitions StatsBomb's live competitions index
+# verifies as having 360 data (via `match_available_360` -- see
+# find_360_competitions; NOT a hardcoded list of "competitions that should
+# have 360 coverage," the same lesson as Milestone 3's match-id and
+# Milestone 9's competition-matches verification). MATCH_POOL_SIZE is a
+# generous upper bound on how many valid matches to gather as candidates
+# BEFORE processing (per-match sample yield isn't knowable until a match is
+# actually processed into possession chains); TARGET_SAMPLE_COUNT is the
+# actual stopping condition, checked after each match is processed, per the
+# task's 5,000-10,000 possession-chain sample target.
+MATCH_POOL_SIZE = 100
+TARGET_SAMPLE_COUNT = 8000
 
 # Possession chains are built across both halves (Milestone 9). Period-2
 # chains contribute trainable feature samples with NO coordinate
@@ -145,6 +154,15 @@ MILESTONE_10_FORCED_FLIP_BRIER_15S = 0.0956
 MILESTONE_10_FORCED_FLIP_BRIER_30S = 0.1874
 MILESTONE_10_FORCED_FLIP_DATASET_SIZE = 3198
 
+# Milestone 12B's STABILIZED single-competition (World Cup 2022 only)
+# MLP/GNN pair -- the direct "prior small-dataset numbers" this milestone's
+# multi-competition run is meant to be compared against (Step 2.4).
+MILESTONE_12B_DATASET_SIZE = 3198
+MILESTONE_12B_MLP_BRIER_15S = 0.0846
+MILESTONE_12B_MLP_BRIER_30S = 0.1720
+MILESTONE_12B_GNN_BRIER_15S = 0.1051
+MILESTONE_12B_GNN_BRIER_30S = 0.2042
+
 
 def _match_chains_with_features(match_id: int, engine: BiomechanicalPitchControl):
     """Pair each possession chain (Milestone 5/9, both periods by default)
@@ -209,21 +227,55 @@ def _match_chains_with_features(match_id: int, engine: BiomechanicalPitchControl
 
 
 def build_training_data():
-    match_ids = batch_extract_valid_matches(
-        competition_id=COMPETITION_ID, season_id=SEASON_ID, num_matches=NUM_MATCHES_NEEDED
+    qualifying_competitions = find_360_competitions()
+    print(f"Competitions verified (via the live competitions index) to have 360 data ({len(qualifying_competitions)}):")
+    for c in qualifying_competitions:
+        print(
+            f"  competition_id={c['competition_id']}, season_id={c['season_id']}: "
+            f"{c['competition_name']} {c['season_name']}"
+        )
+
+    competition_season_pairs = [
+        (c["competition_id"], c["season_id"]) for c in qualifying_competitions
+    ]
+    match_pool = batch_extract_valid_matches(competition_season_pairs, num_matches=MATCH_POOL_SIZE)
+    print(
+        f"\nResolved {len(match_pool)} valid matches across {len(qualifying_competitions)} "
+        f"qualifying competitions (pool target {MATCH_POOL_SIZE})"
     )
-    print(f"Resolved {len(match_ids)} valid matches (requested {NUM_MATCHES_NEEDED}): {match_ids}")
 
     engine = BiomechanicalPitchControl()
     all_features, all_frames, all_chains, all_source_event_ids = [], [], [], []
-    for match_id in match_ids:
+    used_match_ids = []
+    for match_id in match_pool:
         features, frames, chains, source_event_ids = _match_chains_with_features(match_id, engine)
         all_features.extend(features)
         all_frames.extend(frames)
         all_chains.extend(chains)
         all_source_event_ids.extend(source_event_ids)
+        used_match_ids.append(match_id)
 
-    return all_features, all_frames, all_chains, all_source_event_ids, match_ids
+        if len(all_features) >= TARGET_SAMPLE_COUNT:
+            print(
+                f"\nReached target sample count ({TARGET_SAMPLE_COUNT}) after "
+                f"{len(used_match_ids)} matches -- stopping early rather than "
+                "exhaustively processing the whole match pool."
+            )
+            break
+
+    print(
+        f"Final: {len(all_features)} samples from {len(used_match_ids)} matches "
+        f"(target was {TARGET_SAMPLE_COUNT}, requested range 5,000-10,000)"
+    )
+
+    return (
+        all_features,
+        all_frames,
+        all_chains,
+        all_source_event_ids,
+        used_match_ids,
+        qualifying_competitions,
+    )
 
 
 def _normalize_scalar_batch(scalar_batch: torch.Tensor, graph_batch, mean, std) -> torch.Tensor:
@@ -475,9 +527,12 @@ def _train_and_log_model(
 def train_and_evaluate():
     torch.manual_seed(RANDOM_SEED)
 
-    features, frames, chains, source_event_ids, match_ids = build_training_data()
+    features, frames, chains, source_event_ids, match_ids, qualifying_competitions = build_training_data()
     match_count = len(match_ids)
     dataset_size = len(features)
+    competition_season_summary = ",".join(
+        f"{c['competition_id']}:{c['season_id']}" for c in qualifying_competitions
+    )
     print(f"\nTotal (feature, frame, chain) triples across {match_count} matches: {dataset_size}")
     if dataset_size < SMALL_DATASET_WARNING_THRESHOLD:
         print(
@@ -566,7 +621,10 @@ def train_and_evaluate():
         n_val=n_val,
         match_ids=match_ids,
         dataset_size=dataset_size,
-        extra_params={},
+        extra_params={
+            "dataset_scale": "multi_competition",
+            "competition_season_pairs": competition_season_summary,
+        },
         normalization_artifact={
             "feature_key_order": list(FEATURE_KEYS),
             "mean": feature_mean.tolist(),
@@ -602,6 +660,8 @@ def train_and_evaluate():
             "same_team_radius": DEFAULT_SAME_TEAM_RADIUS,
             "opponent_radius": DEFAULT_OPPONENT_RADIUS,
             "hidden_dim": GNN_HIDDEN_DIM,
+            "dataset_scale": "multi_competition",
+            "competition_season_pairs": competition_season_summary,
         },
         run_tags={
             "supersedes_run_id": MILESTONE_12_UNSTABLE_GNN_RUN_ID,
@@ -685,9 +745,10 @@ def train_and_evaluate():
                     "\nThe GNN's train loss is now low/smooth and its train/val gap is comparable "
                     "to (not meaningfully worse than) the MLP's, yet its Brier Score remains "
                     "substantially worse. This looks like a DATA-LIMITED result, not an "
-                    "optimization-limited one: 2,558 training samples is a modest dataset for a "
-                    "2-layer GraphSAGE model's capacity relative to the 4-feature MLP. This is a "
-                    "genuinely different, equally valid finding for RQ4 -- not a non-result."
+                    f"optimization-limited one: {n_train} training samples may still be a modest "
+                    "dataset for a 2-layer GraphSAGE model's capacity relative to the 4-feature "
+                    "MLP. This is a genuinely different, equally valid finding for RQ4 -- not a "
+                    "non-result."
                 )
             elif gnn_brier_worse:
                 print(
@@ -696,13 +757,29 @@ def train_and_evaluate():
                     "interpret the Brier comparison below with that in mind."
                 )
 
-            print("\n=== RQ4 comparison table ===")
-            print(f"{'Model':<24} {'Brier@15s':>10} {'Brier@30s':>10}")
-            print(f"{'MLP':<24} {mlp_results['brier_15s']:>10.4f} {mlp_results['brier_30s']:>10.4f}")
-            print(f"{'GNN (stabilized)':<24} {gnn_results['brier_15s']:>10.4f} {gnn_results['brier_30s']:>10.4f}")
+            print("\n=== Step 2.4: MLP vs GNN, multi-competition vs Milestone 12B small-dataset ===")
+            print(f"{'Model (dataset)':<42} {'Dataset size':>12} {'Brier@15s':>10} {'Brier@30s':>10}")
             print(
-                f"{'GNN (Milestone 12, unstable)':<24} {MILESTONE_12_UNSTABLE_GNN_BRIER_15S:>10.4f} "
-                f"{MILESTONE_12_UNSTABLE_GNN_BRIER_30S:>10.4f}"
+                f"{'MLP (multi-competition)':<42} {dataset_size:>12} "
+                f"{mlp_results['brier_15s']:>10.4f} {mlp_results['brier_30s']:>10.4f}"
+            )
+            print(
+                f"{'GNN (multi-competition, stabilized)':<42} {dataset_size:>12} "
+                f"{gnn_results['brier_15s']:>10.4f} {gnn_results['brier_30s']:>10.4f}"
+            )
+            print(
+                f"{'MLP (Milestone 12B, single-competition)':<42} {MILESTONE_12B_DATASET_SIZE:>12} "
+                f"{MILESTONE_12B_MLP_BRIER_15S:>10.4f} {MILESTONE_12B_MLP_BRIER_30S:>10.4f}"
+            )
+            print(
+                f"{'GNN (Milestone 12B, single-competition)':<42} {MILESTONE_12B_DATASET_SIZE:>12} "
+                f"{MILESTONE_12B_GNN_BRIER_15S:>10.4f} {MILESTONE_12B_GNN_BRIER_30S:>10.4f}"
+            )
+            print(
+                f"  (for reference: GNN Milestone 12 UNSTABLE run, dataset_size="
+                f"{MILESTONE_10_FORCED_FLIP_DATASET_SIZE}: Brier@15s="
+                f"{MILESTONE_12_UNSTABLE_GNN_BRIER_15S:.4f}, Brier@30s="
+                f"{MILESTONE_12_UNSTABLE_GNN_BRIER_30S:.4f})"
             )
             print(
                 "NOTE: MLP and GNN are not matched in raw parameter count/capacity -- a caveat for "

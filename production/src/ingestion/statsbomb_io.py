@@ -24,6 +24,9 @@ MATCHES_URL_TEMPLATE = (
     "https://raw.githubusercontent.com/statsbomb/open-data/master/data/matches/"
     "{competition_id}/{season_id}.json"
 )
+COMPETITIONS_URL = (
+    "https://raw.githubusercontent.com/statsbomb/open-data/master/data/competitions.json"
+)
 
 CACHE_DIR = Path("data/raw")
 
@@ -100,42 +103,92 @@ def fetch_competition_matches(competition_id: int, season_id: int) -> list[dict]
     return matches
 
 
-def batch_extract_valid_matches(competition_id: int, season_id: int, num_matches: int) -> list[int]:
-    """Return up to `num_matches` match_ids from a competition/season that
-    have BOTH events and 360 data present, reusing the same validity check
-    and disk cache as `find_valid_match_id`.
+def _competitions_cache_path() -> Path:
+    return CACHE_DIR / "competitions.json"
 
-    Stops as soon as `num_matches` valid matches are found rather than
-    exhaustively checking every match in the competition. If the whole
-    competition has fewer than `num_matches` valid matches, returns however
-    many were found and prints a warning instead of raising.
+
+def fetch_competitions_index() -> list[dict]:
+    """Fetch (and cache) StatsBomb's full competitions index."""
+    data = _fetch_json(COMPETITIONS_URL, _competitions_cache_path())
+    if data is None:
+        raise ValueError("could not fetch the StatsBomb competitions index")
+    return data
+
+
+def find_360_competitions() -> list[dict]:
+    """Competitions/seasons verified to have 360 freeze-frame data
+    available, via the `match_available_360` field on the LIVE competitions
+    index -- NOT a hardcoded list from memory (a competition "sounding like"
+    it should have 360 data, e.g. an older World Cup or Euros, may or may
+    not actually have public 360 coverage; this is the same lesson as
+    Milestone 3's match-id verification and Milestone 9's competition-
+    matches endpoint shape -- verify against the live source, don't assume).
+
+    Returns a list of dicts with competition_id, season_id, competition_name,
+    and season_name for each qualifying (competition, season) pair.
     """
-    matches = fetch_competition_matches(competition_id, season_id)
-    candidate_match_ids = [m["match_id"] for m in matches]
+    index = fetch_competitions_index()
+    return [
+        {
+            "competition_id": c["competition_id"],
+            "season_id": c["season_id"],
+            "competition_name": c["competition_name"],
+            "season_name": c["season_name"],
+        }
+        for c in index
+        if c.get("match_available_360")
+    ]
 
-    valid_ids = []
-    progress = tqdm(candidate_match_ids, desc="Verifying match validity (events + 360 data)")
-    for match_id in progress:
+
+def batch_extract_valid_matches(
+    competition_season_pairs: list[tuple[int, int]], num_matches: int
+) -> list[int]:
+    """Return up to `num_matches` match_ids with BOTH events and 360 data
+    present, drawn from ACROSS the given (competition_id, season_id) pairs
+    in the order given -- not just a single competition -- reusing the same
+    validity check, disk cache, tqdm progress, and rate-limit handling as
+    the original single-competition version.
+
+    Stops as soon as `num_matches` valid matches are found in total, rather
+    than exhaustively checking every match in every competition. If all
+    given competitions combined have fewer than `num_matches` valid
+    matches, returns however many were found and prints a warning instead
+    of raising.
+    """
+    valid_ids: list[int] = []
+
+    for competition_id, season_id in competition_season_pairs:
         if len(valid_ids) >= num_matches:
             break
 
-        events = fetch_match_events(match_id)
-        if events is None:
-            continue
-        frames = fetch_match_360(match_id)
-        if frames is None:
-            continue
+        matches = fetch_competition_matches(competition_id, season_id)
+        candidate_match_ids = [m["match_id"] for m in matches]
 
-        valid_ids.append(match_id)
-        progress.set_postfix(valid=len(valid_ids))
+        progress = tqdm(
+            candidate_match_ids,
+            desc=f"Verifying match validity (competition_id={competition_id}, season_id={season_id})",
+        )
+        for match_id in progress:
+            if len(valid_ids) >= num_matches:
+                break
 
-    progress.close()
+            events = fetch_match_events(match_id)
+            if events is None:
+                continue
+            frames = fetch_match_360(match_id)
+            if frames is None:
+                continue
+
+            valid_ids.append(match_id)
+            progress.set_postfix(valid=len(valid_ids))
+
+        progress.close()
 
     if len(valid_ids) < num_matches:
         print(
             f"WARNING: only found {len(valid_ids)} valid matches (events + 360 data both "
-            f"present) out of {len(candidate_match_ids)} total in competition_id="
-            f"{competition_id}, season_id={season_id}; requested {num_matches}."
+            f"present) across {len(competition_season_pairs)} competition/season pairs; "
+            f"requested {num_matches}."
         )
 
     return valid_ids
