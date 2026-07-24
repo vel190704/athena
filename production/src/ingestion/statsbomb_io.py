@@ -218,6 +218,17 @@ def parse_360_frame(event_data: dict, frame_data: dict) -> dict:
     events (Pass, Shot, ...) StatsBomb records the event's location as the
     ball's position at that moment -- the 360 freeze-frame itself carries no
     separate ball coordinate.
+
+    PLAYER IDENTITY (Milestone 22 Step 0/1 -- verified, not assumed, against
+    21,273 real freeze-frames across 6 cached matches): a 360 freeze-frame
+    entry carries ONLY `location`, `teammate`, `actor`, `keeper` -- NEVER a
+    player id or name, not even for the entry with `actor: True`. The one
+    reliable player identity anywhere in this data is the acting player of
+    the PARENT EVENT, via `event_data["player"]["id"]`/`["name"]` (every
+    360-covered event in the cached data has this field). `is_actor` below
+    marks which row of `player_pos` corresponds to that player -- there is
+    NO way to know who any of the other ~21 visible players are, and this
+    parser does not invent one.
     """
     ball_raw = event_data["location"]
     ball_pos = torch.tensor([ball_raw[0] * X_SCALE, ball_raw[1] * Y_SCALE], dtype=torch.float32)
@@ -244,12 +255,26 @@ def parse_360_frame(event_data: dict, frame_data: dict) -> dict:
     # not absolute team identity.
     is_teammate = torch.tensor([bool(p["teammate"]) for p in freeze_frame], dtype=torch.bool)
 
+    # Milestone 22: which row of player_pos is the one player whose real
+    # identity is known (see this function's docstring). `event_data`
+    # doesn't always carry a `player` field (e.g. some event types), so
+    # actor_player_id/name fall back to None rather than raising -- callers
+    # (habit_memory.py) must treat a None actor_player_id as "no habit
+    # blending possible for this frame."
+    is_actor = torch.tensor([bool(p["actor"]) for p in freeze_frame], dtype=torch.bool)
+    actor_player = event_data.get("player")
+    actor_player_id = actor_player["id"] if actor_player is not None else None
+    actor_player_name = actor_player["name"] if actor_player is not None else None
+
     return {
         "ball_pos": ball_pos,
         "player_pos": player_pos,
         "player_vel": player_vel,
         "fatigue_mod": fatigue_mod,
         "is_teammate": is_teammate,
+        "is_actor": is_actor,
+        "actor_player_id": actor_player_id,
+        "actor_player_name": actor_player_name,
         "event_type": event_data["type"]["name"],
         "period": event_data["period"],
         # The acting player's team (same team `is_teammate` is relative to

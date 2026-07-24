@@ -65,7 +65,11 @@ def _team_control(engine, pos, vel, fatigue, pitch_grid, ball_pos):
     return active_coords, team_control
 
 
-def extract_features(frame: dict, engine: BiomechanicalPitchControl | None = None) -> dict:
+def extract_features(
+    frame: dict,
+    engine: BiomechanicalPitchControl | None = None,
+    habit_heatmaps: dict | None = None,
+) -> dict:
     """Extract scalar pitch-control features from one parsed 360 frame.
 
     `frame` is the dict returned by statsbomb_io.parse_360_frame. Per
@@ -74,6 +78,29 @@ def extract_features(frame: dict, engine: BiomechanicalPitchControl | None = Non
     acting team's own attacking-left-to-right perspective in both periods,
     so every frame (either period) is used as-is after the ADR-002 rescale
     that already happened in parse_360_frame.
+
+    `habit_heatmaps` (Milestone 22, Module 6 -- OPT-IN, defaults to None/
+    off): a dict `{player_id: heatmap_grid}` for whatever player identity
+    is ACTUALLY available in this data -- in practice, at most one entry,
+    for the frame's own acting player (StatsBomb's public 360 data exposes
+    no identity for the other ~21 visible players; see
+    `statsbomb_io.parse_360_frame`'s docstring). When None (the default),
+    this function behaves EXACTLY as it did before Milestone 22 -- see
+    `test_habit_memory.py`'s regression test, which confirms
+    byte-identical output to the pre-Milestone-22 extraction path. Every
+    previously trained model (MLP, GNN, Deep Ensemble) and every logged
+    MLflow baseline was trained WITHOUT habit blending; silently changing
+    the default here would invalidate every prior comparison in this
+    project's history -- the same risk Milestone 11 avoided by keeping the
+    graph builder standalone rather than wiring it into the dataset
+    prematurely.
+
+    When provided and the frame's `actor_player_id` has a matching
+    heatmap, the actor's OWN position (identified via `frame["is_actor"]`)
+    is replaced with its Bayesian-blended expected position
+    (`habit_memory.bayesian_blend_habit`) before running
+    `BiomechanicalPitchControl`. No other player's position is touched,
+    since no other player's identity is known.
     """
     if engine is None:
         engine = BiomechanicalPitchControl()
@@ -83,6 +110,25 @@ def extract_features(frame: dict, engine: BiomechanicalPitchControl | None = Non
     player_vel = frame["player_vel"]
     fatigue_mod = frame["fatigue_mod"]
     is_teammate = frame["is_teammate"]
+
+    if habit_heatmaps is not None:
+        actor_player_id = frame.get("actor_player_id")
+        if actor_player_id is not None and actor_player_id in habit_heatmaps:
+            # Local import: habit_memory.py imports PITCH_LENGTH/PITCH_WIDTH
+            # from THIS module, so a module-level import here would be
+            # circular. By the time extract_features is actually called,
+            # both modules are already fully loaded.
+            from production.src.pipeline.habit_memory import bayesian_blend_habit
+
+            is_actor = frame["is_actor"]
+            actor_x, actor_y = player_pos[is_actor][0].tolist()
+            blended_x, blended_y = bayesian_blend_habit(
+                (actor_x, actor_y), habit_heatmaps[actor_player_id]
+            )
+            player_pos = player_pos.clone()  # never mutate the caller's frame in place
+            player_pos[is_actor] = torch.tensor(
+                [blended_x, blended_y], dtype=player_pos.dtype
+            )
 
     attacking_mask = is_teammate
     defending_mask = ~is_teammate

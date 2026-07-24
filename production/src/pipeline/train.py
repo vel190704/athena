@@ -39,7 +39,7 @@ os.environ.setdefault("MLFLOW_ALLOW_FILE_STORE", "true")
 import mlflow
 import mlflow.pytorch
 import torch
-from torch.utils.data import random_split
+from torch.utils.data import Subset, random_split
 from torch_geometric.loader import DataLoader
 
 from production.src.ingestion.statsbomb_io import (
@@ -57,6 +57,11 @@ from production.src.models.gnn_model import GNNDeepHitSurvivalModel
 from production.src.models.graph_builder import DEFAULT_OPPONENT_RADIUS, DEFAULT_SAME_TEAM_RADIUS
 from production.src.pipeline.chain_builder import build_possession_chains
 from production.src.pipeline.feature_extractor import extract_features
+from production.src.pipeline.habit_memory import (
+    MIN_HISTORICAL_EVENTS,
+    build_player_match_buckets,
+    heatmap_from_buckets,
+)
 from production.src.pipeline.survival_dataset import (
     BIN_SIZE_SECONDS,
     FEATURE_KEYS,
@@ -294,6 +299,7 @@ def build_training_data():
 
     engine = BiomechanicalPitchControl()
     all_features, all_frames, all_chains, all_source_event_ids = [], [], [], []
+    all_sample_match_ids = []  # Milestone 23: per-SAMPLE match_id (same order/length as all_features)
     used_match_ids = []
     for match_id in match_pool:
         features, frames, chains, source_event_ids = _match_chains_with_features(match_id, engine)
@@ -301,6 +307,7 @@ def build_training_data():
         all_frames.extend(frames)
         all_chains.extend(chains)
         all_source_event_ids.extend(source_event_ids)
+        all_sample_match_ids.extend([match_id] * len(features))
         used_match_ids.append(match_id)
 
         if len(all_features) >= TARGET_SAMPLE_COUNT:
@@ -323,6 +330,7 @@ def build_training_data():
         all_source_event_ids,
         used_match_ids,
         qualifying_competitions,
+        all_sample_match_ids,
     )
 
 
@@ -921,10 +929,116 @@ def _train_and_log_deep_ensemble(
     }
 
 
+def _build_habit_blended_features(
+    frames: list[dict],
+    sample_match_ids: list[int],
+    used_match_ids: list[int],
+    train_indices: list[int],
+    val_indices: list[int],
+    engine: BiomechanicalPitchControl,
+) -> tuple[list[dict], dict]:
+    """Milestone 23 Step 1: re-extracts scalar features for EVERY sample
+    with habit blending enabled, using a match-aware AND split-aware
+    heatmap for each sample's acting player.
+
+    Leakage discipline (both rules hold simultaneously, per Step 1):
+      (a) the current sample's own match is always excluded from ITS OWN
+          heatmap (Milestone 22's base `exclude_match_id` rule), and
+      (b) ANY match with at least one VALIDATION-split sample is excluded
+          from the training bucket corpus ENTIRELY -- not just for its own
+          val samples, for every sample's heatmap, period. This is
+          intentionally the CONSERVATIVE partition: since this project's
+          train/val split is at the SAMPLE level (Milestone 7), not the
+          match level, most non-trivial matches contribute samples to
+          BOTH splits under random assignment. Treating a straddling match
+          as "training-eligible" for its train-split samples while
+          excluding it for its val-split samples would require per-sample
+          bucket exclusion finer than "the match," which isn't how
+          historical positional tendency data is naturally grouped here.
+          Excluding any straddling match outright is the safe reading of
+          Milestone 7's "training-split only" rule, at the cost of
+          shrinking the usable historical corpus -- reported explicitly
+          below, not hidden.
+
+    SCOPE LIMITATION (documented per Step 1.6, not fixed here): heatmaps
+    use ANY OTHER training-split match regardless of its real-world
+    chronological date relative to the match being predicted -- true
+    "only past matches" chronological ordering is NOT enforced. This tests
+    whether the Bayesian blending MECHANISM helps prediction, not a fully
+    faithful simulation of live deployment (where only genuinely past
+    matches would be available at inference time).
+
+    Returns (blended_features, diagnostics) -- blended_features has the
+    exact same length/order as `frames` (only feature VALUES differ from
+    the unblended pass); diagnostics reports the counts Step 1.5 asks for.
+    """
+    val_match_ids = {sample_match_ids[i] for i in val_indices}
+    all_match_ids_set = set(used_match_ids)
+    training_match_ids = sorted(all_match_ids_set - val_match_ids)
+    validation_match_ids = sorted(val_match_ids)
+
+    print(
+        f"\n[Milestone 23] {len(training_match_ids)} training-split matches, "
+        f"{len(validation_match_ids)} validation-split matches (a match with ANY validation-split "
+        f"sample is excluded from the training bucket corpus entirely, per the conservative "
+        f"partition documented above)."
+    )
+
+    # Step 1.2: precompute per-player-per-match buckets ONCE, from training
+    # matches' FULL event logs (every action that player took in that
+    # match, not just the handful of chain-representative sample events).
+    events_by_training_match = {
+        match_id: fetch_match_events(match_id) for match_id in training_match_ids
+    }
+    buckets = build_player_match_buckets(events_by_training_match)
+    del events_by_training_match  # same "don't linger on raw fetched JSON" precaution as build_training_data
+
+    blended_features = []
+    actor_ids_seen = set()
+    cold_start_count = 0
+    samples_with_known_actor = 0
+
+    for i, frame in enumerate(frames):
+        actor_player_id = frame.get("actor_player_id")
+        habit_heatmaps = None
+        if actor_player_id is not None:
+            heatmap, _num_events, is_cold_start = heatmap_from_buckets(
+                actor_player_id,
+                buckets,
+                training_match_ids,
+                exclude_match_id=sample_match_ids[i],
+            )
+            habit_heatmaps = {actor_player_id: heatmap}
+            actor_ids_seen.add(actor_player_id)
+            samples_with_known_actor += 1
+            if is_cold_start:
+                cold_start_count += 1
+
+        blended_features.append(extract_features(frame, engine, habit_heatmaps=habit_heatmaps))
+
+    diagnostics = {
+        "training_match_count": len(training_match_ids),
+        "validation_match_count": len(validation_match_ids),
+        "unique_actor_count": len(actor_ids_seen),
+        "cold_start_count": cold_start_count,
+        "samples_with_known_actor": samples_with_known_actor,
+        "total_samples": len(frames),
+    }
+    print(
+        f"[Milestone 23] {diagnostics['unique_actor_count']} unique actors found across "
+        f"{diagnostics['samples_with_known_actor']}/{diagnostics['total_samples']} samples with a "
+        f"known actor; {diagnostics['cold_start_count']} of those fell back to the uniform "
+        f"cold-start prior (< {MIN_HISTORICAL_EVENTS} historical events)."
+    )
+    return blended_features, diagnostics
+
+
 def train_and_evaluate():
     torch.manual_seed(RANDOM_SEED)
 
-    features, frames, chains, source_event_ids, match_ids, qualifying_competitions = build_training_data()
+    features, frames, chains, source_event_ids, match_ids, qualifying_competitions, sample_match_ids = (
+        build_training_data()
+    )
     match_count = len(match_ids)
     dataset_size = len(features)
     competition_season_summary = ",".join(
@@ -1184,6 +1298,161 @@ def train_and_evaluate():
             "lower ensemble Brier Score is evidence the mean-PMF prediction is at least as good, "
             "not evidence the ensembling technique itself is more parameter-efficient."
         )
+
+    # === Milestone 23 (RQ2): MLP with Bayesian habit blending enabled.
+    # Same hyperparameters, split, and instability detector as the
+    # Milestone 14B baseline -- the ONLY difference is that features are
+    # re-extracted with habit_heatmaps populated per Step 1's match-aware/
+    # split-aware discipline.
+    print("\n=== Milestone 23 (RQ2): building habit-blended features ===")
+    habit_blend_engine = BiomechanicalPitchControl()
+    habit_blended_features, habit_diagnostics = _build_habit_blended_features(
+        frames=frames,
+        sample_match_ids=sample_match_ids,
+        used_match_ids=match_ids,
+        train_indices=train_set.indices,
+        val_indices=val_set.indices,
+        engine=habit_blend_engine,
+    )
+
+    habit_dataset = TacticalSurvivalDataset(habit_blended_features, frames, chains)
+    # Reuse the EXACT SAME sample indices already determined above (not a
+    # fresh random_split call) -- guarantees the habit-blended run trains
+    # on the identical partition the leakage guard itself was computed
+    # against, rather than relying on RNG determinism to reproduce it.
+    habit_train_subset = Subset(habit_dataset, train_set.indices)
+    habit_val_subset = Subset(habit_dataset, val_set.indices)
+
+    # Normalization stats recomputed from the BLENDED training split only
+    # (Milestone 7's rule) -- blending shifts feature values, so reusing
+    # the unblended mean/std here would normalize against the wrong
+    # reference distribution.
+    habit_train_features_raw = torch.stack([habit_dataset[i][0] for i in train_set.indices])
+    habit_feature_mean = habit_train_features_raw.mean(dim=0)
+    habit_feature_std = habit_train_features_raw.std(dim=0).clamp(min=1e-8)
+
+    torch.manual_seed(RANDOM_SEED)
+    habit_train_loader = DataLoader(
+        habit_train_subset,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        generator=torch.Generator().manual_seed(RANDOM_SEED),
+    )
+    habit_val_batch = next(iter(DataLoader(habit_val_subset, batch_size=len(habit_val_subset))))
+
+    habit_mlp_model = DeepHitSurvivalModel(num_features=len(FEATURE_KEYS), num_bins=NUM_BINS)
+    habit_mlp_optimizer = torch.optim.Adam(
+        habit_mlp_model.parameters(),
+        lr=MLP_STABILIZED_LR,
+        weight_decay=MLP_STABILIZED_WEIGHT_DECAY,
+    )
+    habit_mlp_results = _train_and_log_model(
+        model_type="MLP",
+        model=habit_mlp_model,
+        optimizer=habit_mlp_optimizer,
+        lr=MLP_STABILIZED_LR,
+        weight_decay=MLP_STABILIZED_WEIGHT_DECAY,
+        clip_grad_norm=True,
+        input_fn=_normalize_scalar_batch,
+        normalize_args=(habit_feature_mean, habit_feature_std),
+        train_loader=habit_train_loader,
+        val_batch=habit_val_batch,
+        n_train=n_train,
+        n_val=n_val,
+        match_ids=match_ids,
+        dataset_size=dataset_size,
+        extra_params={
+            "dataset_scale": "multi_competition",
+            "competition_season_pairs": competition_season_summary,
+            "stabilization_bundle": True,
+            "saturation_check_v2": True,
+            "init_seed": RANDOM_SEED,
+            "habit_blending": True,
+            "habit_unique_actor_count": habit_diagnostics["unique_actor_count"],
+            "habit_cold_start_count": habit_diagnostics["cold_start_count"],
+            "habit_training_match_count": habit_diagnostics["training_match_count"],
+            "habit_validation_match_count": habit_diagnostics["validation_match_count"],
+        },
+        run_tags={
+            "baseline_single_mlp_run_id": MILESTONE_14B_MLP_RUN_ID,
+            "description": (
+                "Milestone 23 (RQ2): MLP trained with Bayesian habit blending enabled for the "
+                "acting player only (Milestone 22's data-availability constraint). Heatmaps built "
+                "train-split-only, current-match-excluded, per Step 1's match-aware/split-aware "
+                "discipline -- ANY match with a validation-split sample is excluded from the "
+                "training bucket corpus entirely. Non-chronological: any other training-split "
+                "match may contribute to a heatmap regardless of real-world date order."
+            ),
+        },
+        normalization_artifact={
+            "feature_key_order": list(FEATURE_KEYS),
+            "mean": habit_feature_mean.tolist(),
+            "std": habit_feature_std.tolist(),
+        },
+    )
+
+    print("\n=== Milestone 23 (RQ2): habit-blended MLP vs. non-blended baselines ===")
+    if habit_mlp_results is None:
+        print("Habit-blended MLP: training ABORTED (NaN/Inf loss).")
+    else:
+        print(
+            f"Habit-blended MLP: spike={habit_mlp_results['spike_fired']}, "
+            f"cumulative_drift={habit_mlp_results['cumulative_drift_fired']}, "
+            f"saturation={habit_mlp_results['saturation_fired']}, "
+            f"frozen_val_loss={habit_mlp_results['frozen_val_loss_fired']}"
+        )
+        print(f"\n{'Model':<40} {'Brier@15s':>10} {'Brier@30s':>10}")
+        print(f"{'MLP, no blending (Milestone 14B)':<40} {MILESTONE_14B_MLP_BRIER_15S:>10.4f} {MILESTONE_14B_MLP_BRIER_30S:>10.4f}")
+        print(f"{'MLP, habit blending (Milestone 23)':<40} {habit_mlp_results['brier_15s']:>10.4f} {habit_mlp_results['brier_30s']:>10.4f}")
+        if deep_ensemble_results is not None:
+            print(f"{f'Deep Ensemble, no blending (M={DEEP_ENSEMBLE_M}, Milestone 21)':<40} {deep_ensemble_results['brier_15s']:>10.4f} {deep_ensemble_results['brier_30s']:>10.4f}")
+
+        brier_15s_delta = habit_mlp_results["brier_15s"] - MILESTONE_14B_MLP_BRIER_15S
+        brier_30s_delta = habit_mlp_results["brier_30s"] - MILESTONE_14B_MLP_BRIER_30S
+        habit_healthy = not habit_mlp_results["instability_warning_fired"]
+
+        print(
+            f"\nBrier delta vs. non-blended baseline: {brier_15s_delta:+.4f} @15s, "
+            f"{brier_30s_delta:+.4f} @30s (negative = habit blending improved the score)."
+        )
+
+        print("\n=== Step 3: RQ2 conclusion (conditional on evidence quality) ===")
+        if not habit_healthy:
+            print(
+                "The habit-blended MLP triggered an instability warning -- NOT issuing an RQ2 "
+                "conclusion this run. Report the blocker, fix it, re-run -- do not force a verdict."
+            )
+        elif brier_15s_delta < 0 and brier_30s_delta < 0:
+            print(
+                f"RQ2 SUPPORTED (hedged): habit blending improved Brier Score at both horizons "
+                f"({brier_15s_delta:+.4f} @15s, {brier_30s_delta:+.4f} @30s). This is a notable "
+                "result given how diluted the blended signal could be: only 1 of ~22 visible "
+                "players' positions is ever blended per sample (the acting player, per Milestone "
+                "22's data-availability constraint), inside features that are themselves sums "
+                "over many players' pitch-control contributions. Scope limitations: (1) blending "
+                "only ever affects the acting player, never the other ~21 visible players; "
+                "(2) the historical corpus is NON-CHRONOLOGICAL -- any other training-split match "
+                "may contribute to a heatmap regardless of real-world date order relative to the "
+                "match being predicted, so this tests the blending MECHANISM, not a faithful "
+                "live-deployment simulation."
+            )
+        else:
+            print(
+                f"RQ2 NOT supported by this run: Brier Score did not improve at both horizons "
+                f"({brier_15s_delta:+.4f} @15s, {brier_30s_delta:+.4f} @30s). Two distinct, "
+                "non-exclusive candidate explanations, not one: (a) the actor-only constraint "
+                "means the blended signal is heavily diluted within aggregate features summed "
+                "over ~11 players per side -- a single player's Bayesian-adjusted position is a "
+                "small perturbation within that sum; and/or (b) the chain's representative actor "
+                "is not consistently on the attacking side (sometimes a defensive action's actor, "
+                "per Milestone 7's frame-resolution logic), so blending doesn't consistently "
+                "affect the same feature direction across samples, adding noise rather than "
+                "signal. Scope limitations to name alongside this finding: the actor-only scope "
+                "(Milestone 22) and the non-chronological historical corpus (Step 1.6) both apply "
+                "regardless of direction -- this result should not be read as a definitive verdict "
+                "on Bayesian habit blending in general, only on this specific, constrained "
+                "implementation of it."
+            )
 
     print(f"\nDataset size: {dataset_size} total samples ({n_train} train / {n_val} val)")
 
