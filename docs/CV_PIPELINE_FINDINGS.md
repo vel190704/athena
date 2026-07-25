@@ -12,6 +12,23 @@ exact demonstration fresh) immediately before this document was written —
 not transcribed from memory of prior milestone summaries. Section 7 lists
 every figure that could not be reconfirmed this way, and why.
 
+**Update — first real-footage run.** In a subsequent debugging session
+(after this document was first drafted), the pipeline was run end-to-end
+against a real video file for the first time:
+`data/raw/test_match.mp4`, a **private local broadcast-style clip**
+(1284x728, 28fps, 970 frames / ~34.6s) — explicitly NOT SoccerNet, and
+carrying no ground-truth annotations. `test_cv_tracker.py` and
+`test_cv_pipeline.py`'s own skip messages call this kind of clip "an
+acceptable stopgap for this milestone only," not a substitute for the
+NDA-gated dataset. The Executive Summary and the Milestone 26/29/32
+sections below are updated in place with these newly-verified figures.
+**This does not lift the real-data blocker described in Section 3** — a
+single unannotated private clip cannot answer any question that requires
+ground truth (detection precision/recall, a true ID-switch *rate*, real
+calibration accuracy), and every such gap remains exactly as open as
+before. What it DOES provide, for the first time, is real (not synthetic
+or mocked) tracking and end-to-end throughput behavior — see below.
+
 ---
 
 ## 1. Executive Summary
@@ -27,15 +44,23 @@ WebSocket/REST API) can consume CV-derived state with zero modification.
 
 **Current state, stated plainly:** all nine CV components (Milestones
 25-33) are built, internally consistent, and validated against synthetic,
-adversarial, or mocked test cases — every one of those tests passes.
-**Zero components have been validated against real broadcast footage.**
-Two components (Milestone 25's baseline detector, Milestone 29's ball
-detector) have been validated against real *photographs* — a meaningfully
-different and much easier condition than real match video (no motion blur,
-no compression artifacts, no camera pan/zoom, no crowd/broadcast-graphics
-clutter). This distinction matters throughout this document: "validated on
-a real photo" and "validated on real broadcast footage" are never treated
-as equivalent claims here.
+adversarial, or mocked test cases — every one of those tests passes. As of
+the update above, the full pipeline has also now **run successfully
+end-to-end on one real broadcast-style video clip** — real tracking, real
+ball detection (after a real bug fix — see Milestone 29 below), and a
+first real throughput measurement (Milestone 32 below). **This is one
+unannotated private clip, not the SoccerNet validation this track has
+always needed** — no detection precision/recall, no true ID-switch rate,
+no calibration-accuracy figure can be computed without ground truth, and
+none of those gaps are closed by this run. Two components (Milestone 25's
+baseline detector, Milestone 29's ball detector) were separately validated
+against real *photographs* earlier — a meaningfully different and much
+easier condition than real match video (no motion blur, no compression
+artifacts, no camera pan/zoom, no crowd/broadcast-graphics clutter). This
+document keeps three tiers distinct throughout: "validated on a real
+photo," "run once on a real, unannotated private clip," and "validated
+against real broadcast footage with ground truth" are never treated as
+equivalent claims here.
 
 ---
 
@@ -69,8 +94,7 @@ derived `dt`; an explicit, stated (not hidden) sanity ceiling
 (`LIKELY_ID_SWITCH_PIXEL_VELOCITY_CEILING = 800.0` px/s) flags implausible
 frame-to-frame jumps as `likely_id_switch: True` rather than silently
 trusting them.
-**Validation:** `test_cv_tracker.py`'s real-footage test skips (no video
-available). The camera-motion-confound property was demonstrated via a
+**Validation:** the camera-motion-confound property was demonstrated via a
 synthetic panning-crop video over a static real photograph (ultralytics'
 `bus.jpg`) and reconfirmed by regenerating it fresh for this document: at
 a real, file-read fps of **24.0**, with 2 track IDs persisting across all
@@ -80,10 +104,22 @@ reported moving at **[-171.4, -1.2] px/s** and **[-166.5, -8.6] px/s** on
 the first post-pan frame (settling into a roughly -170 to -230 px/s range
 as the pan continued). This is not a bug; it is the camera-motion-velocity
 confound working exactly as documented (see Section 4).
-**Limitations/Unknowns:** no ID-switch behavior has been observed on real
-occlusion/crossing events (only a clean synthetic pan, which never
-produced a switch); the 800 px/s ceiling is explicitly an unvalidated
-guess.
+**`test_bytetrack_player_tracking_on_real_footage` now runs and passes**
+(previously skipped, no video available) against the private clip
+described in the Update note above. Direct re-run over the full 970-frame
+clip: **152 unique track_ids observed, 146 of them persisting across more
+than one frame**, and **15,090 individual nonzero-`vel_pixels_per_sec`
+observations** among persistent tracks — proving real displacement is
+genuinely being measured, not defaulted to zero, on real footage.
+**Limitations/Unknowns:** 152 unique IDs against a real roster of ~22-25
+people on the pitch is a real, honestly-reported signal of heavy ID
+churn/fragmentation — but WITHOUT ground-truth identity labels, this raw
+count cannot be turned into a true "ID-switch rate": some of that churn is
+legitimate (people entering/leaving frame, camera cuts the shot classifier
+correctly treats as separate shots), not necessarily erroneous re-assigned
+identity. Future Validation Roadmap item 2 (a real switch *rate*) remains
+open. The 800 px/s sanity ceiling is still an unvalidated guess and was
+not directly exercised by this analysis.
 
 ### Milestone 27 — Pitch Calibration & Homography
 **Implementation:** `cv2.findHomography` (4 known corner correspondences,
@@ -163,6 +199,25 @@ tests motion blur, partial occlusion by a player's body, or a ball
 silhouetted against a crowd/advertising-board background, all realistic
 broadcast conditions.
 
+**A real bug was found and fixed via the private real-footage clip
+described in the Update note above.** `detect_ball` never passed `imgsz`
+to `model.predict()`, so Ultralytics defaulted to 640 — downscaling this
+clip's 1284x728 frames enough to erase the ball, whose true footprint at
+this camera distance is only ~5x5px (inferred from a median real
+person-detection bbox height of ~33px in this clip). Direct A/B testing on
+this footage: **zero "sports ball" class candidates at any confidence down
+to 0.01** at the Ultralytics default `imgsz=640`, across every sampled
+frame, versus a real, moving, plausible-confidence (~0.3-0.7) detection
+recovered at `imgsz=1920` on the majority of frames sampled across the
+whole clip (position genuinely changes frame-to-frame, ruling out a static
+broadcast-graphic false positive). Fixed by adding an explicit
+`imgsz: int = DEFAULT_BALL_DETECTION_IMGSZ` (1920) parameter to
+`detect_ball()`. **This value is evidence-based on exactly ONE clip at one
+resolution, not a generally-validated default** — a fixed pixel value does
+not scale correctly to a different source resolution (upscaling an
+already-larger frame to 1920 would shrink it instead), a limitation stated
+directly in the code, not silently assumed away.
+
 ### Milestone 30 — CV-to-Physics Adapter Layer
 **Implementation:** `convert_frame_to_tensors` — converts current AND
 previous pixel positions to meters SEPARATELY before differencing for
@@ -226,9 +281,10 @@ OBSERVED FRAME INDEX (not just position) so velocity uses the TRUE elapsed
 gap across skipped non-tactical frames, with an explicit staleness cutoff
 (`stale_gap_frames_threshold`, default 5) falling back to `[0,0]` velocity
 beyond it.
-**Validation** (reconfirmed by direct re-run, `test_cv_pipeline.py`, 6 of 7
-tests — the real-footage throughput test skips): at the pure-function
-level, a frame-10-to-frame-16 gap correctly yields `dt = 6/25 = 0.24s`.
+**Validation** (reconfirmed by direct re-run, `test_cv_pipeline.py`, all 7
+tests, including the real-footage throughput test — see the Update note
+below): at the pure-function level, a frame-10-to-frame-16 gap correctly
+yields `dt = 6/25 = 0.24s`.
 At the full end-to-end orchestrator level (cv2/YOLO mocked, since no real
 video exists in this environment, but the REAL `process_video` code path,
 not a shortcut), the same scenario produced velocity **[125.0, 0.0] px/s**
@@ -239,11 +295,25 @@ observation + 5 skipped between observations). A separate scenario
 confirmed the staleness cutoff: an 11-frame gap against a threshold of 5
 correctly produced `stale_velocity_fallback_count = 2` (both tracks in
 that scenario shared the same gap) and `[0,0]` velocity for both.
-**Limitations/Unknowns:** `test_pipeline_on_real_video_and_throughput` —
-median/p95 ms-per-frame, effective fps, tactical-frame ratio, a
-plain-language real-time-sustainability assessment — is fully implemented
-and ready to run, but **has never executed against real footage**. Actual
-end-to-end throughput on this or any hardware is completely unmeasured.
+**`test_pipeline_on_real_video_and_throughput` now runs and passes**
+(previously skipped, no real footage) against the private clip described
+in the Update note above — the CV track's first-ever real end-to-end
+throughput measurement. Over the first 30 raw frames of
+`data/raw/test_match.mp4` (all 30 yielded — the ball-detector fix above
+was required for this; before it, 0 of 30 yielded because every frame
+lacked a detected ball): **median 116.73ms/yielded-frame, p95 127.23ms,
+effective throughput 8.57 fps**, against this clip's real 28fps source
+rate — i.e. **not real-time on this hardware**, printed by the test itself
+as "well below real-time; significant optimization needed before live
+use."
+**Limitations/Unknowns:** this is ONE clip, 30 frames, on one machine's
+hardware, with no GPU-vs-CPU breakdown recorded here — not a general
+throughput characterization. The ~8.57 fps effective rate is well below
+this clip's own 28fps, meaning a rolling buffer or frame-skipping/dropping
+strategy would be required before any real-time deployment attempt; that
+strategy itself has not been designed or implemented. Future Validation
+Roadmap item 6 (broader, multi-clip, multi-hardware throughput
+characterization) remains open.
 
 ### Milestone 33 — Live CV API Integration
 **Implementation:** `source=cv` WebSocket path in `production/src/serving/api.py`:
@@ -304,6 +374,19 @@ idealization only," but a static photograph does not exercise motion
 blur, compression artifacts, camera pan/zoom, or broadcast-graphics
 clutter — real video remains a categorically different and harder test
 this track has not yet faced.
+
+**Update:** the pipeline has since run end-to-end on one real, private,
+unannotated broadcast-style clip (see the Update note in the Executive
+Summary) — real tracking and real end-to-end throughput data now exist for
+the first time (Milestones 26 and 32 above), and a real bug (ball
+detection's `imgsz` default) was found and fixed as a direct result. This
+is genuine progress, but it is **not the SoccerNet unblock**. This one
+clip has no ground-truth annotations, so it cannot answer detection
+precision/recall, a true ID-switch rate, or calibration accuracy against a
+real lens — the three most consequential items in the Future Validation
+Roadmap below remain exactly as blocked as before. Treat this clip as
+useful for catching real integration bugs (which it already has), not as
+a substitute for licensed, annotated validation data.
 
 ---
 
@@ -384,9 +467,12 @@ blocker (real, legitimately-licensed footage with ground truth):
    properly prioritized against real data until this exists.
 2. **Tracking ID-switch frequency on real occlusions/crossings** —
    Milestone 26's synthetic pan produced zero switches by construction
-   (nothing ever occluded anything); real broadcast footage's actual
-   switch rate, and whether the 800 px/s sanity ceiling is anywhere near
-   the right threshold, is completely unknown.
+   (nothing ever occluded anything). A real private clip now shows 152
+   unique track_ids against a real ~22-25-person roster over 970 frames —
+   a real signal of heavy churn — but without ground-truth identity labels
+   this cannot be turned into a true switch *rate*, and whether the 800
+   px/s sanity ceiling is anywhere near the right threshold remains
+   unknown.
 3. **Calibration accuracy against real lens distortion and panning** —
    Milestone 27's homography math is proven correct against a synthetic
    pinhole model with zero lens distortion; real broadcast lenses are not
@@ -400,10 +486,12 @@ blocker (real, legitimately-licensed footage with ground truth):
    above) occurs often enough on real footage to matter in practice** — a
    single constructed example proves the failure mode EXISTS; only real
    footage can establish its real-world frequency and cost.
-6. **End-to-end throughput on real hardware with real video** —
-   Milestone 32's profiling code (median/p95 ms/frame, effective fps,
-   real-time-sustainability assessment) is fully implemented and ready,
-   but has never executed against real footage on any hardware.
+6. **End-to-end throughput on real hardware with real video** — Milestone
+   32's profiling code has now run once, on one private clip, on one
+   machine: median 116.73ms/frame, 8.57 effective fps, well below this
+   clip's 28fps source rate. A broader characterization (multiple clips,
+   multiple hardware targets, a GPU-vs-CPU breakdown, and a designed
+   frame-skipping/rolling-buffer strategy for real-time use) remains open.
 
 ---
 
@@ -442,12 +530,22 @@ production-proven against real footage (see Section 3):
   on missing parameters, path traversal attempts, nonexistent files, and
   genuinely unreadable/corrupt video files.
 
+**Update:** the full pipeline has now run end-to-end on one real, private,
+unannotated broadcast-style clip, yielding real tracked players, real ball
+detections (after the Milestone 29 `imgsz` fix), and a real (not
+real-time) throughput measurement — see the Update note in the Executive
+Summary and the Milestone 26/29/32 entries above. This is real progress on
+integration correctness, not a validated-on-real-broadcast-video claim for
+any individual component's accuracy — see Section 3.
+
 **Explicitly NOT yet capable of:** automatic pitch-keypoint/line detection
 (correspondences are hand-specified); continuous re-calibration across a
 panning/zooming feed; distinguishing a replay from live play; real camera
 capture (webcam) input; wiring a real homography through the live API
-(CV-sourced threat values are not yet physically calibrated); any
-validated behavior on real broadcast video.
+(CV-sourced threat values are not yet physically calibrated); real-time
+throughput on the one clip measured so far (8.57 fps effective vs. 28fps
+source); any ground-truth-anchored accuracy validation on real broadcast
+video (still blocked on SoccerNet NDA access).
 
 ---
 
@@ -466,3 +564,17 @@ camera-pan pixel-velocity figures specifically, which were an ephemeral
 manual demonstration during Milestone 26 and not a hard-coded assertion in
 `test_cv_tracker.py`) regenerated fresh, byte-for-byte reproducibly, using
 the exact same construction, immediately before writing this document.
+
+**Figures added in the Update (first real-footage run):** the M26 real
+tracking figures (152 unique track_ids, 146 persisting, 15,090 nonzero
+velocity observations), the M29 `imgsz` A/B-test figures, and the M32
+throughput figures (116.73ms median, 127.23ms p95, 8.57 fps) were all
+directly measured by running the real code against `data/raw/test_match.mp4`
+in the same debugging session that produced this update, not recalled from
+a prior write-up — this is a first-time measurement, not a
+reconfirmation of an earlier claim. These figures are specific to this
+one private, unannotated clip and this one machine; they are not claimed
+to generalize. Every figure requiring ground-truth annotations (SoccerNet
+detection P/R, a true ID-switch rate, calibration accuracy against a real
+lens) remains unmeasurable in this environment, exactly as before this
+update — see Section 3.
