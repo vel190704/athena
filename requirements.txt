@@ -13,3 +13,6 @@ websockets
 httpx2
 streamlit
 websocket-client
+ultralytics
+SoccerNet
+opencv-python
