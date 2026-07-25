@@ -16,3 +16,4 @@ websocket-client
 ultralytics
 SoccerNet
 opencv-python
+scikit-learn
