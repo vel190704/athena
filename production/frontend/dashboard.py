@@ -73,7 +73,7 @@ DEFAULT_MATCH_ID = "3857276"
 DEFAULT_CV_VIDEO_PATH = "data/raw/test_match.mp4"
 MAX_THREAT_BUFFER_LEN = 60
 MAX_ALERT_BUFFER_LEN = 20
-RECV_TIMEOUT_SECONDS = 10.0  # how long to wait for a single message before treating the stream as stalled
+RECV_TIMEOUT_SECONDS = 60.0  # how long to wait for a single message before treating the stream as stalled
 SIMULATE_REQUEST_TIMEOUT_SECONDS = 5.0  # mandatory -- see What-If section below
 TACTICAL_ACTIONS = ["high_press", "drop_deep", "force_wide", "no_change"]
 

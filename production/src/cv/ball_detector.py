@@ -45,11 +45,30 @@ COCO_SPORTS_BALL_CLASS_ID = 32
 # detections, not an oversight.
 DEFAULT_BALL_CONFIDENCE_THRESHOLD = 0.3
 
+# REAL-FOOTAGE FINDING, not a hypothetical: on an actual 1284x728 broadcast
+# tactical-wide-shot clip, the ball's true pixel footprint is only ~5x5px
+# (a player at median bbox height ~33px implies a ~4px ball, by real-world
+# player-height/ball-diameter ratio). Ultralytics' `model.predict()`
+# defaults `imgsz` to 640, which downscales a frame this size just enough
+# to erase that object entirely -- direct A/B testing on this clip found
+# ZERO "sports ball" class candidates at ANY confidence down to 0.01 at the
+# 640 default, across every sampled frame, versus a real, moving,
+# plausible-confidence (~0.3-0.7) detection recovered at imgsz=1920 on the
+# majority of sampled frames. Like every other hand-tuned constant in this
+# project, 1920 is evidence-based on exactly ONE real clip, not a
+# generally-validated default -- a fixed pixel value also does not scale
+# correctly to a different native video resolution (upscaling an
+# already-larger frame to 1920 would shrink it instead); a longer-term fix
+# should size this relative to the source video's own resolution, not a
+# hardcoded constant.
+DEFAULT_BALL_DETECTION_IMGSZ = 1920
+
 
 def detect_ball(
     image,
     confidence_threshold: float = DEFAULT_BALL_CONFIDENCE_THRESHOLD,
     model_checkpoint: str = "yolov8m.pt",
+    imgsz: int = DEFAULT_BALL_DETECTION_IMGSZ,
 ) -> dict | None:
     """Runs a pretrained (COCO-trained) YOLO detector on `image` and
     returns the highest-confidence "sports ball" (COCO class 32)
@@ -68,9 +87,14 @@ def detect_ball(
     Returns `{"ball_pos_pixels": [x, y], "bbox": [x, y, w, h],
     "confidence": float}` (top-left-origin pixel position/box, matching
     `detector.py`/`tracker.py`'s convention), or `None`.
+
+    `imgsz` defaults to `DEFAULT_BALL_DETECTION_IMGSZ` (see that constant's
+    comment) rather than Ultralytics' own built-in 640 -- the ball is small
+    enough, relative to a typical broadcast wide shot, that the default
+    resize can erase it before the model ever sees it.
     """
     model = _load_model(model_checkpoint)
-    results = model.predict(source=image, conf=confidence_threshold, verbose=False)
+    results = model.predict(source=image, conf=confidence_threshold, imgsz=imgsz, verbose=False)
 
     best_detection = None
     for result in results:

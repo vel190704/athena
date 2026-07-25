@@ -37,7 +37,7 @@ from ultralytics import YOLO
 from production.src.cv.adapter import convert_frame_to_tensors
 from production.src.cv.ball_detector import DEFAULT_BALL_CONFIDENCE_THRESHOLD, detect_ball
 from production.src.cv.detector import COCO_PERSON_CLASS_ID
-from production.src.cv.shot_classifier import is_tactical_view
+from production.src.cv.shot_classifier import compute_shot_features, is_tactical_view
 from production.src.cv.team_classifier import classify_teams, extract_jersey_color
 
 # Milestone 30's own default person-detection confidence (Milestone 25).
@@ -289,6 +289,11 @@ class CVPipeline:
                     # saving purpose of Milestone 31: YOLO/tracking is
                     # never invoked on a non-tactical frame.
                     if not is_tactical_view(frame):
+                        green_ratio, edge_density = compute_shot_features(frame)
+                        print(
+                            f"[CVPipeline] frame {frame_index} skipped (non-tactical): "
+                            f"green_ratio={green_ratio:.4f}, edge_density={edge_density:.4f}"
+                        )
                         skipped_non_tactical += 1
                         frame_index += 1
                         # A skipped frame produces NO observation -- it

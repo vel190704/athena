@@ -1,7 +1,13 @@
 PROJECT ATHENA: Tactical Digital Twin & Prediction Engine
 
 Version: 5.1 (Research-Grade HPC Architecture Blueprint)
-Status: Green-Light for Implementation. Defense Readiness Level (DRL) 9/9.
+Status: Two tracks implemented, each validated to its own standard. StatsBomb/physics-ML
+track (Modules 1-3, 5-8): implemented AND empirically validated against real match data
+(8,074 samples, ~55 matches, 12 competitions) -- see docs/RESEARCH_FINDINGS.md (Milestone 24).
+CV/Module 4 track: implemented AND internally validated on synthetic/adversarial/mocked
+tests only, NOT YET validated on real broadcast footage, blocked on SoccerNet NDA access --
+see docs/CV_PIPELINE_FINDINGS.md (Milestone 34). See context.md for the fast-orientation
+summary; this document is the full technical reference and both are kept in agreement.
 1. Project Overview
 
 Project Athena is a research-grade, end-to-end AI system designed to ingest live football (soccer) match telemetry and generate real-time tactical intelligence. It treats the football match as a differential game, mapping how physical fatigue, environmental friction, player biomechanics, and referee thresholds actively dictate tactical spaces. 
@@ -27,13 +33,36 @@ System Assumptions (A1-A4)
 
 Research Questions & Success Criteria (RQ1-RQ5)
 
+All five RQs below have been investigated at least once and have working, honestly-reported
+findings in docs/RESEARCH_FINDINGS.md (Milestone 24) as of Milestone 23's data. None should
+be read as permanently settled -- RQ4 in particular has reversed direction twice as data
+scale and training stability changed.
+
      RQ1: Can velocity-aware pitch control improve short-term goal probability calibration? (Success: Brier Score improvement ≥
-     X%)
-     RQ2: Does Bayesian tactical memory improve prediction over purely live tracking? (Success: Calibration error reduction)
+     X%). FINDING: well-calibrated Brier scores achieved in absolute terms (e.g. 0.0942/0.1588
+     at 15s/30s, Milestone 14B), but no non-physics-informed baseline was ever run for
+     comparison -- the "improvement" half of this question remains unmeasured, named
+     explicitly rather than implied.
+     RQ2: Does Bayesian tactical memory improve prediction over purely live tracking? (Success: Calibration error reduction). FINDING:
+     not supported -- Brier Score got slightly worse (0.0950 vs 0.0942 at 15s, Milestone 23),
+     under a 68% cold-start fallback rate (only 4 of ~55 matches were training-bucket-eligible)
+     -- a null result for this specific, heavily constrained implementation, not a general verdict.
      RQ3: Does latent friction estimation improve pass trajectory prediction? (Success: Pass landing error reduction ≤
-     X meters)
-     RQ4: Can graph-based team representations outperform handcrafted tactical features? (Success: AUROC/Brier improvement over MLP)
-     RQ5: Can counterfactual simulations predict the tactical effects of substitutions? (Success: Predicts real-world xT shift within predefined bounds)
+     X meters). FINDING: the Kalman filter's synthetic convergence is validated (0.336% error
+     after 50 passes, 5x tighter than the 2% gate), but this validates only the filter's
+     mathematical correctness -- real pass-landing-error reduction has never been measured.
+     RQ4: Can graph-based team representations outperform handcrafted tactical features? (Success: AUROC/Brier improvement over MLP). FINDING:
+     reversed direction twice (single-competition: MLP wins; multi-competition as first
+     measured: GNN "wins" only via an invalid MLP silent collapse; corrected: MLP wins again
+     once both models are confirmed genuinely healthy). Current best-evidence conclusion:
+     MLP outperforms the GNN at the current 8,074-sample scale -- presented as a trajectory,
+     not a single settled number.
+     RQ5: Can counterfactual simulations predict the tactical effects of substitutions? (Success: Predicts real-world xT shift within predefined bounds). FINDING:
+     two evidence threads. Heuristic tactical-alignment probes (Milestone 13/14/14B) gave
+     mixed, model/scenario-dependent results. Oracle Substitution Validation against real
+     historical subs (Milestone 20, one match) is hedged -- 9 of 10 real substitutions had
+     overlapping ±2-minute windows, leaving only 1 genuinely unconfounded observation. RQ5
+     remains largely open on its literal question.
 
 Risks & Mitigations (R1-R5)
 
@@ -83,7 +112,18 @@ Module 3: Streaming & Feature Store Architecture
 
 Module 4: Computer Vision Pipeline (Decoupled Phase 4)
 
-     Broadcast-level homography takes 12-18 months. The ML prediction engine (Phases 1-3) ingests provided tracking data (StatsBomb 360). The CV pipeline (YOLOv9 + ByteTrack + SoccerNet calibration) runs fully parallelized and is decoupled from the ML launch date.
+     STATUS (Milestone 34): built and internally validated, NOT YET validated on real
+     broadcast footage. The ML prediction engine (Phases 1-3) ingests provided tracking data
+     (StatsBomb 360) and remains the empirically-validated track. The CV pipeline (implemented
+     as YOLOv8m, not the originally-planned YOLOv9, + ByteTrack + a hand-specified
+     cv2.findHomography calibration, not SoccerNet's own calibration tooling) ran fully
+     parallelized and decoupled from the ML launch date, exactly as planned -- detection,
+     tracking, calibration, team classification, ball detection, shot/camera-cut
+     classification, pipeline orchestration, and a tensor-contract adapter (Milestones 25-33)
+     are all built and passing synthetic/adversarial/mocked tests. The entire track remains
+     blocked on SoccerNet NDA access for any real-broadcast-footage validation -- see
+     docs/CV_PIPELINE_FINDINGS.md (Milestone 34) for the full component-by-component status
+     and the prioritized validation roadmap once that access is unblocked.
 
 Module 5: Graph & Relational Engine
 
@@ -98,7 +138,7 @@ Module 6: Historical Memory & Bayesian Habit Layer
 Module 7: Prediction & Uncertainty Engine
 
      DeepHit (Survival Analysis): Captures non-proportional, time-varying hazards (90th-minute chaos vs 20th-minute structure). Handles right-censoring for non-goal possession terminations (turnovers, out-of-play, fouls).
-     Batch Ensembles & Ranking Loss: Ensemble forward passes are batched. The DeepHit ranking loss is computed strictly within the same ensemble member (reshaped to [Ensemble, Batch, Features]) to prevent entangled gradients.
+     Batch Ensembles & Ranking Loss: Ensemble forward passes are batched. The DeepHit ranking loss is computed strictly within the same ensemble member (reshaped to [Ensemble, Batch, Features]) to prevent entangled gradients. IMPLEMENTATION NOTE (ADR-004, Milestone 21): what was actually built is a 5-member Deep Ensemble (fully independent models, ~5x parameters/compute), not a true shared-weight Batch Ensemble (Wen et al.) -- a simpler, statistically valid but heavier alternative, deliberately named DeepEnsembleDeepHit to avoid confusion. True Batch Ensembles remain future work if inference latency becomes a real constraint.
      Asynchronous Explainability: SurvivalSHAP requires hundreds of forward passes. It is moved to an async background worker. Real-time streams push raw hazard scores; every 5 seconds, the worker computes SHAP and pushes the LLM textual summary to a secondary WebSocket channel.
 
 Module 8: Digital Twin & Counterfactual Simulator
