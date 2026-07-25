@@ -41,6 +41,7 @@ def convert_frame_to_tensors(
     homography_matrix: np.ndarray,
     fps: float,
     prev_positions_pixel: dict[int, list[float]] | None = None,
+    dt_seconds_per_track: dict[int, float] | None = None,
 ) -> dict | None:
     """Converts one frame's CV outputs into the tensor bundle
     `feature_extractor.extract_features` expects.
@@ -60,9 +61,21 @@ def convert_frame_to_tensors(
     27).
     `fps`: real frame rate (Milestone 26 -- read from the source video,
     never assumed).
-    `prev_positions_pixel`: `{track_id: [u, v]}` from the PREVIOUS frame,
-    or `None` on a clip's first frame. Needed for correct velocity -- see
-    below.
+    `prev_positions_pixel`: `{track_id: [u, v]}` from the PREVIOUS
+    OBSERVATION of that track (not necessarily the immediately-preceding
+    frame -- see `dt_seconds_per_track`), or `None` on a clip's first
+    frame. Needed for correct velocity -- see below.
+    `dt_seconds_per_track` (Milestone 32, optional, additive -- omitting it
+    reproduces Milestone 30's original behavior exactly): `{track_id:
+    seconds}` overriding the DEFAULT `1/fps` elapsed-time assumption on a
+    PER-TRACK basis. This exists because a real orchestrator (the
+    Milestone 32 pipeline) may skip whole runs of non-tactical frames
+    between two observations of the same track_id -- the true elapsed time
+    since a track's previous observation can be several real frames (and
+    real seconds), not always exactly one frame. If a track_id has no
+    entry here (or this argument is omitted entirely), the default
+    `1/fps` is used, i.e. the original Milestone 30 assumption that
+    `prev_positions_pixel` always reflects exactly one frame ago.
 
     CRITICAL -- velocity is computed by transforming CURRENT and PREVIOUS
     pixel positions SEPARATELY into meter space and then differencing,
@@ -106,7 +119,7 @@ def convert_frame_to_tensors(
         return None
 
     ball_pos_meters = transform_points(homography_matrix, [ball_pixel])[0]
-    dt_seconds = 1.0 / fps
+    default_dt_seconds = 1.0 / fps
 
     lower_x = -PITCH_BOUNDS_TOLERANCE_METERS
     upper_x = PITCH_LENGTH + PITCH_BOUNDS_TOLERANCE_METERS
@@ -130,7 +143,11 @@ def convert_frame_to_tensors(
 
         if prev_positions_pixel is not None and track_id in prev_positions_pixel:
             prev_pos_meters = transform_points(homography_matrix, [prev_positions_pixel[track_id]])[0]
-            velocity_meters = (pos_meters - prev_pos_meters) / dt_seconds
+            if dt_seconds_per_track is not None and track_id in dt_seconds_per_track:
+                track_dt_seconds = dt_seconds_per_track[track_id]
+            else:
+                track_dt_seconds = default_dt_seconds
+            velocity_meters = (pos_meters - prev_pos_meters) / track_dt_seconds
         else:
             # No previous position for this track (clip's first frame, or
             # the track just appeared) -- "no velocity available yet",
