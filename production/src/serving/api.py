@@ -14,7 +14,9 @@ main per-frame `threat` stream.
 
 import asyncio
 import os
+import time
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Literal
 
 # Must be set before the lifespan handler's first MlflowClient() call (this
@@ -27,7 +29,9 @@ os.environ.setdefault("MLFLOW_ALLOW_FILE_STORE", "true")
 
 import torch
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from ultralytics import YOLO
 
+from production.src.cv.pipeline import CVPipeline
 from production.src.ingestion.statsbomb_io import (
     fetch_match_360,
     fetch_match_events,
@@ -47,6 +51,21 @@ from production.src.serving.simulator import live_match_stream
 
 DEFAULT_MATCH_ID = 3857276
 TIME_BIN = 3  # 15s horizon, matching Milestones 8/13/14/15
+
+# Milestone 33: the CV video-source path. Only paths that resolve INSIDE
+# this directory are ever opened -- a raw `video_path` query parameter is
+# untrusted input, and without this check a client could request an
+# arbitrary file on the server's filesystem via path traversal (e.g.
+# `../../etc/passwd`). Same input-validation discipline as `/simulate`'s
+# `Literal` type on `action` (Milestone 18) -- reject cleanly, don't trust.
+ALLOWED_CV_VIDEO_DIRECTORY = Path("data/raw").resolve()
+
+# The checkpoint every per-connection CVPipeline instance will load. Warmed
+# once at startup (see `lifespan`) so the underlying weights file is
+# already local/cached by the time any connection instantiates its own
+# CVPipeline -- see that warm-up call's comment for why each connection
+# still gets its OWN model object rather than sharing one.
+CV_MODEL_CHECKPOINT = "yolov8m.pt"
 
 # ABSOLUTE percentage-point threshold, not relative: cumulative incidence
 # values in this project are typically small (~5-15%, per Milestone 15's
@@ -68,6 +87,24 @@ async def lifespan(app: FastAPI):
     global _model, _normalization_mean, _normalization_std, _model_run_id
     _model, _normalization_mean, _normalization_std, _model_run_id = load_deterministic_mlp()
     print(f"[api] Live inference server ready. Loaded MLP run_id={_model_run_id}")
+
+    # Milestone 33 Step 1.1: warm the CV YOLO checkpoint ONCE at startup --
+    # heavy, stateless-once-downloaded weights should be fetched/cached
+    # once, not per connection. This does NOT mean every connection shares
+    # one model OBJECT for tracking: `CVPipeline` (Milestone 32) instantiates
+    # its own internal YOLO model instance per construction specifically
+    # because `model.track(..., persist=True)` accumulates ByteTrack
+    # tracker state ON that model object across calls -- sharing one
+    # instance across concurrent connections would leak track IDs between
+    # them, exactly the class of bug per-connection state isolation exists
+    # to prevent (see the WebSocket endpoint below). What this warm-up call
+    # DOES buy: the checkpoint FILE is downloaded/deserialized once here,
+    # so every later per-connection `CVPipeline()` construction is fast
+    # (loading already-local weights), not a fresh cold-start each time.
+    print(f"[api] Warming CV model checkpoint {CV_MODEL_CHECKPOINT} ...")
+    YOLO(CV_MODEL_CHECKPOINT)
+    print("[api] CV model checkpoint ready.")
+
     yield
 
 
@@ -141,28 +178,240 @@ async def _run_alert_pipeline(
         await websocket.send_json({"type": "alert", "explanation": explanation})
 
 
+def _maybe_trigger_spike_alert(
+    websocket: WebSocket,
+    connection_lock: asyncio.Lock,
+    previous_threat_15s: float | None,
+    cumulative_incidence: float,
+    spike_threshold: float,
+    features_dict: dict,
+    normalized_input: torch.Tensor,
+) -> None:
+    """Shared spike-detection trigger (Milestone 16), reused IDENTICALLY by
+    both the StatsBomb-replay and Milestone 33 CV-video sources below --
+    the detection rule and alert pipeline must not silently diverge
+    between sources depending on where the `threat_15s` number came from.
+    """
+    spike_fired = (
+        previous_threat_15s is not None
+        and (cumulative_incidence - previous_threat_15s) > spike_threshold
+    )
+    if spike_fired:
+        asyncio.create_task(
+            _run_alert_pipeline(
+                websocket, connection_lock, features_dict, normalized_input, cumulative_incidence
+            )
+        )
+
+
+# WebSocket close-frame reasons are limited to ~123 UTF-8-encoded bytes by
+# the protocol itself (a control-frame length limit, not a choice this
+# project makes -- RFC 6455's 125-byte control-frame cap minus the 2-byte
+# status code). An error message that embeds a full resolved file path (as
+# this module's do) can easily exceed that, which silently turns an
+# intended clean close into `websockets.exceptions.ProtocolError: control
+# frame too long` instead -- found via manual testing against a real
+# running server (the automated TestClient suite's in-process transport
+# did not happen to trip this), not something a synthetic short-path test
+# alone would have caught.
+MAX_WEBSOCKET_CLOSE_REASON_BYTES = 100
+
+
+def _truncate_close_reason(reason: str) -> str:
+    """Encodes to bytes, truncates to `MAX_WEBSOCKET_CLOSE_REASON_BYTES`,
+    and decodes back leniently (`errors="ignore"`) so a multi-byte UTF-8
+    character is never split mid-sequence."""
+    encoded = reason.encode("utf-8")
+    if len(encoded) <= MAX_WEBSOCKET_CLOSE_REASON_BYTES:
+        return reason
+    return encoded[:MAX_WEBSOCKET_CLOSE_REASON_BYTES].decode("utf-8", errors="ignore") + "..."
+
+
+def _resolve_and_validate_cv_video_path(video_path: str) -> Path | str:
+    """Resolves `video_path` to an absolute path and verifies it lies
+    within `ALLOWED_CV_VIDEO_DIRECTORY` -- guards against path traversal
+    via a raw, untrusted query parameter (Milestone 33 Step 1.3). Returns
+    the resolved `Path` on success, or an error message `str` on failure
+    (the caller decides how to close the connection; this function never
+    touches the websocket itself, keeping it independently testable).
+    """
+    resolved = Path(video_path).resolve()
+    try:
+        resolved.relative_to(ALLOWED_CV_VIDEO_DIRECTORY)
+    except ValueError:
+        return f"video_path must resolve inside {ALLOWED_CV_VIDEO_DIRECTORY}, got {resolved}"
+    if not resolved.exists():
+        return f"video_path does not exist: {resolved}"
+    return resolved
+
+
+async def _stream_cv_source(
+    websocket: WebSocket,
+    video_path: str,
+    connection_lock: asyncio.Lock,
+    spike_threshold: float,
+) -> None:
+    """Milestone 33: streams tactical updates derived from REAL CV
+    processing (Milestones 25-32), instead of StatsBomb event replay.
+
+    A FRESH `CVPipeline` is instantiated HERE, inside this one connection's
+    coroutine call -- never shared across connections or module-level.
+    This is mandatory: `CVPipeline` carries stateful tracking dictionaries
+    (`last_observed_frame_index`, `team_mapping`) and its own internal YOLO
+    model instance's ByteTrack `persist=True` state, all of which must
+    never leak between two videos/connections processed concurrently --
+    the exact same discipline Milestone 16 already applied to
+    `previous_threat_15s`, now applied to substantially more state.
+
+    CALIBRATION CAVEAT (read before trusting `threat_15s` from this path):
+    this endpoint does not accept or wire through a real homography yet --
+    automatic camera recalibration is explicitly out of scope for this
+    milestone. `CVPipeline(homography_matrix=None)` therefore returns
+    PIXEL-SPACE positions (Milestone 32's documented fallback), not real
+    meters. `extract_features`'s physics-grid math assumes ADR-002's
+    100x68 METER space, so `threat_15s` values produced via this path are
+    NOT physically meaningful yet. This endpoint proves the async /
+    per-connection-isolation / real-time-pacing wiring end-to-end -- this
+    milestone's actual scope -- not calibrated real-world threat numbers.
+    """
+    pipeline = CVPipeline(homography_matrix=None, model_checkpoint=CV_MODEL_CHECKPOINT)
+    frame_generator = pipeline.process_video(video_path)
+
+    previous_threat_15s = None
+    stream_start_wall_time = time.monotonic()
+
+    while True:
+        try:
+            # CRITICAL: `next()` on a plain (blocking) generator is
+            # offloaded to a worker thread via `asyncio.to_thread` on EVERY
+            # call, not just once -- calling `pipeline.process_video(...)`
+            # directly in a `for` loop here would block the ENTIRE FastAPI
+            # event loop (every connection, not just this one) for the
+            # whole video's processing duration.
+            frame_data = await asyncio.to_thread(next, frame_generator)
+        except StopIteration:
+            break
+        except Exception as exc:
+            # Step 4: a top-level pipeline failure (video can't be opened
+            # at all -- corrupt file, unsupported codec) -- distinct from
+            # Milestone 32's own per-frame resilience, which already
+            # handles per-frame errors internally and would never raise
+            # here for those. This is a failure the generator itself could
+            # not recover from.
+            await websocket.close(
+                code=1011, reason=_truncate_close_reason(f"CV pipeline error: {exc}")
+            )
+            return
+
+        tensors = frame_data["tensors"]
+        # Same validated call pattern Milestone 30 proved works: the
+        # adapter's output dict feeds `extract_features` UNMODIFIED.
+        features_dict = await asyncio.to_thread(extract_features, tensors)
+        cumulative_incidence, normalized_input = await asyncio.to_thread(
+            _predict_cumulative_incidence_sync, features_dict
+        )
+
+        # Real-time pacing (explicit, not ambiguous): compare this frame's
+        # video timestamp against wall-clock time elapsed since the stream
+        # started. Ahead of real-time pace -> sleep to align sends with
+        # real video timing (genuinely simulating live playback). Behind
+        # real-time pace (a real possibility -- Milestone 32's own
+        # throughput measurements were honest that this is hardware-
+        # dependent) -> do NOT force real-time pacing; stream as fast as
+        # the pipeline can produce frames and report the honest lag
+        # instead of silently sprinting through the match or claiming a
+        # pace it can't sustain.
+        elapsed_wall_seconds = time.monotonic() - stream_start_wall_time
+        target_timestamp_seconds = frame_data["timestamp_sec"]
+        lag_seconds = elapsed_wall_seconds - target_timestamp_seconds
+        if lag_seconds < 0:
+            await asyncio.sleep(-lag_seconds)
+            lag_seconds = 0.0
+
+        num_players = tensors["player_pos"].shape[0]
+        players_payload = [
+            {
+                "pos": tensors["player_pos"][i].tolist(),
+                "is_teammate": bool(tensors["is_teammate"][i].item()),
+            }
+            for i in range(num_players)
+        ]
+        ball_payload = {"pos": tensors["ball_pos"].tolist()}
+
+        async with connection_lock:
+            await websocket.send_json(
+                {
+                    "type": "threat",
+                    "minute": int(target_timestamp_seconds // 60),
+                    "threat_15s": cumulative_incidence,
+                    "players": players_payload,
+                    "ball": ball_payload,
+                    "real_time_lag_sec": lag_seconds,
+                }
+            )
+
+        # Reuse the EXACT SAME spike-detection/alert logic as the
+        # StatsBomb source, regardless of where threat_15s came from.
+        _maybe_trigger_spike_alert(
+            websocket,
+            connection_lock,
+            previous_threat_15s,
+            cumulative_incidence,
+            spike_threshold,
+            features_dict,
+            normalized_input,
+        )
+        previous_threat_15s = cumulative_incidence
+
+
 @app.websocket("/ws/tactical-stream")
 async def tactical_stream(
     websocket: WebSocket,
     match_id: int = DEFAULT_MATCH_ID,
     delay: float = 1.0,
     spike_threshold: float = SPIKE_THRESHOLD,
+    source: Literal["statsbomb", "cv"] = "statsbomb",
+    video_path: str | None = None,
 ):
     """`spike_threshold` defaults to the module-level SPIKE_THRESHOLD but is
     overridable per-connection via a query param -- primarily so tests can
     force a low, reliably-triggered threshold to exercise the alert path
     (Step 5.2) without depending on a specific match happening to contain a
     genuine 5-percentage-point swing within the test window.
+
+    `source="cv"` (Milestone 33) streams from real CV processing
+    (`video_path`, required, must resolve inside `ALLOWED_CV_VIDEO_DIRECTORY`)
+    instead of StatsBomb event replay. See `_stream_cv_source`'s docstring
+    for the calibration caveat that currently applies to that path's
+    `threat_15s` values.
     """
     await websocket.accept()
 
-    # Connection-LOCAL state (Step 3.3) -- deliberately a plain local
-    # variable, not module/global state, so concurrent connections each
-    # track their own previous threat value independently and can never
-    # clobber each other's spike detection.
-    previous_threat_15s = None
+    # Connection-LOCAL state (Step 3.3, Milestone 16) -- deliberately a
+    # plain local variable, not module/global state, so concurrent
+    # connections each track their own previous threat value independently
+    # and can never clobber each other's spike detection. The SAME
+    # discipline applies to `source="cv"` below via a freshly-constructed
+    # `CVPipeline` per connection, inside `_stream_cv_source`.
     connection_lock = asyncio.Lock()
 
+    if source == "cv":
+        if not video_path:
+            await websocket.close(code=1008, reason="video_path is required when source=cv")
+            return
+
+        resolved = _resolve_and_validate_cv_video_path(video_path)
+        if isinstance(resolved, str):  # error message, not a valid Path
+            await websocket.close(code=1008, reason=_truncate_close_reason(resolved))
+            return
+
+        try:
+            await _stream_cv_source(websocket, str(resolved), connection_lock, spike_threshold)
+        except WebSocketDisconnect:
+            pass
+        return
+
+    previous_threat_15s = None
     try:
         async for event, frame in live_match_stream(match_id, delay=delay):
             features_dict = extract_features(frame)
@@ -179,20 +428,15 @@ async def tactical_stream(
                     }
                 )
 
-            spike_fired = (
-                previous_threat_15s is not None
-                and (cumulative_incidence - previous_threat_15s) > spike_threshold
+            _maybe_trigger_spike_alert(
+                websocket,
+                connection_lock,
+                previous_threat_15s,
+                cumulative_incidence,
+                spike_threshold,
+                features_dict,
+                normalized_input,
             )
-            if spike_fired:
-                asyncio.create_task(
-                    _run_alert_pipeline(
-                        websocket,
-                        connection_lock,
-                        features_dict,
-                        normalized_input,
-                        cumulative_incidence,
-                    )
-                )
 
             # Updated regardless of whether a spike fired (Step 3.7).
             previous_threat_15s = cumulative_incidence

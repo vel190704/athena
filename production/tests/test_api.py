@@ -11,11 +11,16 @@ import os
 import queue
 import threading
 import time
+from pathlib import Path
 
 os.environ.setdefault("MLFLOW_ALLOW_FILE_STORE", "true")
 
+import pytest
+import torch
 from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 
+import production.src.serving.api as api_module
 from production.src.serving.api import app
 
 MATCH_ID = 3857276
@@ -144,3 +149,228 @@ def test_per_connection_spike_state_is_isolated():
         f"type={first_message['type']!r} (never an alert), independent of connection A's "
         "spike_threshold=0.0 activity on a separate connection."
     )
+
+
+# ============================================================================
+# Milestone 33: CV video-source WebSocket integration.
+#
+# Two real, already-cached JSON files (not videos) stand in as "video_path"
+# values for tests that mock CVPipeline entirely (its process_video is never
+# actually asked to open them as video); one of them is ALSO used, WITHOUT
+# any mocking, to prove the genuine "file exists and is inside the allowed
+# directory, but cv2 can't read it as a video" failure path end-to-end.
+# ============================================================================
+
+_STANDIN_VIDEO_PATH_A = "data/raw/3773386_events.json"
+_STANDIN_VIDEO_PATH_B = "data/raw/3773386_360.json"
+
+
+class _FakeCVPipelineForIsolationTest:
+    """Records every instance created (class-level list) so a test can
+    assert a FRESH instance was constructed per connection, and yields one
+    frame whose ball position encodes `video_path`, so two connections
+    given different paths are directly, exactly distinguishable in the
+    JSON they receive -- proving no cross-connection state leakage.
+    """
+
+    instances: list["_FakeCVPipelineForIsolationTest"] = []
+
+    def __init__(self, homography_matrix=None, model_checkpoint="yolov8m.pt", **kwargs):
+        self.video_path_seen = None
+        _FakeCVPipelineForIsolationTest.instances.append(self)
+
+    def process_video(self, video_path, max_frames=None):
+        self.video_path_seen = video_path
+        marker = float(abs(hash(video_path)) % 1000)
+        yield {
+            "frame_num": 0,
+            "timestamp_sec": 0.0,
+            "tensors": {
+                "player_pos": torch.tensor([[30.0, 20.0], [70.0, 50.0]], dtype=torch.float32),
+                "player_vel": torch.zeros((2, 2), dtype=torch.float32),
+                "is_teammate": torch.tensor([True, False], dtype=torch.bool),
+                "ball_pos": torch.tensor([marker, marker], dtype=torch.float32),
+                "fatigue_mod": torch.ones((2,), dtype=torch.float32),
+            },
+            "diagnostics": {
+                "skipped_non_tactical": 0,
+                "tracked_players": 2,
+                "ball_detected": True,
+                "team_mapping_refreshed": True,
+                "stale_velocity_fallback_count": 0,
+            },
+        }
+
+
+def test_cv_source_per_connection_state_isolation(monkeypatch):
+    """The load-bearing correctness test for this milestone: two CV-source
+    connections, given DIFFERENT video paths, must each get a FRESH
+    CVPipeline instance and must never see the other's data.
+    """
+    _FakeCVPipelineForIsolationTest.instances.clear()
+    monkeypatch.setattr(api_module, "CVPipeline", _FakeCVPipelineForIsolationTest)
+
+    with TestClient(app) as client:
+        with client.websocket_connect(
+            f"/ws/tactical-stream?source=cv&video_path={_STANDIN_VIDEO_PATH_A}"
+        ) as connection_a:
+            message_a = connection_a.receive_json()
+
+        with client.websocket_connect(
+            f"/ws/tactical-stream?source=cv&video_path={_STANDIN_VIDEO_PATH_B}"
+        ) as connection_b:
+            message_b = connection_b.receive_json()
+
+    assert len(_FakeCVPipelineForIsolationTest.instances) == 2, (
+        "expected a FRESH CVPipeline instance per connection, got "
+        f"{len(_FakeCVPipelineForIsolationTest.instances)}"
+    )
+    # video_path_seen is the RESOLVED absolute path (api.py resolves it for
+    # the path-safety check before ever calling process_video), not the
+    # raw relative string passed in the URL.
+    assert _FakeCVPipelineForIsolationTest.instances[0].video_path_seen == str(Path(_STANDIN_VIDEO_PATH_A).resolve())
+    assert _FakeCVPipelineForIsolationTest.instances[1].video_path_seen == str(Path(_STANDIN_VIDEO_PATH_B).resolve())
+
+    # The fake pipeline's process_video hashes whatever path it's actually
+    # called with -- the RESOLVED absolute path, same as video_path_seen above.
+    expected_marker_a = float(abs(hash(str(Path(_STANDIN_VIDEO_PATH_A).resolve()))) % 1000)
+    expected_marker_b = float(abs(hash(str(Path(_STANDIN_VIDEO_PATH_B).resolve()))) % 1000)
+
+    print(f"\nConnection A ball.pos: {message_a['ball']['pos']} (expected marker {expected_marker_a})")
+    print(f"Connection B ball.pos: {message_b['ball']['pos']} (expected marker {expected_marker_b})")
+
+    assert message_a["ball"]["pos"] == pytest.approx([expected_marker_a, expected_marker_a])
+    assert message_b["ball"]["pos"] == pytest.approx([expected_marker_b, expected_marker_b])
+    assert message_a["ball"]["pos"] != message_b["ball"]["pos"], (
+        "connection A and B received IDENTICAL ball positions -- state may be leaking between "
+        "connections"
+    )
+
+
+class _SlowFakeCVPipeline:
+    """Simulates slow, genuinely CPU-bound CV processing via a REAL
+    blocking `time.sleep` inside the generator body -- if `_stream_cv_source`
+    failed to offload `next()` calls to a worker thread, this sleep would
+    block the entire FastAPI event loop, not just this one connection."""
+
+    SLEEP_SECONDS = 3.0
+
+    def __init__(self, homography_matrix=None, model_checkpoint="yolov8m.pt", **kwargs):
+        pass
+
+    def process_video(self, video_path, max_frames=None):
+        time.sleep(self.SLEEP_SECONDS)  # a REAL blocking sleep, not asyncio.sleep
+        yield {
+            "frame_num": 0,
+            "timestamp_sec": 0.0,
+            "tensors": {
+                "player_pos": torch.tensor([[30.0, 20.0], [70.0, 50.0]], dtype=torch.float32),
+                "player_vel": torch.zeros((2, 2), dtype=torch.float32),
+                "is_teammate": torch.tensor([True, False], dtype=torch.bool),
+                "ball_pos": torch.tensor([50.0, 34.0], dtype=torch.float32),
+                "fatigue_mod": torch.ones((2,), dtype=torch.float32),
+            },
+            "diagnostics": {
+                "skipped_non_tactical": 0,
+                "tracked_players": 2,
+                "ball_detected": True,
+                "team_mapping_refreshed": True,
+                "stale_velocity_fallback_count": 0,
+            },
+        }
+
+
+def test_cv_source_does_not_block_event_loop_for_other_requests(monkeypatch):
+    """Proves the async fix (Step 1.3's `asyncio.to_thread(next, gen)`
+    pattern) actually works: while a CV-source connection is mid-processing
+    a deliberately slow (3s, genuinely blocking) frame, a SEPARATE,
+    concurrent `/simulate` REST request must still complete quickly --
+    a single-connection test alone cannot show this, since it wouldn't
+    reveal whether the event loop itself was blocked.
+    """
+    monkeypatch.setattr(api_module, "CVPipeline", _SlowFakeCVPipeline)
+
+    with TestClient(app) as client:
+        ws_elapsed_holder = {}
+
+        def _slow_ws_worker():
+            start = time.monotonic()
+            with client.websocket_connect(
+                f"/ws/tactical-stream?source=cv&video_path={_STANDIN_VIDEO_PATH_A}"
+            ) as ws:
+                ws.receive_json()
+            ws_elapsed_holder["seconds"] = time.monotonic() - start
+
+        ws_thread = threading.Thread(target=_slow_ws_worker)
+        ws_thread.start()
+        time.sleep(0.5)  # let the WS connection start and enter the slow sleep
+
+        get_start = time.monotonic()
+        response = client.get("/simulate?match_id=3857276&minute=10&action=no_change")
+        get_elapsed = time.monotonic() - get_start
+
+        ws_thread.join(timeout=_SlowFakeCVPipeline.SLEEP_SECONDS + 10)
+
+    print(f"\n/simulate GET completed in {get_elapsed:.2f}s while a CV stream was mid-sleep "
+          f"({_SlowFakeCVPipeline.SLEEP_SECONDS}s blocking call)")
+    print(f"CV WebSocket connection took {ws_elapsed_holder.get('seconds', float('nan')):.2f}s total")
+
+    assert response.status_code == 200
+    assert get_elapsed < _SlowFakeCVPipeline.SLEEP_SECONDS, (
+        f"/simulate took {get_elapsed:.2f}s, close to or exceeding the CV stream's "
+        f"{_SlowFakeCVPipeline.SLEEP_SECONDS}s blocking sleep -- the event loop may have been "
+        "blocked by the CV connection rather than offloading it to a worker thread"
+    )
+
+
+def test_cv_source_rejects_path_traversal():
+    # NOTE: `websocket.accept()` runs unconditionally before the path
+    # check (see api.py), so the ACCEPT message is what
+    # `websocket_connect()`'s `__enter__` observes -- the subsequent
+    # `close()` this test is checking for only becomes visible on an
+    # explicit `receive_json()` call inside the block, not from `__enter__`
+    # itself. Same pattern as `test_cv_source_unreadable_file_closes_cleanly_not_a_crash`.
+    with TestClient(app) as client:
+        with pytest.raises(WebSocketDisconnect) as exc_info:
+            with client.websocket_connect(
+                "/ws/tactical-stream?source=cv&video_path=../../etc/passwd"
+            ) as ws:
+                ws.receive_json()
+        assert exc_info.value.code == 1008
+
+
+def test_cv_source_missing_video_path_param_rejected():
+    with TestClient(app) as client:
+        with pytest.raises(WebSocketDisconnect) as exc_info:
+            with client.websocket_connect("/ws/tactical-stream?source=cv") as ws:
+                ws.receive_json()
+        assert exc_info.value.code == 1008
+
+
+def test_cv_source_nonexistent_file_within_allowed_dir_rejected():
+    with TestClient(app) as client:
+        with pytest.raises(WebSocketDisconnect) as exc_info:
+            with client.websocket_connect(
+                "/ws/tactical-stream?source=cv&video_path=data/raw/does_not_exist_12345.mp4"
+            ) as ws:
+                ws.receive_json()
+        assert exc_info.value.code == 1008
+
+
+def test_cv_source_unreadable_file_closes_cleanly_not_a_crash():
+    """A REAL file that genuinely exists inside the allowed directory --
+    but is not a valid video (a cached JSON file) -- passes the path-safety
+    check, so the failure must surface from CVPipeline itself
+    (`cv2.VideoCapture` producing an invalid fps, per Milestone 32) and be
+    caught by `_stream_cv_source`'s top-level exception handler (Step 4),
+    not crash the server or hang. No mocking -- this exercises the REAL
+    CVPipeline/cv2 failure path end-to-end.
+    """
+    with TestClient(app) as client:
+        with pytest.raises(WebSocketDisconnect) as exc_info:
+            with client.websocket_connect(
+                f"/ws/tactical-stream?source=cv&video_path={_STANDIN_VIDEO_PATH_A}"
+            ) as ws:
+                ws.receive_json()
+        print(f"\nUnreadable-video close code: {exc_info.value.code}, reason: {exc_info.value.reason}")
+        assert exc_info.value.code == 1011

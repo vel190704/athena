@@ -66,6 +66,11 @@ import websocket
 DEFAULT_REST_BASE_URL = "http://127.0.0.1:8000"
 DEFAULT_WS_URL = "ws://127.0.0.1:8000/ws/tactical-stream"
 DEFAULT_MATCH_ID = "3857276"
+# Milestone 33: server-side default for the CV data source -- MUST resolve
+# inside the backend's data/raw/ directory (ALLOWED_CV_VIDEO_DIRECTORY in
+# api.py); this is just a plausible-looking placeholder, not a file
+# guaranteed to exist.
+DEFAULT_CV_VIDEO_PATH = "data/raw/test_match.mp4"
 MAX_THREAT_BUFFER_LEN = 60
 MAX_ALERT_BUFFER_LEN = 20
 RECV_TIMEOUT_SECONDS = 10.0  # how long to wait for a single message before treating the stream as stalled
@@ -89,6 +94,19 @@ with st.sidebar:
 
     st.divider()
     st.header("Live Stream Settings")
+    data_source_label = st.radio("Data Source", ["StatsBomb Replay", "CV Video Feed"])
+    video_path = None
+    if data_source_label == "CV Video Feed":
+        video_path = st.text_input(
+            "Video Path",
+            value=DEFAULT_CV_VIDEO_PATH,
+            help=(
+                "Server-side file path -- must resolve INSIDE the backend's data/raw/ directory. "
+                "The backend rejects (with a clean error, not a crash) any path that resolves "
+                "outside it, so don't point this at an arbitrary location on disk. The Match ID "
+                "field above is ignored for this data source."
+            ),
+        )
     max_duration_seconds = st.number_input(
         "Max stream duration (seconds)", min_value=1, max_value=3600, value=300
     )
@@ -198,7 +216,14 @@ def _render_alerts(alerts_buffer: list[str]) -> None:
 
 
 if start_clicked:
-    connection_url = f"{ws_url}?match_id={match_id}"
+    # Milestone 33: which data source's query params to build depends on
+    # the sidebar selection -- source=cv requires video_path (server-side,
+    # must resolve inside data/raw/); source=statsbomb (the default,
+    # unchanged from Milestone 17) uses match_id.
+    if data_source_label == "CV Video Feed":
+        connection_url = f"{ws_url}?source=cv&video_path={video_path}"
+    else:
+        connection_url = f"{ws_url}?source=statsbomb&match_id={match_id}"
 
     # Rolling, CAPPED buffers -- plain local variables, intentionally NOT
     # session_state, since the entire stream lifetime happens within this
@@ -206,6 +231,7 @@ if start_clicked:
     threat_buffer: list[float] = []
     alerts_buffer: list[str] = []
     message_count = 0
+    latest_real_time_lag_sec: float | None = None  # only ever set by the CV source
 
     status_placeholder.info("Connecting...")
 
@@ -256,6 +282,13 @@ if start_clicked:
                     if len(threat_buffer) > MAX_THREAT_BUFFER_LEN:
                         threat_buffer.pop(0)
                     chart_placeholder.line_chart(pd.DataFrame({"threat_15s": threat_buffer}))
+                    # real_time_lag_sec (Milestone 33, CV source only): how
+                    # far behind real video time the stream currently is.
+                    # Surfaced honestly rather than silently either
+                    # sprinting through the match or claiming a pace it
+                    # isn't keeping -- see api.py's _stream_cv_source.
+                    if "real_time_lag_sec" in message:
+                        latest_real_time_lag_sec = message["real_time_lag_sec"]
 
                 elif message_type == "alert":
                     alert_text = message.get("explanation", "(empty alert)")
@@ -264,7 +297,13 @@ if start_clicked:
                         alerts_buffer.pop()
                     _render_alerts(alerts_buffer)
 
-                status_placeholder.info(f"Streaming... ({message_count} messages received)")
+                lag_suffix = ""
+                if latest_real_time_lag_sec is not None:
+                    if latest_real_time_lag_sec > 0.5:
+                        lag_suffix = f" -- running {latest_real_time_lag_sec:.1f}s behind real-time"
+                    else:
+                        lag_suffix = " -- keeping real-time pace"
+                status_placeholder.info(f"Streaming... ({message_count} messages received){lag_suffix}")
         finally:
             try:
                 ws_connection.close()
