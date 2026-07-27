@@ -1,18 +1,32 @@
+# Project Athena -- dependencies grouped by track (see README.md's at-a-glance
+# table / context.md for what each track has achieved vs. not yet).
+
+# --- Core numerics & utilities ---
 numpy
-pytest
-torch
-requests
 pandas
+requests
 tqdm
-mlflow
+
+# --- Testing ---
+pytest
+
+# --- StatsBomb / physics-ML track (Milestones 1-24, empirically validated) ---
+torch
 torch-geometric
+mlflow
 captum
+
+# --- Live serving & dashboard (Milestones 15-19, 33) ---
 fastapi
 uvicorn
 websockets
-httpx2
+httpx              # required by fastapi.testclient.TestClient (starlette dependency)
 streamlit
 websocket-client
+
+# --- Computer Vision pipeline / Module 4 (Milestones 25-34, internally
+# validated only -- see docs/CV_PIPELINE_FINDINGS.md; blocked on SoccerNet
+# NDA access for ground-truth validation) ---
 ultralytics
 SoccerNet
 opencv-python

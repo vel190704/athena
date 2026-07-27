@@ -2,8 +2,28 @@
 
 **Repository:** https://github.com/vel190704/athena  
 **Version:** 5.1 (Research-Grade HPC Architecture Blueprint)  
-**Last major update:** Milestone 34 (CV Pipeline Findings synthesis)  
+**Last major update:** Milestone 36 (Match-level train/val split — see `docs/adr/ADR-011-match-level-train-val-split.md`)  
 **Status:** Two tracks now implemented, each validated to its own appropriate standard — StatsBomb/physics-ML track: implemented **and empirically validated** against real match data (8,074 samples, ~55 matches, 12 competitions — see `docs/RESEARCH_FINDINGS.md`); CV/Module 4 track: implemented **and internally validated** on synthetic/adversarial/mocked tests only, **not yet validated on real broadcast footage**, blocked on SoccerNet NDA access (see `docs/CV_PIPELINE_FINDINGS.md`).
+
+---
+
+## At a Glance: Achieved vs. Not Yet
+
+The fastest way to answer "is X done?" without reading the full document below.
+
+| Track / Area | Achieved so far | Not yet achieved |
+|---|---|---|
+| Physics core (Kalman friction, pitch control) | Kalman filter validated to 0.336% error on synthetic data (5x tighter than the 2% gate, ADR-008); analytical pitch-control ODE, sparse-masked, in production | Real StatsBomb pass-trajectory validation (RQ3's literal "pass landing error" criterion) — only synthetic convergence proven |
+| Survival prediction (DeepHit, RQ1) | Well-calibrated Brier Scores in absolute terms (0.0942 / 0.1588 @15s/30s, M14B) across 8,074 real samples / 55 matches | A non-physics-informed baseline ablation, to measure RQ1's literal "% improvement" criterion |
+| Graph vs. handcrafted features (RQ4) | GNN wired in, trained head-to-head under matched, stabilized hyperparameters; current data point: MLP wins | A settled verdict — this comparison has already reversed direction twice; re-running it under Milestone 36's match-level split has not been done |
+| Uncertainty quantification | 5-member Deep Ensemble (M21) with per-member disentangled loss | True Batch Ensemble (shared weights, ADR-004) — the ~5x compute cost remains unresolved |
+| Explainability | Integrated Gradients + templated LLM-style summaries, fully async (M15, ADR-006) | A real LLM integration (currently a mock/templated executor) |
+| Historical/habit memory (RQ2) | Implemented, tested, honestly reported as a null result (M22-23) | Re-running it against the ~10x larger training corpus Milestone 36 unlocked (4 → up to 42 eligible matches) |
+| Digital Twin / counterfactuals (RQ5) | Heuristic perturbation engine (M13) + Oracle Substitution Validation against one real match (M20) | Multi-match Oracle validation — only 1 genuinely unconfounded observation exists so far |
+| Live serving & dashboard | WebSocket/REST API, Streamlit dashboard, per-connection isolation, async non-blocking CV integration (M16-19, M33) | Real calibration wired through the live CV API path (currently pixel-space only, not physically meaningful yet) |
+| Train/val split methodology | Match-level split — no match can straddle both splits, by construction (M36, ADR-011) | *(closed — nothing further planned here)* |
+| Training-stability safety net | 4-signal detector, regression-tested against real historical failure patterns; a false positive found & fixed (M35, ADR-010) | *(considered solid pending a genuinely novel failure mode)* |
+| Computer Vision pipeline (Module 4) | Full pipeline built and internally validated (detection→tracking→calibration→team ID→ball detection→shot classification→orchestration→adapter→live API, M25-34); one real private clip processed end-to-end, a real bug found & fixed (ball-detector `imgsz`), and a first real throughput number (8.57 fps vs. this clip's 28fps source) | SoccerNet-gated ground-truth validation — detection P/R, a true ID-switch rate, calibration accuracy vs. real lens distortion. **The single biggest blocker in the whole project.** |
 
 ---
 
@@ -93,7 +113,7 @@ athena/
 | CV — Adapter | Pixel→meter tensor conversion into the shared tensor contract | `adapter.py` — synthetic homography only |
 
 ### Architecture Decision Records (ADRs)
-All 9 ADR files exist in `docs/adr/`:
+All 11 ADR files exist in `docs/adr/`:
 - ADR-001 · DeepHit over Cox / DeepSurv
 - ADR-002 · StatsBomb coordinate scaling (120×80 → 100×68)
 - ADR-003 · Attacking direction normalization — **superseded by ADR-009** (see both; ADR-003's `direction.py` module is kept, not deleted, for a future data source that genuinely needs it)
@@ -103,6 +123,8 @@ All 9 ADR files exist in `docs/adr/`:
 - ADR-007 · Reaction-time / fatigue coupling
 - ADR-008 · Kalman synthetic validation baseline
 - ADR-009 · StatsBomb per-team coordinate convention (supersedes ADR-003 — coordinates are already actor-oriented, no direction flip needed; explicitly scoped to StatsBomb's convention, noted as NOT applicable to a future CV pixel-coordinate source)
+- ADR-010 · Instability-detector false-positive fix (Milestone 35; a separate, cruder "10% loss decrease" heuristic — not the four-signal core detector — caused the false positive; demoted to a non-blocking diagnostic, detector regression-tested against synthetic M12/M14/M23 patterns)
+- ADR-011 · Match-level train/val split (Milestone 36; replaces sample-level splitting so a match can never straddle both groups, fixing the corpus-starvation problem Milestone 23 discovered; pre- and post-refactor MLflow runs are explicitly NOT comparable — see `split_type` param)
 
 ---
 
@@ -130,6 +152,8 @@ All 9 ADR files exist in `docs/adr/`:
 | **24** | `docs/RESEARCH_FINDINGS.md` — full RQ1-RQ5 synthesis, every MLflow-logged number re-verified against the tracking store before citing it | Found zero numeric discrepancies specifically *because* every figure was re-checked rather than recalled — the project's verification discipline applied to its own reporting, not just its code |
 | **25–33** | Full CV ingestion track (Module 4): YOLOv8m detection → ByteTrack tracking → homography calibration → team classification → ball detection → shot/camera-cut classification → pipeline orchestrator → adapter into the shared tensor contract → live WebSocket API integration | Built an entire parallel data source (broadcast video) that feeds the exact same tensor contract the StatsBomb-trained models already consume, with zero changes to existing physics/ML/serving code — proving Principle 5 above in practice. Every component internally validated (synthetic/adversarial/mocked); a real WebSocket close-frame protocol bug was found only by testing against the actual running server (M33) |
 | **34** | `docs/CV_PIPELINE_FINDINGS.md` — full CV component validation synthesis, mirroring Milestone 24's discipline for the CV track | Every cited figure re-run or freshly regenerated before citing; states plainly that the entire CV track remains blocked on SoccerNet NDA access for real-broadcast validation — the document's central, load-bearing caveat |
+| **35** | Audited and fixed the instability-detector false positive flagged since M14B: the four-signal core detector (spike/drift/saturation/frozen-val-loss) never misfired — a SEPARATE, cruder "10% loss decrease" heuristic inside the `mlp_healthy` gate did. Demoted it to a non-blocking diagnostic; extracted the three previously-inline signals into pure, testable functions; regression-tested against synthetic M12/M14/M23 patterns (ADR-010) | Exonerated the detector this project's own history had validated (M12, M14) rather than tuning it against a single incident; fixed the actual, narrower culprit instead |
+| **36** | Implemented match-level train/val splitting (`data_split.match_level_split`), replacing sample-level splitting everywhere in `train.py`; simplified habit-memory's now-unnecessary "conservative partition" workaround; ran a single MLP smoke test under the new split (Brier@15s/30s = 0.1012/0.1888, informational only) (ADR-011) | Fixes M23's root cause at the source (a match can no longer straddle both splits, by construction) — the training-bucket corpus a future habit-memory re-run could use jumped from 4 to up to 42 matches, purely as a side effect |
 
 ### Important Design Decisions Made Along the Way
 - Only relative “teammate” flags are used (a single freeze-frame has no absolute team IDs) — extended in the CV track (Milestone 30) to a **possession-based** heuristic: the nearest player to the ball, by transformed pitch-meter distance, defines the possessing team, verified to flip correctly as ball position changes, rather than any hardcoded team assignment.
@@ -140,6 +164,8 @@ All 9 ADR files exist in `docs/adr/`:
 - Bayesian habit-memory blending (Milestone 22) is constrained to the single acting player per event, a **real 360-data schema limitation** (no per-player identity for ~21 of 22 visible players in any freeze-frame), not a design choice — this dilutes the blended signal inside features that sum over ~11 players per side.
 - Counterfactual actions (Milestone 13) are intentionally simple multiplicative heuristics — research probes, not production-calibrated effects.
 - The CV pipeline (Milestones 25-34) is deliberately kept synthetic/adversarial-validated and does **not** claim real-world readiness anywhere in its own documentation — every "works" claim in `CV_PIPELINE_FINDINGS.md` is explicitly labeled by validation level (synthetic vs. real-photo vs. real-broadcast-footage), and the SoccerNet NDA blocker is stated plainly rather than softened.
+- The instability detector's four core signals (spike, cumulative drift, saturation, frozen-val-loss) were never the source of Milestone 23's false positive — a SEPARATE, cruder "10% loss decrease" heuristic sitting alongside them was (Milestone 35, ADR-010). Fixing the actual culprit rather than re-tuning the exonerated detector avoided overfitting a threshold to one incident.
+- Train/validation splitting moved from sample-level to match-level (Milestone 36, ADR-011): a match can no longer contribute samples to both splits, by construction, removing the need for habit-memory's prior "exclude any straddling match entirely" workaround. Pre- and post-refactor MLflow runs are NOT comparable (different validation sets, not just different models) — every run since Milestone 36 is tagged `split_type`; historical runs are implicitly `sample_level`, never retroactively re-tagged.
 
 ### Current Test Coverage
 - Synthetic Kalman convergence gate
@@ -152,28 +178,31 @@ All 9 ADR files exist in `docs/adr/`:
 - MLflow logging
 - Counterfactual simulator + end-to-end prediction with a real trained model (Milestone 13); Oracle Substitution Validation against real historical substitutions (Milestone 20)
 - Live FastAPI WebSocket API + REST `/simulate`, including per-connection state-isolation tests (established Milestone 16, re-proven for a second, independent subsystem at Milestone 33's CV integration)
-- Full CV test suite — detector, tracker, calibration, team classifier, ball detector, shot classifier, pipeline orchestrator, adapter, and the API's CV-source path — all explicitly synthetic/adversarial/mocked, per `docs/CV_PIPELINE_FINDINGS.md`; no real-broadcast-footage tests currently pass (they skip, pending SoccerNet NDA access)
+- Full CV test suite — detector, tracker, calibration, team classifier, ball detector, shot classifier, pipeline orchestrator, adapter, and the API's CV-source path — all explicitly synthetic/adversarial/mocked, per `docs/CV_PIPELINE_FINDINGS.md`; the SoccerNet-ground-truth test still skips (NDA-blocked), but the tracker's and pipeline's real-footage tests now run and pass against a real private clip
+- Instability detector, regression-tested against synthetic reconstructions of the M12/M14/M23 historical failure (and healthy-control) patterns (Milestone 35)
+- Match-level split (`match_level_split`) — no-straddling guarantee, determinism, honest ratio reporting, dominant-match imbalance detection (Milestone 36)
 
 ---
 
 ## 4. What's the current goal
 
-**Both tracks are now "complete" in the sense of implemented-and-tested-at-their-appropriate-standard** — the StatsBomb/physics-ML track (RQ1-RQ5) is empirically validated against real match data; the CV track (Module 4) is internally validated against synthetic/adversarial tests. Neither is "done" in an absolute sense; two concrete, real gaps remain open on the StatsBomb side, and the CV side has one single, well-understood blocker.
+**Both tracks are now "complete" in the sense of implemented-and-tested-at-their-appropriate-standard** — the StatsBomb/physics-ML track (RQ1-RQ5) is empirically validated against real match data; the CV track (Module 4) is internally validated against synthetic/adversarial tests, plus one real private clip. Neither is "done" in an absolute sense; one real gap remains open on the StatsBomb side, and the CV side has one single, well-understood blocker.
 
-1. **Recalibrate the instability detector's false-positive rate.** Flagged as a known issue since Milestone 14B: the detector's conservative "10% loss decrease" health heuristic has declined to certify a clean RQ4 verdict on every subsequent re-run (Milestones 21 and 23 both), even though direct probing confirms both models are genuinely healthy on those runs. Worth fixing before trusting this detector as a hands-off gate on future training runs, rather than continuing to rely on manual override.
-2. **Move the train/val split from sample-level to match-level.** The split has been at the sample level since Milestone 7 — fine while no feature depended on cross-sample information, but Milestone 23's habit-memory work showed this is a real limitation once a feature needs match-level exclusion logic (only 4 of ~55 matches were training-bucket-eligible under the current conservative rule). Worth revisiting before any further habit-memory or cross-sample-dependent feature work.
-3. **Unblock the CV track's real-data validation.** SoccerNet NDA/research-use access is still pending; no real broadcast footage has ever been processed by this pipeline. Every remaining CV validation gap (detection P/R, tracking ID-switches under real occlusion, calibration against a real lens, team classification under real jersey patterns, the shot classifier's real-world adversarial failure rate, real-hardware throughput) traces back to this one blocker — `docs/CV_PIPELINE_FINDINGS.md` §5 is the prioritized list of what to validate once it's lifted.
+1. **Re-run RQ2 (habit memory) and RQ4 (MLP-vs-GNN) under the new match-level split.** Milestone 36 fixed the split methodology itself (ADR-011) and ran only a single MLP smoke test as a validation check — it deliberately did NOT re-run the full comparison suite. The training-bucket corpus a habit-memory re-run could now draw on jumped from 4 matches to up to 42, purely as a side effect of the split fix; whether that changes RQ2's null result, and whether RQ4's "MLP wins" conclusion holds under the new split, are both still open.
+2. **Unblock the CV track's real-data validation.** SoccerNet NDA/research-use access is still pending; no ground-truth-annotated broadcast footage has ever been processed by this pipeline (one real, unannotated private clip has, as of Milestones 35-36's debugging — see the CV row in the at-a-glance table above — but that is not a substitute for licensed, annotated data). Every remaining CV validation gap (detection P/R, tracking ID-switches under real occlusion, calibration against a real lens, team classification under real jersey patterns, the shot classifier's real-world adversarial failure rate, real-hardware throughput at scale) traces back to this one blocker — `docs/CV_PIPELINE_FINDINGS.md` §5 is the prioritized list of what to validate once it's lifted.
 
-The following Milestone-13-era goals are now resolved and should not be re-opened as if still pending:
+The following goals are now resolved and should not be re-opened as if still pending:
 - ~~Wire the graph builder in for RQ4~~ — done, Milestone 12 onward; result trajectory documented in Research Findings, not treated as final.
 - ~~Close the velocity gap~~ — partially done: the CV tracker (Milestone 26) produces real pixel velocity, explicitly labeled camera-motion-confounded; true calibrated player velocity still requires camera-motion compensation, not yet built.
 - ~~Prepare the Bayesian habit layer~~ — done, Milestones 22-23; a real, honestly-reported null result under current data constraints, not an open task.
 - ~~Full Digital Twin with substitution counterfactuals~~ — done, Milestone 20 (Oracle Substitution Validation); a hedged, confounded-but-real result on one match, not a closed/clean pass.
-- ~~Eventually the computer-vision pipeline~~ — done through Milestone 34; fully built and internally validated, unvalidated on real data (see gap 3 above).
+- ~~Eventually the computer-vision pipeline~~ — done through Milestone 34; fully built and internally validated, unvalidated on ground-truth-annotated real data (see gap 2 above).
+- ~~Recalibrate the instability detector's false-positive rate~~ — done, Milestone 35 (ADR-010): the actual culprit was a separate, cruder heuristic, not the core detector; fixed and regression-tested.
+- ~~Move the train/val split from sample-level to match-level~~ — done, Milestone 36 (ADR-011); re-running RQ2/RQ4 under it is the new item 1 above, not this item reopened.
 
 The guiding principle remains unchanged, now with a demonstrated track record behind it:  
 **Validate the physics first. Keep every component independently testable. Answer the research questions with measurable evidence. Treat heuristic counterfactuals as exploratory probes, not final answers.** This discipline has repeatedly caught real, silent failures — a coordinate convention error (ADR-003→009), two separate silent training collapses (Milestone 12, Milestone 14), and a homography math trap that would have produced 4,242 m/s of fabricated player velocity had it shipped uncaught (Milestone 30) — precisely because every component was independently validated rather than assumed correct.
 
 ---
 
-*This context document reflects the state of the repository after Milestone 34 (`docs/CV_PIPELINE_FINDINGS.md`). Any specific commit hash should be treated as an approximate pointer, not a verified reference, unless independently confirmed against `git log` at the time of reading.*
+*This context document reflects the state of the repository after Milestone 36 (`docs/adr/ADR-011-match-level-train-val-split.md`). Any specific commit hash should be treated as an approximate pointer, not a verified reference, unless independently confirmed against `git log` at the time of reading.*
