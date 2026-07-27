@@ -41,6 +41,22 @@ permanently settled — RQ4 in particular has already reversed direction twice a
 scale and training stability changed, and is presented as a trajectory, not a single
 number.
 
+**Methodological update (Milestone 35), read alongside every finding below:** every RQ
+finding in this document — including RQ2's null result and RQ4's full trajectory — was
+produced under a train/validation split at the SAMPLE level (Milestone 7 through
+Milestone 34). As of Milestone 35, this project's training code uses a MATCH-level split
+instead (`production/src/pipeline/data_split.py`; see ADR-011), because sample-level
+splitting let almost every match contribute samples to both sides, which is exactly what
+starved RQ2's historical corpus down to 4 usable matches (see RQ2 below). **This does
+not change or supersede any finding already reported below** — those remain accurate
+statements about what was found under the methodology used at the time. A single
+validation smoke test (the seed=42 stabilized MLP, Milestone 14B's exact
+hyperparameters, retrained under the new match-level split) is logged in MLflow tagged
+`split_type="match_level"` for the record, explicitly NOT as a new headline number; every
+pre-existing run remains implicitly `split_type="sample_level"`. Re-running RQ2 and RQ4's
+full comparisons under match-level splitting is legitimate, separate future work (see
+Future Work §6), not performed as part of this update.
+
 ---
 
 ## 2. Research Questions & Findings
@@ -417,15 +433,20 @@ first feature genuinely dependent on cross-sample information.
 
 Prioritized, not exhaustive:
 
-1. **Match-level (not sample-level) train/val split — a prerequisite, not an independent
-   nice-to-have.** The split has been at the sample level since Milestone 7, which was
-   fine while no feature depended on cross-sample information. Milestone 23 showed this
-   becomes a real constraint the moment a feature (habit memory) depends on *other
-   samples' matches*: a proper training-history corpus needs match-level split
-   boundaries (and, ideally, chronological ordering within them) so that most matches
-   aren't excluded from the historical bucket corpus simply for straddling both splits.
-   Any future habit-memory improvement should treat this as a foundational
-   re-architecture to do first, not a follow-on fix.
+1. **~~Match-level (not sample-level) train/val split~~ — DONE (Milestone 35, ADR-011).**
+   The split had been at the sample level since Milestone 7, which was fine while no
+   feature depended on cross-sample information, until Milestone 23 showed this becomes
+   a real constraint the moment a feature (habit memory) depends on *other samples'
+   matches*. `data_split.match_level_split` now guarantees no match straddles both
+   splits, by construction. What remains open, and is NOT done: (a) chronological
+   ordering within the training-history corpus is still not enforced (a separate,
+   independent limitation from the split level itself — see RQ2's Thread scope notes
+   above and ADR-011); and (b) actually re-running RQ2's habit-blended MLP and RQ4's
+   MLP-vs-GNN comparisons under the new split — Milestone 35 only ran a single MLP smoke
+   test, explicitly not a re-validation campaign. Both re-runs are the natural next step,
+   now that the training-bucket corpus a habit-blending re-run could draw on has grown
+   from 4 matches to as many as 42 (out of ~52 matches contributing any samples) purely
+   as a side effect of this refactor.
 2. **Larger-scale dataset**, for two independent reasons: a fairer RQ4 re-evaluation at a
    scale less sensitive to any single training run's noise, and — jointly with (1) — a
    training-bucket corpus for RQ2 larger than the 4 matches Milestone 23 had to work

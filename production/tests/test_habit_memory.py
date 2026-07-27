@@ -22,14 +22,17 @@ from production.src.ingestion.statsbomb_io import (
     fetch_match_events,
     parse_360_frame,
 )
+from production.src.pipeline.data_split import match_level_split
 from production.src.pipeline.feature_extractor import extract_features
 from production.src.pipeline.habit_memory import (
     GRID_COLS,
     GRID_ROWS,
     MIN_HISTORICAL_EVENTS,
     bayesian_blend_habit,
+    build_player_match_buckets,
     generate_mock_heatmap,
     generate_player_heatmap,
+    heatmap_from_buckets,
 )
 
 MATCH_ID = 3857276
@@ -204,3 +207,93 @@ def test_extract_features_with_habit_blending_enabled_differs_and_is_finite():
         parsed_frame["player_pos"][parsed_frame["is_actor"]][0],
         torch.tensor(actor_pos, dtype=parsed_frame["player_pos"].dtype),
     )
+
+
+def test_heatmap_from_buckets_leakage_guard_holds_under_match_level_partition():
+    """Milestone 35 / ADR-011 Step 2.2: confirms the leakage guard (a
+    sample's own match is never in its own heatmap corpus) still holds
+    now that `train.py` feeds `heatmap_from_buckets` a match-level-clean
+    `included_match_ids` set (via `match_level_split`) instead of the
+    Milestone 23 sample-level "any match with a validation sample is
+    excluded entirely" workaround.
+
+    Under match-level splitting, a sample's own match is either (a) in
+    the training group -- in which case it's still explicitly excluded
+    via `exclude_match_id`, exactly as Milestone 22's base rule always
+    required -- or (b) in the validation group, and therefore was never
+    in `included_match_ids` (the caller's training-match set) to begin
+    with. Both paths are exercised here directly against the real bucket
+    functions, not a reimplementation.
+    """
+    player_id = 999
+    # Three matches: 100 and 200 each have MIN_HISTORICAL_EVENTS qualifying
+    # events (enough to clear the cold-start threshold on their own), 300
+    # has only 3 (deliberately below it on its own).
+    events_by_match = {
+        100: [{"player": {"id": player_id}, "location": [10.0, 10.0]} for _ in range(MIN_HISTORICAL_EVENTS)],
+        200: [{"player": {"id": player_id}, "location": [50.0, 30.0]} for _ in range(MIN_HISTORICAL_EVENTS)],
+        300: [{"player": {"id": player_id}, "location": [90.0, 60.0]} for _ in range(3)],
+    }
+    buckets = build_player_match_buckets(events_by_match)
+
+    # Simulate match_level_split having assigned match 300 to validation,
+    # and matches 100/200 to training -- a clean partition, no straddling.
+    training_match_ids = [100, 200]
+
+    # Case (a): a TRAINING-split sample whose own match is 100 -- must
+    # exclude match 100's events via exclude_match_id, leaving only
+    # match 200's events (still >= MIN_HISTORICAL_EVENTS on its own).
+    heatmap_a, num_qualifying_a, is_cold_start_a = heatmap_from_buckets(
+        player_id, buckets, training_match_ids, exclude_match_id=100
+    )
+    assert num_qualifying_a == MIN_HISTORICAL_EVENTS, (
+        f"expected exactly match 200's {MIN_HISTORICAL_EVENTS} events after excluding match 100, "
+        f"got {num_qualifying_a}"
+    )
+    assert is_cold_start_a is False
+
+    # Case (b): match 300 (the validation-split match) was NEVER passed
+    # in `training_match_ids` at all -- so its events can't leak into any
+    # training-split sample's heatmap regardless of exclude_match_id.
+    heatmap_b, num_qualifying_b, _is_cold_start_b = heatmap_from_buckets(
+        player_id, buckets, training_match_ids, exclude_match_id=100
+    )
+    assert num_qualifying_b == MIN_HISTORICAL_EVENTS  # identical to (a) -- match 300 never reachable
+
+    # Sanity: if exclude_match_id excluded NOTHING (e.g. a genuinely
+    # different sample's own match), both training matches' events count,
+    # proving the guard is doing real exclusion work above, not a no-op.
+    heatmap_c, num_qualifying_c, _is_cold_start_c = heatmap_from_buckets(
+        player_id, buckets, training_match_ids, exclude_match_id=999999
+    )
+    assert num_qualifying_c == 2 * MIN_HISTORICAL_EVENTS
+    assert not np.allclose(heatmap_a, heatmap_c)
+
+
+def test_match_level_split_training_matches_are_fully_eligible_for_habit_corpus():
+    """Milestone 35 / ADR-011 Step 2: with match-level splitting, a match
+    assigned to the training group is FULLY eligible for the training-
+    bucket corpus (no partial/conservative exclusion needed) -- verified
+    by confirming `match_level_split`'s train/val match partition, when
+    fed directly into `heatmap_from_buckets` as `included_match_ids`, is
+    already clean by construction (every training match contributes,
+    none held back "just in case").
+    """
+    # 20 matches, 10 samples each -- mirrors test_data_split.py's
+    # even-sized scenario so the match-count split is exact and easy to
+    # reason about here too.
+    sample_match_ids = [i // 10 for i in range(200)]
+    train_indices, val_indices = match_level_split(sample_match_ids, val_fraction=0.2, seed=42)
+
+    training_match_ids = sorted({sample_match_ids[i] for i in train_indices})
+    validation_match_ids = sorted({sample_match_ids[i] for i in val_indices})
+
+    # No conservative exclusion: training + validation match sets are a
+    # complete, non-overlapping partition of ALL matches -- unlike
+    # Milestone 23's sample-level rule, where a straddling match was
+    # dropped from BOTH the training corpus's eligibility and effectively
+    # wasted.
+    assert set(training_match_ids).isdisjoint(validation_match_ids)
+    assert set(training_match_ids) | set(validation_match_ids) == set(sample_match_ids)
+    assert len(training_match_ids) == 16  # 20 - round(20 * 0.2)
+    assert len(validation_match_ids) == 4

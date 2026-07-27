@@ -39,7 +39,7 @@ os.environ.setdefault("MLFLOW_ALLOW_FILE_STORE", "true")
 import mlflow
 import mlflow.pytorch
 import torch
-from torch.utils.data import Subset, random_split
+from torch.utils.data import Subset
 from torch_geometric.loader import DataLoader
 
 from production.src.ingestion.statsbomb_io import (
@@ -56,6 +56,7 @@ from production.src.models.evaluation import calculate_brier_score
 from production.src.models.gnn_model import GNNDeepHitSurvivalModel
 from production.src.models.graph_builder import DEFAULT_OPPONENT_RADIUS, DEFAULT_SAME_TEAM_RADIUS
 from production.src.pipeline.chain_builder import build_possession_chains
+from production.src.pipeline.data_split import match_level_split
 from production.src.pipeline.feature_extractor import extract_features
 from production.src.pipeline.habit_memory import (
     MIN_HISTORICAL_EVENTS,
@@ -100,6 +101,19 @@ LEARNING_RATE = 1e-3  # MLP only -- already stable in Milestone 12, deliberately
 BATCH_SIZE = 32
 TRAIN_FRACTION = 0.8
 RANDOM_SEED = 42
+
+# Milestone 35 (ADR-011): as of this milestone, every training run in this
+# file uses `data_split.match_level_split` (MATCH-level train/val split),
+# tagged `split_type="match_level"` in its MLflow params. EVERY MLflow run
+# logged before this milestone (M8's baseline through M23's habit-blended
+# MLP) used `torch.utils.data.random_split` (SAMPLE-level splitting) and
+# is therefore implicitly `split_type="sample_level"` -- those historical
+# runs are NOT retroactively re-tagged (MLflow params are immutable after
+# logging, and rewriting history here would misrepresent what actually
+# produced those numbers). A run's `split_type` param is the authoritative
+# way to tell which methodology produced it; do not assume from date or
+# run name alone. See ADR-011 for why this changed and why the two
+# methodologies' numbers are not directly comparable.
 BRIER_TIME_BINS = (3, 6)  # 15s and 30s, at BIN_SIZE_SECONDS=5.0
 GNN_HIDDEN_DIM = 64
 
@@ -378,6 +392,93 @@ def _check_for_instability(model_type: str, epoch_losses: list[float]) -> bool:
     return fired
 
 
+def _check_cumulative_drift(
+    model_type: str,
+    epoch_losses: list[float],
+    epoch: int,
+    window_epochs: int = CUMULATIVE_DRIFT_WINDOW_EPOCHS,
+    threshold_fraction: float = CUMULATIVE_DRIFT_THRESHOLD_FRACTION,
+) -> tuple[bool, float]:
+    """Milestone 14B Signal 2, factored out of the epoch loop as a pure
+    function (ADR-010) so it can be regression-tested against synthetic
+    epoch-loss sequences without a real training run. Compares the current
+    epoch's loss against the loss `window_epochs` epochs prior -- this is
+    what would have caught Milestone 14's actual failure (a steady,
+    sub-spike-threshold climb across many epochs), unlike a single-epoch
+    spike check.
+
+    `epoch` is the 1-indexed epoch number matching `epoch_losses`'
+    construction (`epoch_losses[epoch - 1]` is that epoch's loss). Returns
+    `(fired, drift_fraction)`.
+    """
+    current_loss = epoch_losses[epoch - 1]
+    prior_loss = epoch_losses[epoch - window_epochs - 1]
+    drift_fraction = (current_loss - prior_loss) / prior_loss if prior_loss > 0 else 0.0
+    fired = drift_fraction > threshold_fraction
+    if fired:
+        print(
+            f"[{model_type}] CUMULATIVE DRIFT WARNING at epoch {epoch}: loss increased "
+            f"by {drift_fraction:.1%} over the last {window_epochs} epochs (from "
+            f"{prior_loss:.4f} at epoch {epoch - window_epochs} to {current_loss:.4f} now) -- "
+            f"exceeds the {threshold_fraction:.0%} threshold. This is exactly the failure mode "
+            "a single-epoch spike check misses."
+        )
+    return fired, drift_fraction
+
+
+def _check_saturation(
+    model_type: str,
+    epoch: int,
+    batch_variance: float,
+    mean_entropy: float,
+    variance_threshold: float = SATURATION_VARIANCE_THRESHOLD,
+    entropy_threshold: float = SATURATION_ENTROPY_THRESHOLD,
+) -> bool:
+    """Milestone 14B Signal 3, factored out of the epoch loop as a pure
+    function (ADR-010) for the same regression-testability reason as
+    `_check_cumulative_drift`. TWO independent signals -- batch variance
+    and mean entropy -- since either alone can miss a real collapse:
+    variance catches "every sample gets the same output"; entropy catches
+    the subtler case where outputs still differ slightly across samples
+    but each individual prediction has collapsed to a near one-hot spike.
+    """
+    fired = batch_variance < variance_threshold or mean_entropy < entropy_threshold
+    if fired:
+        print(
+            f"[{model_type}] SATURATION WARNING at epoch {epoch}: output batch "
+            f"variance={batch_variance:.2e} (threshold <{variance_threshold:.0e}), "
+            f"mean entropy={mean_entropy:.4f} (threshold <{entropy_threshold}) -- "
+            "predictions have collapsed to a near-constant or near-one-hot output "
+            "regardless of input."
+        )
+    return fired
+
+
+def _check_frozen_val_loss(
+    model_type: str,
+    epoch: int,
+    val_loss_history: dict[int, float],
+    epoch_val_loss: float,
+) -> bool:
+    """Milestone 14B Signal 4 (the weakest of the four -- only fires after
+    a model has already fully saturated), factored out of the epoch loop
+    as a pure function (ADR-010) for the same regression-testability
+    reason as the two checks above.
+    """
+    if not val_loss_history:
+        return False
+    previous_check_epoch = max(val_loss_history.keys())
+    fired = val_loss_history[previous_check_epoch] == epoch_val_loss
+    if fired:
+        print(
+            f"[{model_type}] FROZEN VAL LOSS WARNING at epoch {epoch}: val_loss is "
+            f"bit-for-bit identical to epoch {previous_check_epoch}'s value "
+            f"({epoch_val_loss}) -- the weakest of these signals, since it only "
+            "fires after the model has already fully saturated."
+        )
+    return fired
+
+
 def _train_and_log_model(
     model_type: str,
     model: torch.nn.Module,
@@ -501,21 +602,11 @@ def _train_and_log_model(
             # this is what would have caught Milestone 14's actual failure
             # (a steady, sub-spike-threshold climb across many epochs).
             if epoch % VAL_LOSS_LOG_INTERVAL_EPOCHS == 0 and epoch > CUMULATIVE_DRIFT_WINDOW_EPOCHS:
-                prior_loss = epoch_losses[epoch - CUMULATIVE_DRIFT_WINDOW_EPOCHS - 1]
-                drift_fraction = (
-                    (final_epoch_loss - prior_loss) / prior_loss if prior_loss > 0 else 0.0
+                drift_fired_this_epoch, drift_fraction = _check_cumulative_drift(
+                    model_type, epoch_losses, epoch
                 )
                 mlflow.log_metric("cumulative_drift_fraction", drift_fraction, step=epoch)
-                if drift_fraction > CUMULATIVE_DRIFT_THRESHOLD_FRACTION:
-                    cumulative_drift_fired = True
-                    print(
-                        f"[{model_type}] CUMULATIVE DRIFT WARNING at epoch {epoch}: loss increased "
-                        f"by {drift_fraction:.1%} over the last {CUMULATIVE_DRIFT_WINDOW_EPOCHS} "
-                        f"epochs (from {prior_loss:.4f} at epoch {epoch - CUMULATIVE_DRIFT_WINDOW_EPOCHS} "
-                        f"to {final_epoch_loss:.4f} now) -- exceeds the "
-                        f"{CUMULATIVE_DRIFT_THRESHOLD_FRACTION:.0%} threshold. This is exactly the "
-                        "failure mode a single-epoch spike check misses."
-                    )
+                cumulative_drift_fired = cumulative_drift_fired or drift_fired_this_epoch
 
             # Step 2.3 / Signal 3: periodic validation loss AND output-
             # saturation check (two independent sub-signals: batch variance
@@ -540,18 +631,9 @@ def _train_and_log_model(
                 mlflow.log_metric("output_batch_variance", batch_variance, step=epoch)
                 mlflow.log_metric("output_mean_entropy", mean_entropy, step=epoch)
 
-                if (
-                    batch_variance < SATURATION_VARIANCE_THRESHOLD
-                    or mean_entropy < SATURATION_ENTROPY_THRESHOLD
-                ):
-                    saturation_fired = True
-                    print(
-                        f"[{model_type}] SATURATION WARNING at epoch {epoch}: output batch "
-                        f"variance={batch_variance:.2e} (threshold <{SATURATION_VARIANCE_THRESHOLD:.0e}), "
-                        f"mean entropy={mean_entropy:.4f} (threshold <{SATURATION_ENTROPY_THRESHOLD}) -- "
-                        "predictions have collapsed to a near-constant or near-one-hot output "
-                        "regardless of input."
-                    )
+                saturation_fired = saturation_fired or _check_saturation(
+                    model_type, epoch, batch_variance, mean_entropy
+                )
 
                 # Signal 4 (backstop, weakest of the four -- see module
                 # docstring comment): bit-for-bit frozen val_loss. Only
@@ -559,16 +641,9 @@ def _train_and_log_model(
                 # floating-point equality across resumed computation is
                 # what confirmed Milestone 14's collapse, well after the
                 # drift had already started.
-                if val_loss_history:
-                    previous_check_epoch = max(val_loss_history.keys())
-                    if val_loss_history[previous_check_epoch] == epoch_val_loss:
-                        frozen_val_loss_fired = True
-                        print(
-                            f"[{model_type}] FROZEN VAL LOSS WARNING at epoch {epoch}: val_loss is "
-                            f"bit-for-bit identical to epoch {previous_check_epoch}'s value "
-                            f"({epoch_val_loss}) -- the weakest of these signals, since it only "
-                            "fires after the model has already fully saturated."
-                        )
+                frozen_val_loss_fired = frozen_val_loss_fired or _check_frozen_val_loss(
+                    model_type, epoch, val_loss_history, epoch_val_loss
+                )
                 val_loss_history[epoch] = epoch_val_loss
 
         print(f"[{model_type}] Final training loss: {final_epoch_loss:.4f}")
@@ -728,6 +803,7 @@ def _train_and_log_deep_ensemble(
                 "stabilization_bundle": True,
                 "saturation_check_v2": True,
                 "ensemble_kind": "deep_ensemble_not_batch_ensemble",  # see ADR-004
+                "split_type": "match_level",  # Milestone 35 / ADR-011
             }
         )
 
@@ -778,18 +854,11 @@ def _train_and_log_deep_ensemble(
                 print(f"  [DeepEnsemble] epoch {epoch:3d}/{NUM_EPOCHS}: mean-member training loss = {final_epoch_loss:.4f}")
 
             if epoch % VAL_LOSS_LOG_INTERVAL_EPOCHS == 0 and epoch > CUMULATIVE_DRIFT_WINDOW_EPOCHS:
-                prior_loss = epoch_losses[epoch - CUMULATIVE_DRIFT_WINDOW_EPOCHS - 1]
-                drift_fraction = (
-                    (final_epoch_loss - prior_loss) / prior_loss if prior_loss > 0 else 0.0
+                drift_fired_this_epoch, drift_fraction = _check_cumulative_drift(
+                    "DeepEnsemble", epoch_losses, epoch
                 )
                 mlflow.log_metric("cumulative_drift_fraction", drift_fraction, step=epoch)
-                if drift_fraction > CUMULATIVE_DRIFT_THRESHOLD_FRACTION:
-                    cumulative_drift_fired = True
-                    print(
-                        f"[DeepEnsemble] CUMULATIVE DRIFT WARNING at epoch {epoch}: mean-member loss "
-                        f"increased by {drift_fraction:.1%} over the last "
-                        f"{CUMULATIVE_DRIFT_WINDOW_EPOCHS} epochs."
-                    )
+                cumulative_drift_fired = cumulative_drift_fired or drift_fired_this_epoch
 
             if epoch % VAL_LOSS_LOG_INTERVAL_EPOCHS == 0 or epoch == NUM_EPOCHS:
                 model.eval()
@@ -812,27 +881,12 @@ def _train_and_log_deep_ensemble(
                 mlflow.log_metric("output_batch_variance", batch_variance, step=epoch)
                 mlflow.log_metric("output_mean_entropy", mean_entropy, step=epoch)
 
-                if (
-                    batch_variance < SATURATION_VARIANCE_THRESHOLD
-                    or mean_entropy < SATURATION_ENTROPY_THRESHOLD
-                ):
-                    saturation_fired = True
-                    print(
-                        f"[DeepEnsemble] SATURATION WARNING at epoch {epoch}: mean-prediction batch "
-                        f"variance={batch_variance:.2e}, mean entropy={mean_entropy:.4f} -- the "
-                        "ensemble's AVERAGED output has collapsed to a near-constant or near-one-hot "
-                        "distribution regardless of input."
-                    )
-
-                if val_loss_history:
-                    previous_check_epoch = max(val_loss_history.keys())
-                    if val_loss_history[previous_check_epoch] == epoch_val_loss:
-                        frozen_val_loss_fired = True
-                        print(
-                            f"[DeepEnsemble] FROZEN VAL LOSS WARNING at epoch {epoch}: val_loss is "
-                            f"bit-for-bit identical to epoch {previous_check_epoch}'s value "
-                            f"({epoch_val_loss})."
-                        )
+                saturation_fired = saturation_fired or _check_saturation(
+                    "DeepEnsemble", epoch, batch_variance, mean_entropy
+                )
+                frozen_val_loss_fired = frozen_val_loss_fired or _check_frozen_val_loss(
+                    "DeepEnsemble", epoch, val_loss_history, epoch_val_loss
+                )
                 val_loss_history[epoch] = epoch_val_loss
 
         print(f"[DeepEnsemble] Final mean-member training loss: {final_epoch_loss:.4f}")
@@ -937,36 +991,39 @@ def _build_habit_blended_features(
     val_indices: list[int],
     engine: BiomechanicalPitchControl,
 ) -> tuple[list[dict], dict]:
-    """Milestone 23 Step 1: re-extracts scalar features for EVERY sample
-    with habit blending enabled, using a match-aware AND split-aware
-    heatmap for each sample's acting player.
+    """Milestone 23 Step 1 (SIMPLIFIED per Milestone 35 / ADR-011):
+    re-extracts scalar features for EVERY sample with habit blending
+    enabled, using a match-aware AND split-aware heatmap for each sample's
+    acting player.
 
-    Leakage discipline (both rules hold simultaneously, per Step 1):
+    Leakage discipline (both rules hold simultaneously):
       (a) the current sample's own match is always excluded from ITS OWN
           heatmap (Milestone 22's base `exclude_match_id` rule), and
-      (b) ANY match with at least one VALIDATION-split sample is excluded
-          from the training bucket corpus ENTIRELY -- not just for its own
-          val samples, for every sample's heatmap, period. This is
-          intentionally the CONSERVATIVE partition: since this project's
-          train/val split is at the SAMPLE level (Milestone 7), not the
-          match level, most non-trivial matches contribute samples to
-          BOTH splits under random assignment. Treating a straddling match
-          as "training-eligible" for its train-split samples while
-          excluding it for its val-split samples would require per-sample
-          bucket exclusion finer than "the match," which isn't how
-          historical positional tendency data is naturally grouped here.
-          Excluding any straddling match outright is the safe reading of
-          Milestone 7's "training-split only" rule, at the cost of
-          shrinking the usable historical corpus -- reported explicitly
-          below, not hidden.
+      (b) every match in the VALIDATION group is excluded from the
+          training-bucket corpus entirely.
 
-    SCOPE LIMITATION (documented per Step 1.6, not fixed here): heatmaps
-    use ANY OTHER training-split match regardless of its real-world
-    chronological date relative to the match being predicted -- true
-    "only past matches" chronological ordering is NOT enforced. This tests
-    whether the Bayesian blending MECHANISM helps prediction, not a fully
-    faithful simulation of live deployment (where only genuinely past
-    matches would be available at inference time).
+    Rule (b) used to require an explicit CONSERVATIVE workaround: under
+    the sample-level split used through Milestone 34, most non-trivial
+    matches contributed samples to BOTH splits under random per-sample
+    assignment, so "any match with at least one validation-split sample"
+    had to be excluded outright, shrinking the usable historical corpus to
+    just 4 of ~55 matches (Milestone 23's finding). As of Milestone 35's
+    MATCH-level split (`data_split.match_level_split`), a match can no
+    longer straddle both groups AT ALL -- `training_match_ids` below is
+    now an exact, complete partition (every non-validation match, full
+    stop), not a conservative subset working around a straddling problem
+    that no longer exists. The computation below is unchanged (a plain set
+    difference); what changed is that it's no longer compensating for
+    anything.
+
+    SCOPE LIMITATION (still open, NOT fixed here): heatmaps use ANY OTHER
+    training-split match regardless of its real-world chronological date
+    relative to the match being predicted -- true "only past matches"
+    chronological ordering is NOT enforced. This tests whether the
+    Bayesian blending MECHANISM helps prediction, not a fully faithful
+    simulation of live deployment (where only genuinely past matches would
+    be available at inference time). Match-level splitting does not
+    address this; it is an independent limitation.
 
     Returns (blended_features, diagnostics) -- blended_features has the
     exact same length/order as `frames` (only feature VALUES differ from
@@ -978,10 +1035,10 @@ def _build_habit_blended_features(
     validation_match_ids = sorted(val_match_ids)
 
     print(
-        f"\n[Milestone 23] {len(training_match_ids)} training-split matches, "
-        f"{len(validation_match_ids)} validation-split matches (a match with ANY validation-split "
-        f"sample is excluded from the training bucket corpus entirely, per the conservative "
-        f"partition documented above)."
+        f"\n[Milestone 23/35] {len(training_match_ids)} training-split matches, "
+        f"{len(validation_match_ids)} validation-split matches -- an exact, complete partition "
+        "under Milestone 35's match-level split (no match straddles both groups, so none is held "
+        "back beyond the validation matches themselves; see ADR-011)."
     )
 
     # Step 1.2: precompute per-player-per-match buckets ONCE, from training
@@ -1066,10 +1123,25 @@ def train_and_evaluate():
 
     dataset = TacticalSurvivalDataset(features, frames, chains)
 
-    n_train = int(TRAIN_FRACTION * len(dataset))
-    n_val = len(dataset) - n_train
-    split_generator = torch.Generator().manual_seed(RANDOM_SEED)
-    train_set, val_set = random_split(dataset, [n_train, n_val], generator=split_generator)
+    # Milestone 35 (ADR-011): MATCH-level split, replacing the SAMPLE-level
+    # random_split used through Milestone 34. A match can no longer
+    # contribute samples to both train and val -- see ADR-011 for why
+    # sample-level splitting became a real limitation once Milestone 23's
+    # habit-memory heatmaps needed match-level exclusion (only 4 of ~55
+    # matches ended up training-bucket-eligible under the old approach).
+    train_indices, val_indices = match_level_split(
+        sample_match_ids, val_fraction=1.0 - TRAIN_FRACTION, seed=RANDOM_SEED
+    )
+    train_set = Subset(dataset, train_indices)
+    val_set = Subset(dataset, val_indices)
+    n_train, n_val = len(train_set), len(val_set)
+    print(
+        f"\n[Milestone 35] resulting sample-level ratio: {n_train} train / {n_val} val "
+        f"({n_train / (n_train + n_val):.1%} / {n_val / (n_train + n_val):.1%}) -- NOT forced to "
+        f"exactly {TRAIN_FRACTION:.0%}/{1 - TRAIN_FRACTION:.0%} since matches contribute different "
+        "sample counts; see match_level_split's own report above for the match-count split and "
+        "any single-match imbalance warning."
+    )
     # Both models train on this exact same split (same indices) -- guard
     # that assumption explicitly rather than leaving it implicit.
     assert len(train_set) == n_train and len(val_set) == n_val
@@ -1152,6 +1224,7 @@ def train_and_evaluate():
                 "stabilization_bundle": True,
                 "saturation_check_v2": True,
                 "init_seed": seed,
+                "split_type": "match_level",  # Milestone 35 / ADR-011
             },
             run_tags={
                 "supersedes_run_id": MILESTONE_14_MLP_COLLAPSED_RUN_ID,
@@ -1204,6 +1277,7 @@ def train_and_evaluate():
             "stabilization_bundle": True,
             "saturation_check_v2": True,
             "init_seed": RANDOM_SEED,
+            "split_type": "match_level",  # Milestone 35 / ADR-011
         },
         run_tags={
             "supersedes_run_id": MILESTONE_14_GNN_STABLE_RUN_ID,
@@ -1367,6 +1441,7 @@ def train_and_evaluate():
             "stabilization_bundle": True,
             "saturation_check_v2": True,
             "init_seed": RANDOM_SEED,
+            "split_type": "match_level",  # Milestone 35 / ADR-011
             "habit_blending": True,
             "habit_unique_actor_count": habit_diagnostics["unique_actor_count"],
             "habit_cold_start_count": habit_diagnostics["cold_start_count"],
@@ -1493,8 +1568,23 @@ def train_and_evaluate():
     robustness_seed = next(s for s in MLP_ROBUSTNESS_CHECK_SEEDS if s != RANDOM_SEED)
     robustness_mlp_results = mlp_seed_results[robustness_seed]
 
-    # === Step 2.2: is the stabilized MLP genuinely HEALTHY, not merely
-    # "not collapsed"? Three explicit criteria. ===
+    # === Step 2.2 (revised per ADR-010): is the stabilized MLP genuinely
+    # HEALTHY, not merely "not collapsed"? GATED on exactly two criteria:
+    # (1) none of the four principled signals fired (spike, cumulative
+    # drift, saturation/entropy, frozen val loss -- the entropy/variance
+    # probing that has resolved every real ambiguous case in this
+    # project's history, Milestones 12/14/23) and (2) Brier Score isn't
+    # catastrophically bad. A THIRD criterion this health check used to
+    # require -- "did total loss decrease by more than 10% from epoch 1 to
+    # the final epoch" -- was REMOVED from the gate per ADR-010: it
+    # produced a real false positive in Milestone 23 (a genuinely healthy,
+    # fast-converging-then-plateauing MLP, confirmed healthy only by
+    # manual entropy/variance probing), because a model that converges
+    # quickly within its first epoch and then correctly holds near its
+    # optimum for the rest of training shows exactly the same small
+    # further decrease this check would misread as "not learning." It is
+    # still computed and printed below as a non-blocking diagnostic --
+    # useful context for a human glance, never a gate.
     mlp_healthy = False
     if primary_mlp_results is not None and not primary_mlp_results["instability_warning_fired"]:
         first_loss = primary_mlp_results["epoch_losses"][0]
@@ -1504,13 +1594,20 @@ def train_and_evaluate():
             primary_mlp_results["brier_15s"] <= MLP_SANITY_BRIER_15S_CEILING
             and primary_mlp_results["brier_30s"] <= MLP_SANITY_BRIER_30S_CEILING
         )
-        mlp_healthy = loss_decreased_meaningfully and brier_in_sane_range
+        mlp_healthy = brier_in_sane_range
         print(
-            f"\nMLP (seed={RANDOM_SEED}) health check: no instability warnings=True, loss "
-            f"decreased meaningfully={loss_decreased_meaningfully} ({first_loss:.4f} -> "
-            f"{last_loss:.4f}), Brier in sane range (<= {MLP_SANITY_BRIER_15S_CEILING:.4f} / "
+            f"\nMLP (seed={RANDOM_SEED}) health check: no instability warnings=True, Brier in "
+            f"sane range (<= {MLP_SANITY_BRIER_15S_CEILING:.4f} / "
             f"{MLP_SANITY_BRIER_30S_CEILING:.4f})={brier_in_sane_range} (actual: "
             f"{primary_mlp_results['brier_15s']:.4f} / {primary_mlp_results['brier_30s']:.4f})"
+        )
+        print(
+            f"  [diagnostic only, per ADR-010 NOT part of the health gate] total loss change "
+            f"epoch 1 -> {NUM_EPOCHS}: {first_loss:.4f} -> {last_loss:.4f} "
+            f"({'>' if loss_decreased_meaningfully else '<='} 10% of epoch-1 loss). A small or "
+            "absent late-training decrease is EXPECTED and HEALTHY for a model that converged "
+            "quickly and is now correctly holding near its optimum -- this line is informational "
+            "only and never blocks a conclusion."
         )
         if not brier_in_sane_range:
             print(
@@ -1617,6 +1714,137 @@ def train_and_evaluate():
 
     print(f"\nMLflow experiment: {MLFLOW_EXPERIMENT_NAME}")
     print("Run `mlflow ui` from the project root to inspect results visually.")
+
+
+def run_match_level_split_mlp_smoke_test() -> dict | None:
+    """Milestone 35 (ADR-011) validation smoke test -- NOT a replacement
+    for `train_and_evaluate()`, and NOT a re-validation campaign.
+
+    Trains ONLY the single (seed=RANDOM_SEED) stabilized MLP, with the
+    EXACT same hyperparameters as Milestone 14B, under the NEW match-level
+    split (`data_split.match_level_split`) instead of the sample-level
+    split every prior MLflow run in this project used. Deliberately does
+    NOT retrain the GNN, Deep Ensemble, or habit-blended MLP under the new
+    split -- re-running the full comparison suite this way is legitimate
+    future work, not required by this milestone (Step 3.4).
+
+    CRITICAL (see ADR-011): this run's Brier Scores are NOT directly
+    comparable to any pre-existing MLflow run (all of which used
+    sample-level splitting) -- different samples land in the validation
+    set entirely because of a METHODOLOGY change, not because anything
+    about the model or features changed. This run is tagged
+    `split_type="match_level"` explicitly so this is never ambiguous when
+    reading MLflow later; every pre-existing run is implicitly
+    `split_type="sample_level"` (not retroactively tagged -- see the
+    module-level comment near RANDOM_SEED above and ADR-011).
+
+    Returns `_train_and_log_model`'s result dict (or `None` if training
+    aborted on a NaN/Inf loss).
+    """
+    torch.manual_seed(RANDOM_SEED)
+
+    features, frames, chains, source_event_ids, match_ids, qualifying_competitions, sample_match_ids = (
+        build_training_data()
+    )
+    dataset_size = len(features)
+    competition_season_summary = ",".join(
+        f"{c['competition_id']}:{c['season_id']}" for c in qualifying_competitions
+    )
+    print(
+        f"\n[Milestone 35 smoke test] {dataset_size} samples across {len(match_ids)} matches "
+        "(same data-fetch path as train_and_evaluate(); only the split mechanism and which "
+        "model gets trained differ)."
+    )
+
+    dataset = TacticalSurvivalDataset(features, frames, chains)
+
+    train_indices, val_indices = match_level_split(
+        sample_match_ids, val_fraction=1.0 - TRAIN_FRACTION, seed=RANDOM_SEED
+    )
+    train_set = Subset(dataset, train_indices)
+    val_set = Subset(dataset, val_indices)
+    n_train, n_val = len(train_set), len(val_set)
+    print(
+        f"[Milestone 35 smoke test] resulting sample-level ratio: {n_train} train / {n_val} val "
+        f"({n_train / (n_train + n_val):.1%} / {n_val / (n_train + n_val):.1%})"
+    )
+
+    # Scalar feature normalization: training-split-only, unchanged rule
+    # (Milestone 7), computed from the NEW match-level training indices.
+    train_features_raw = torch.stack([dataset[i][0] for i in train_set.indices])
+    feature_mean = train_features_raw.mean(dim=0)
+    feature_std = train_features_raw.std(dim=0).clamp(min=1e-8)
+
+    train_loader = DataLoader(
+        train_set,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        generator=torch.Generator().manual_seed(RANDOM_SEED),
+    )
+    val_batch = next(iter(DataLoader(val_set, batch_size=len(val_set))))
+
+    mlflow.set_tracking_uri("file:./mlruns")
+    mlflow.set_experiment(MLFLOW_EXPERIMENT_NAME)
+
+    mlp_model = DeepHitSurvivalModel(num_features=len(FEATURE_KEYS), num_bins=NUM_BINS)
+    mlp_optimizer = torch.optim.Adam(
+        mlp_model.parameters(), lr=MLP_STABILIZED_LR, weight_decay=MLP_STABILIZED_WEIGHT_DECAY
+    )
+    results = _train_and_log_model(
+        model_type="MLP",
+        model=mlp_model,
+        optimizer=mlp_optimizer,
+        lr=MLP_STABILIZED_LR,
+        weight_decay=MLP_STABILIZED_WEIGHT_DECAY,
+        clip_grad_norm=True,
+        input_fn=_normalize_scalar_batch,
+        normalize_args=(feature_mean, feature_std),
+        train_loader=train_loader,
+        val_batch=val_batch,
+        n_train=n_train,
+        n_val=n_val,
+        match_ids=match_ids,
+        dataset_size=dataset_size,
+        extra_params={
+            "dataset_scale": "multi_competition",
+            "competition_season_pairs": competition_season_summary,
+            "stabilization_bundle": True,
+            "saturation_check_v2": True,
+            "init_seed": RANDOM_SEED,
+            "split_type": "match_level",  # Milestone 35 / ADR-011
+        },
+        run_tags={
+            "milestone": "35",
+            "split_type": "match_level",
+            "comparability_note": (
+                "NOT directly comparable to Milestone 14B's sample-level MLP baseline "
+                f"(run_id={MILESTONE_14B_MLP_RUN_ID}) -- different train/val split methodology, "
+                "not a corrected or superseding result. See ADR-011."
+            ),
+        },
+        normalization_artifact={
+            "feature_key_order": list(FEATURE_KEYS),
+            "mean": feature_mean.tolist(),
+            "std": feature_std.tolist(),
+        },
+    )
+
+    print("\n=== Milestone 35 (ADR-011): match-level-split MLP result ===")
+    if results is None:
+        print("MLP (match-level split): training ABORTED (NaN/Inf loss).")
+    else:
+        print(
+            "MLP (match-level split) -- INFORMATIONAL ONLY, NOT directly comparable to Milestone "
+            f"14B's sample-level baseline (Brier@15s/30s = {MILESTONE_14B_MLP_BRIER_15S:.4f} / "
+            f"{MILESTONE_14B_MLP_BRIER_30S:.4f}, run_id={MILESTONE_14B_MLP_RUN_ID}):"
+        )
+        print(f"  Brier@15s = {results['brier_15s']:.4f}, Brier@30s = {results['brier_30s']:.4f}")
+        print(
+            f"  instability warnings -- spike: {results['spike_fired']}, cumulative_drift: "
+            f"{results['cumulative_drift_fired']}, saturation: {results['saturation_fired']}, "
+            f"frozen_val_loss: {results['frozen_val_loss_fired']}"
+        )
+    return results
 
 
 if __name__ == "__main__":
