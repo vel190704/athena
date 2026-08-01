@@ -1,6 +1,6 @@
 # Project Athena: Research Findings
 
-**Status as of Milestone 23.** All five Research Questions defined in `README.txt` have
+**Status as of Milestone 35** (the RQ1-RQ5 findings below were produced under Milestone 23's methodology; §1's "Methodological update" paragraph documents the Milestone 35 match-level-split change and its one informational-only smoke test — see `docs/adr/ADR-011-match-level-train-val-split.md` for the full decision). All five Research Questions defined in `README.txt` have
 been investigated at least once. This document synthesizes those findings, the
 Architecture Decision Records that shaped the system, the recurring methodological
 lessons this project's own history surfaced, and what remains open.

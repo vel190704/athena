@@ -286,3 +286,60 @@ def test_team_labels_stable_across_frames_same_mapping():
     )
 
     assert result_1["is_teammate"].tolist() == result_2["is_teammate"].tolist() == [False, False, True]
+
+
+def test_camera_motion_correction_omitted_reproduces_original_behavior_exactly():
+    """Milestone 37's additive `camera_motion_correction` parameter: when
+    omitted (the default), behavior must be byte-for-byte identical to
+    Milestone 30's original signature -- explicitly regression-tested here,
+    same discipline as Milestone 22's opt-in `habit_heatmaps` parameter.
+    """
+    H_true = _build_synthetic_broadcast_camera_homography()
+    H = _calibrate(H_true)
+    tracks, prev_positions_pixel, ball_pixel, team_mapping = _build_basic_scenario(H_true)
+
+    result_without_param = convert_frame_to_tensors(tracks, ball_pixel, team_mapping, H, FPS, prev_positions_pixel)
+    result_with_explicit_none = convert_frame_to_tensors(
+        tracks, ball_pixel, team_mapping, H, FPS, prev_positions_pixel, camera_motion_correction=None
+    )
+
+    assert torch.equal(result_without_param["player_pos"], result_with_explicit_none["player_pos"])
+    assert torch.equal(result_without_param["player_vel"], result_with_explicit_none["player_vel"])
+    assert torch.equal(result_without_param["ball_pos"], result_with_explicit_none["ball_pos"])
+    assert torch.equal(result_without_param["is_teammate"], result_with_explicit_none["is_teammate"])
+
+
+def test_camera_motion_correction_actually_composes_with_base_homography():
+    """When `camera_motion_correction` IS provided, confirms the adapter
+    genuinely composes it (`homography_matrix @ camera_motion_correction`)
+    rather than ignoring it or applying it some other way -- verified by
+    independently computing the expected transformed position via the SAME
+    composed matrix and asserting the adapter's output matches exactly.
+    """
+    H_true = _build_synthetic_broadcast_camera_homography()
+    H = _calibrate(H_true)
+    tracks, prev_positions_pixel, ball_pixel, team_mapping = _build_basic_scenario(H_true)
+
+    # A deliberately non-identity correction (a small synthetic pixel-space
+    # shift, analogous to what one frame of real camera pan would produce)
+    # -- NOT the identity matrix, so this test cannot pass by accident.
+    camera_motion_correction = np.array(
+        [[1.0, 0.0, 15.0], [0.0, 1.0, -8.0], [0.0, 0.0, 1.0]]
+    )
+
+    result = convert_frame_to_tensors(
+        tracks, ball_pixel, team_mapping, H, FPS, prev_positions_pixel,
+        camera_motion_correction=camera_motion_correction,
+    )
+
+    expected_homography = H @ camera_motion_correction
+    expected_ball_meters = transform_points(expected_homography, [ball_pixel])[0]
+
+    assert np.allclose(result["ball_pos"].numpy(), expected_ball_meters, atol=1e-4)
+
+    # And confirm it's NOT just silently reproducing the uncorrected result
+    # (i.e. the correction must have actually changed something).
+    uncorrected_ball_meters = transform_points(H, [ball_pixel])[0]
+    assert not np.allclose(expected_ball_meters, uncorrected_ball_meters, atol=1e-4), (
+        "test's own correction matrix is a no-op at the ball position -- adjust the fixture"
+    )

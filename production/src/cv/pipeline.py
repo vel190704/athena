@@ -406,6 +406,19 @@ class CVPipeline:
                             "team_mapping_refreshed": team_mapping_refreshed,
                             "stale_velocity_fallback_count": stale_velocity_fallback_count,
                         },
+                        # ADDITIVE (Milestone 41): raw PIXEL-SPACE per-track
+                        # data this loop already computed for itself
+                        # (tracking/team-classification/ball-detection),
+                        # exposed here so a renderer can draw real boxes/
+                        # team-color/track_id/ball/possession without a
+                        # second, standalone detection pass -- no new
+                        # computation, no change to any existing key above,
+                        # not consumed by `tensors`/`diagnostics` at all.
+                        "render_frame_data": {
+                            "tracks": tracks_this_frame,
+                            "ball_pixel": ball_pixel,
+                            "team_mapping": dict(team_mapping),
+                        },
                     }
 
                 except Exception as exc:

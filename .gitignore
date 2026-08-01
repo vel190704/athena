@@ -7,3 +7,5 @@ __pycache__/
 mlruns/
 data/raw/
 *.pt
+.env
+reports_output/

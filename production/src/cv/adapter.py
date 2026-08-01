@@ -42,6 +42,7 @@ def convert_frame_to_tensors(
     fps: float,
     prev_positions_pixel: dict[int, list[float]] | None = None,
     dt_seconds_per_track: dict[int, float] | None = None,
+    camera_motion_correction: np.ndarray | None = None,
 ) -> dict | None:
     """Converts one frame's CV outputs into the tensor bundle
     `feature_extractor.extract_features` expects.
@@ -76,6 +77,27 @@ def convert_frame_to_tensors(
     entry here (or this argument is omitted entirely), the default
     `1/fps` is used, i.e. the original Milestone 30 assumption that
     `prev_positions_pixel` always reflects exactly one frame ago.
+
+    `camera_motion_correction` (Milestone 37, optional, additive --
+    omitting it reproduces Milestone 30's original behavior exactly, byte-
+    for-byte, and is regression-tested to do so): a 3x3 homography mapping
+    CURRENT-frame pixel coordinates to the pixel coordinates they would
+    have had at the moment `homography_matrix` was calibrated -- exactly
+    `CameraMotionTracker.get_corrected_homography`'s own
+    `inv(cumulative_transform)` factor (see `camera_motion.py`). When
+    provided, every pixel->meter transform in this function uses
+    `homography_matrix @ camera_motion_correction` instead of
+    `homography_matrix` alone. KNOWN SIMPLIFICATION, stated explicitly:
+    the SAME correction is applied uniformly to the current frame's
+    positions, the ball, AND `prev_positions_pixel` -- the previous
+    observation's pixel coordinates were technically captured under a
+    slightly different (earlier) cumulative correction, and this does not
+    account for that difference. Handling per-observation-time correction
+    precisely (mirroring `dt_seconds_per_track`'s per-track pattern) is
+    deferred future work, appropriate once this is actually wired into the
+    live pipeline's default execution path -- NOT done as part of this
+    milestone (see `camera_motion.py`'s own scope notes on measured, not
+    eliminated, drift).
 
     CRITICAL -- velocity is computed by transforming CURRENT and PREVIOUS
     pixel positions SEPARATELY into meter space and then differencing,
@@ -118,7 +140,15 @@ def convert_frame_to_tensors(
     if ball_pixel is None:
         return None
 
-    ball_pos_meters = transform_points(homography_matrix, [ball_pixel])[0]
+    # Milestone 37: additive, opt-in composition -- when camera_motion_correction
+    # is None (the default), effective_homography IS homography_matrix, byte-
+    # for-byte, reproducing Milestone 30's original behavior exactly.
+    if camera_motion_correction is not None:
+        effective_homography = homography_matrix @ camera_motion_correction
+    else:
+        effective_homography = homography_matrix
+
+    ball_pos_meters = transform_points(effective_homography, [ball_pixel])[0]
     default_dt_seconds = 1.0 / fps
 
     lower_x = -PITCH_BOUNDS_TOLERANCE_METERS
@@ -136,13 +166,13 @@ def convert_frame_to_tensors(
         if role == "outlier":
             continue
 
-        pos_meters = transform_points(homography_matrix, [track["pos_pixel"]])[0]
+        pos_meters = transform_points(effective_homography, [track["pos_pixel"]])[0]
         x, y = pos_meters
         if not (lower_x <= x <= upper_x and lower_y <= y <= upper_y):
             continue
 
         if prev_positions_pixel is not None and track_id in prev_positions_pixel:
-            prev_pos_meters = transform_points(homography_matrix, [prev_positions_pixel[track_id]])[0]
+            prev_pos_meters = transform_points(effective_homography, [prev_positions_pixel[track_id]])[0]
             if dt_seconds_per_track is not None and track_id in dt_seconds_per_track:
                 track_dt_seconds = dt_seconds_per_track[track_id]
             else:

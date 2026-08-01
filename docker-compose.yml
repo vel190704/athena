@@ -1,0 +1,58 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: docker/backend.Dockerfile
+    ports:
+      - "8000:8000"
+      # 8501 is the frontend's port, exposed HERE rather than on the
+      # frontend service -- see the `network_mode` note below.
+      - "8501:8501"
+    volumes:
+      # StatsBomb events/360 cache (production/src/ingestion/statsbomb_io.py's
+      # CACHE_DIR = Path("data/raw"), relative to the container's /app
+      # workdir) -- mounted so the demo match (DEFAULT_MATCH_ID=3857276,
+      # already cached on the host) loads instantly with no network fetch.
+      - ./data/raw:/app/data/raw:ro
+      # MLflow file-store tracking dir (mlflow.set_tracking_uri("file:./mlruns"),
+      # also relative to /app) -- mounted so load_deterministic_mlp() can
+      # find the already-trained MLP run without a fresh training run.
+      - ./mlruns:/app/mlruns:ro
+      # Pretrained YOLO checkpoint (CV_MODEL_CHECKPOINT="yolov8m.pt" in
+      # api.py, relative to /app) -- mounted so the startup warm-up
+      # (`YOLO(CV_MODEL_CHECKPOINT)`) uses the already-downloaded weights
+      # file instead of fetching ~50MB fresh on every container start.
+      - ./yolov8m.pt:/app/yolov8m.pt:ro
+    healthcheck:
+      # No curl in python:3.11-slim -- FastAPI's auto-generated /docs is a
+      # zero-code-change readiness signal that only comes up once the
+      # lifespan handler (MLP load + YOLO warm-up) has finished.
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/docs')"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 60s
+
+  frontend:
+    build:
+      context: .
+      dockerfile: docker/frontend.Dockerfile
+    depends_on:
+      backend:
+        condition: service_healthy
+    # dashboard.py (frontend/ -- not to be modified per this task's scope)
+    # hardcodes its default REST/WS URLs to 127.0.0.1:8000. On the normal
+    # Compose bridge network that default would NOT resolve to the backend
+    # container (it would mean "the frontend container itself"), which is
+    # exactly the trap the task's own Step 2 wording warns about.
+    #
+    # Since editing dashboard.py is out of scope here, this container
+    # instead shares the backend container's network namespace outright:
+    # `network_mode: "service:backend"` makes 127.0.0.1 INSIDE this
+    # container genuinely mean "the backend container." That's why 8501 is
+    # exposed on the `backend` service above, not here -- a service using
+    # `network_mode: service:x` cannot declare its own `ports`, since the
+    # network stack (and therefore port bindings) is shared with `x`.
+    # Net effect: the dashboard's out-of-the-box defaults just work,
+    # unmodified, with zero manual reconfiguration.
+    network_mode: "service:backend"

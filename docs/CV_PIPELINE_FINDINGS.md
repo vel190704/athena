@@ -1,6 +1,6 @@
 # Project Athena: Computer Vision Pipeline Findings
 
-**Status as of Milestone 33.** Module 4 (Computer Vision Pipeline) is fully
+**Status as of Milestone 41** (this document's original synthesis covered Milestones 25-33; it has since been extended in place through Milestone 34B's first-real-footage update, Milestone 37's camera-motion findings, Milestones 39/41's pitch-keypoint/tactical-map work and ADR-014 through ADR-017 — see each section's own Milestone label for exactly what was added when). Module 4 (Computer Vision Pipeline) is fully
 implemented end-to-end: broadcast video in, the exact tensor contract the
 StatsBomb-trained models already consume out. This document mirrors
 `RESEARCH_FINDINGS.md` (Milestone 24) for the CV track specifically.
@@ -12,9 +12,10 @@ exact demonstration fresh) immediately before this document was written —
 not transcribed from memory of prior milestone summaries. Section 7 lists
 every figure that could not be reconfirmed this way, and why.
 
-**Update — first real-footage run.** In a subsequent debugging session
-(after this document was first drafted), the pipeline was run end-to-end
-against a real video file for the first time:
+**Update (Milestone 34B: First Real-Footage Validation) — first
+real-footage run.** In a subsequent debugging session (after this
+document was first drafted), the pipeline was run end-to-end against a
+real video file for the first time:
 `data/raw/test_match.mp4`, a **private local broadcast-style clip**
 (1284x728, 28fps, 970 frames / ~34.6s) — explicitly NOT SoccerNet, and
 carrying no ground-truth annotations. `test_cv_tracker.py` and
@@ -45,10 +46,10 @@ WebSocket/REST API) can consume CV-derived state with zero modification.
 **Current state, stated plainly:** all nine CV components (Milestones
 25-33) are built, internally consistent, and validated against synthetic,
 adversarial, or mocked test cases — every one of those tests passes. As of
-the update above, the full pipeline has also now **run successfully
-end-to-end on one real broadcast-style video clip** — real tracking, real
-ball detection (after a real bug fix — see Milestone 29 below), and a
-first real throughput measurement (Milestone 32 below). **This is one
+the update above (Milestone 34B), the full pipeline has also now **run
+successfully end-to-end on one real broadcast-style video clip** — real
+tracking, real ball detection (after a real bug fix — see Milestone 29
+below), and a first real throughput measurement (Milestone 32 below). **This is one
 unannotated private clip, not the SoccerNet validation this track has
 always needed** — no detection precision/recall, no true ID-switch rate,
 no calibration-accuracy figure can be computed without ground truth, and
@@ -60,7 +61,12 @@ artifacts, no camera pan/zoom, no crowd/broadcast-graphics clutter). This
 document keeps three tiers distinct throughout: "validated on a real
 photo," "run once on a real, unannotated private clip," and "validated
 against real broadcast footage with ground truth" are never treated as
-equivalent claims here.
+equivalent claims here. **A tenth component, Milestone 37 (camera-motion
+compensation), was added afterward** — see its own entry in Section 2 —
+providing measured drift detection and flicker-aware masking, explicitly
+NOT drift-free compensation; the "nine components" count above describes
+this document's original (Milestone 34) scope and is not retroactively
+rewritten.
 
 ---
 
@@ -106,7 +112,8 @@ as the pan continued). This is not a bug; it is the camera-motion-velocity
 confound working exactly as documented (see Section 4).
 **`test_bytetrack_player_tracking_on_real_footage` now runs and passes**
 (previously skipped, no video available) against the private clip
-described in the Update note above. Direct re-run over the full 970-frame
+described in the Update note above (Milestone 34B). Direct re-run over
+the full 970-frame
 clip: **152 unique track_ids observed, 146 of them persisting across more
 than one frame**, and **15,090 individual nonzero-`vel_pixels_per_sec`
 observations** among persistent tracks — proving real displacement is
@@ -200,7 +207,7 @@ silhouetted against a crowd/advertising-board background, all realistic
 broadcast conditions.
 
 **A real bug was found and fixed via the private real-footage clip
-described in the Update note above.** `detect_ball` never passed `imgsz`
+described in the Update note above (Milestone 34B).** `detect_ball` never passed `imgsz`
 to `model.predict()`, so Ultralytics defaulted to 640 — downscaling this
 clip's 1284x728 frames enough to erase the ball, whose true footprint at
 this camera distance is only ~5x5px (inferred from a median real
@@ -297,8 +304,8 @@ correctly produced `stale_velocity_fallback_count = 2` (both tracks in
 that scenario shared the same gap) and `[0,0]` velocity for both.
 **`test_pipeline_on_real_video_and_throughput` now runs and passes**
 (previously skipped, no real footage) against the private clip described
-in the Update note above — the CV track's first-ever real end-to-end
-throughput measurement. Over the first 30 raw frames of
+in the Update note above (Milestone 34B) — the CV track's first-ever real
+end-to-end throughput measurement. Over the first 30 raw frames of
 `data/raw/test_match.mp4` (all 30 yielded — the ball-detector fix above
 was required for this; before it, 0 of 30 yielded because every frame
 lacked a detected ball): **median 116.73ms/yielded-frame, p95 127.23ms,
@@ -353,6 +360,346 @@ physics math that assumes ADR-002's 100x68 METER space, and are not
 physically meaningful yet. This milestone proves the async/isolation/pacing
 wiring, not calibrated real-world threat numbers.
 
+### Milestone 37 — Camera-Motion Compensation
+**Implementation:** `camera_motion.py`'s `estimate_camera_motion` (sparse
+optical flow: `cv2.goodFeaturesToTrack` + `cv2.calcOpticalFlowPyrLK`,
+fit via `cv2.findHomography(..., method=cv2.RANSAC)`) and
+`CameraMotionTracker` (composes frame-to-frame estimates into a cumulative
+transform since a Milestone-27-style manual anchor, with an explicit,
+never-self-clearing `is_stale` flag). Player regions are excluded from the
+background feature set via base confidence masking (≥0.5) PLUS a
+confidence-hysteresis rule (a 0.35–0.5 dip is still masked if a matching
+box was confidently seen two frames prior) and 17.5% bounding-box padding
+— both added specifically in response to this milestone's own diagnostic
+finding below, not a hypothetical concern.
+**Validation:** a full synthetic pinhole-camera pan sequence (Milestone
+27's approach, extended to a real rendered frame sequence so the actual
+optical-flow code path is exercised, not bypassed) MEASURED the
+drift-vs-frame-count curve directly rather than assuming one: composed
+positional error at the pitch center reached **0.83m at frame 30** and
+**1.10m at frame 40** (0.03m/frame synthetic pan rate) — monotonically
+increasing, as expected for composed drift. A masking adversarial test
+(6 independently-flickering synthetic players, confidence cycling
+0.6↔0.4, background contrast deliberately weakened so unmasked player
+edges dominate corner selection — otherwise RANSAC alone absorbs a small
+contaminant regardless of masking quality) measured flicker-aware masking
+(hysteresis + padding) at **0.143px** mean per-frame estimate error vs.
+**0.224px** for naive (current-frame-confidence-only, no padding) masking
+— a real **1.57x** improvement, isolated from unrelated cumulative-drift
+noise by comparing PER-FRAME estimates against ground truth rather than
+final composed position (composing 60 frames of pan alone already
+accumulates >1m of unrelated error that would otherwise swamp the
+comparison). `is_stale` was confirmed to fire at the expected point
+(frame 38) once the drift-budget threshold — itself set FROM this
+measured curve (0.55px/0.83m at frame 30, 0.75px/1.10m at frame 40), not
+assumed in advance — was exceeded.
+**A real-orchestrator diagnostic** (driving `CVPipeline`'s own
+`_tracking_model`/`is_tactical_view` gate directly over 150 real frames of
+the Milestone 34B clip — not `tracker.py`'s standalone harness) confirmed
+the near-threshold detection-flicker finding replicates in practice:
+**26.0% of real person detections fell in the [0.4, 0.6) confidence
+band** (802/3,087), closely matching the earlier 23.1% full-clip
+measurement. `estimate_camera_motion` never returned `None` across this
+real segment. **A load-bearing caveat found by this same diagnostic,
+not assumed:** the drift-budget threshold calibrated against the
+synthetic test's slow pan (0.03m/frame) is NOT validated against real
+footage's actual camera-motion rate — `is_stale` fired almost immediately
+on the real clip under that threshold, confirming real camera motion is
+considerably faster than the deliberately slow synthetic pan this
+milestone's threshold was calibrated against. The threshold is real and
+measured, but only for the synthetic scenario; it is not yet a validated
+real-deployment gate.
+**Limitations/Unknowns:** provides camera-motion ESTIMATION, DRIFT
+DETECTION, and FLICKER-AWARE MASKING — explicitly NOT drift-free
+continuous compensation. There is no way to automatically clear
+`is_stale` once set (no automatic pitch-keypoint detector exists in this
+codebase to re-anchor against — the same SoccerNet-adjacent gap named in
+Section 3); the only reset path (`reanchor()`) requires an externally
+supplied fresh homography. Hysteresis and padding measurably REDUCE, not
+ELIMINATE, player-motion contamination risk. The `is_stale` threshold is
+synthetic-calibrated only, not validated against real footage's actual
+motion rate (see above). Wired into `adapter.py` as an optional,
+additive `camera_motion_correction` parameter (regression-tested to be a
+no-op when omitted) but NOT wired into the live pipeline orchestrator's
+default execution path — that remains separate, deferred follow-up work.
+
+### Milestone 39 — Pretrained Pitch-Keypoint Detection (Qualified Local-Only Adoption, ADR-015)
+
+**Scope reminder (ADR-014): this entire milestone is a strictly LOCAL,
+NON-SERVED research prototype.** `production/src/cv/pitch_keypoint_detector.py`
+is not imported by, and must not be wired into, `production/src/serving/api.py`
+or any other live endpoint. All figures below come from Roboflow's
+**hosted** inference endpoint (`football-field-detection-f07vi`, model
+version 14 — the only version with a deployed model; the latest dataset
+version, 18, has none), called over a real network round trip — timing
+figures include that network latency and are NOT a local-inference cost.
+
+**First-pass verdict, and why it was revisited.** An initial evaluation
+against the Milestone 34B clip found: (a) a "static" (frame-0-anchored)
+homography appeared to outperform fresh per-frame solving, and (b) the
+model's keypoint confidence scores appeared decoupled from positional
+accuracy across the board (20-50m error on a 100m pitch at >0.99
+confidence). Three follow-up checks, run specifically to rule out
+testing-condition artifacts before accepting a negative result, reversed
+both findings:
+
+1. **The low-motion test window was the cause of "static wins."** The
+   initial comparison's window (clip frames 0-57) measured at near-zero
+   real camera motion. Re-run on a genuinely high-motion window (frames
+   804-864, ~5x the clip-median frame-to-frame displacement): **static
+   homography reuse degraded from 7.3m to 38.6m error as the window
+   progressed** (a real drift signature), while **fresh per-frame solving
+   stayed flat at 13.7-14.6m** across the same window. Anchor-based
+   recalibration does what ADR-013 asked of it once real motion is
+   present to test against.
+2. **The pitch-geometry correspondence table was re-verified against
+   ADR-002/ADR-009's established 100x68m grid** — re-diffed line-by-line
+   against `roboflow/sports`' source and cross-checked against
+   `calibration.py`'s `PITCH_CORNERS_METERS`. No mismatch found; this
+   project's recurring 100-vs-105 pitch-dimension bug class is ruled out
+   as a contributor here.
+3. **Confidence/accuracy decoupling is concentrated, not uniform.** A
+   per-vertex breakdown (25-frame sample) found six specific vertices —
+   **19, 22, 23, 24, 25, 26** — detected at ~0.97-1.0 confidence in ~100%
+   of frames with **19-55m median error**, while the other
+   regularly-visible vertices (15, 16, 17, 20, 21, 27, 28, 29, 30) stay
+   within 0.6-8m. Every bad vertex is a far-side/background landmark under
+   this camera's framing (e.g. vertex 25 at `(length,0)`: 53m error, vs.
+   its near-side mirror vertex 30 at `(length,w)`: 1.6m error) — consistent
+   with real, physically-explicable perspective foreshortening, not random
+   noise. **Excluding just these six vertices** dropped the general-sample
+   median residual from 4.7m to 1.5m, and the high-motion-window LOOCV
+   median from ~14.1m to **~6.2m**, with the drift-free flatness from
+   Check 1 preserved.
+
+**Decision (ADR-015): qualified adoption, not full rejection.** Fresh
+per-frame anchor-based homography solving, with vertices 19/22/23/24/25/26
+excluded from the correspondence table, is adopted **for rough visual
+overlay / tactical-map rendering only** (e.g. Milestone 38's renderer),
+under ADR-014's local-only constraint. **This is explicitly NOT validated
+as accurate enough for `BiomechanicalPitchControl`, `DeepHit`, or any
+quantitative tactical/cheat-sheet analysis** — ~6m median error under real
+motion does not meet the positional fidelity the StatsBomb-track physics/ML
+pipeline was empirically validated against.
+
+**Two explicitly unresolved limitations, not assumed away:**
+- The six-vertex exclusion list was derived from the ONE real camera
+  framing available throughout this project. Whether the same six
+  vertices are the unreliable ones under a different camera angle or
+  elevation is UNTESTED — no second, differently-angled clip has been
+  available. The foreshortening explanation makes an analogous pattern
+  plausible elsewhere, but a different framing would plausibly implicate
+  a *different* subset of vertices; this is reasoning from a physical
+  mechanism, not a second measurement.
+- ~6m median error is a reasonable bar for a human-watched visual overlay,
+  but no work has established what accuracy the ML pipeline actually
+  requires before its own outputs degrade. The real threshold is unknown,
+  not merely "probably higher than 6m."
+
+**Update (ADR-016): two adaptive alternatives tried, both rejected --
+fixed list remains adopted.** The first of Milestone 39's two unresolved
+limitations above (the six-vertex list is derived from one camera angle)
+motivated a follow-up attempt to replace the fixed list with a RUNTIME
+mechanism that would generalize to an unseen camera by construction,
+against a pre-committed bar (clearly beat or match the fixed list's
+~6.2m LOOCV median, or stop and report honestly):
+
+1. **Per-frame iterative outlier rejection** (reusing
+   `team_classifier.classify_teams`'s Milestone 28 masking-aware
+   fit/flag/refit/re-evaluate template, extended to trim a fixed fraction
+   every round rather than once). **Measured 35-39m median -- clearly
+   worse.** With only 10-15 confidently-detected points per frame and
+   ~30-40% of them genuinely bad, there isn't enough within-frame sample
+   for statistics to cleanly separate bad from mediocre-but-real residuals
+   -- the fixed list's aggregate analysis only found a clean signal by
+   averaging the same six vertices' behavior over 25 frames, something a
+   single-frame mechanism cannot do.
+2. **Multi-frame rolling reliability tracking** (an EWMA of each vertex's
+   residual accumulated across frames, decay 0.9, excluding vertices whose
+   rolling score exceeded 2x the median among trusted vertices). **Measured
+   32-38m median -- still worse, and in a more concerning way**: it most
+   frequently flagged vertices 30, 15, 16, and 29 -- all four independently
+   verified as RELIABLE in the original analysis -- while under-flagging
+   several genuinely bad ones. Accumulating evidence against each frame's
+   own noisy, still-biased per-frame fit compounds that bias rather than
+   averaging it out.
+
+Both attempts failed the pre-committed bar; per the agreed stopping rule,
+no third variant was attempted. **ADR-016 documents both as an honest,
+diagnosed negative result and keeps ADR-015's fixed 6-vertex list as the
+adopted, recommended approach.** Both adaptive mechanisms remain in
+`pitch_keypoint_detector.py` (not deleted -- this project's established
+practice for a real, informative negative result, per ADR-013's treatment
+of Milestone 37), with the module's own docstring stating plainly that
+`excluded_vertices=ADR015_KNOWN_UNRELIABLE_VERTICES` is the only path
+validated to ~6-7m and is what real usage should pass.
+
+**This result makes the roadmap item below (testing the six-vertex list
+against a second camera angle) MORE load-bearing, not less**: there is
+now no tested adaptive fallback if the fixed list turns out not to
+transfer to a different framing -- the generalization argument for an
+adaptive mechanism remains theoretically sound, but this ADR found the
+opposite of empirical support for it on the only camera angle available,
+so it must not be treated as a safety net the fixed list's own
+camera-angle caveat can lean on.
+
+### Milestone 41 — Tactical Map Rendering (Local-Only, Visual-Only, ADR-014/015/016)
+
+**Scope reminder, unchanged: strictly LOCAL, NON-SERVED (ADR-014); PLAYER
+POSITIONS ONLY, no pitch-control/zone analysis (ADR-015/016)** — nothing
+in `production/src/reporting/` or `production/src/spatial/control.py` is
+imported anywhere in this milestone's code.
+
+**A load-bearing documentation/reality mismatch was found and corrected
+before any other work began.** This milestone's task description referred
+to an existing "Milestone 38" `overlay_renderer.py`/`video_export.py` as
+groundwork to reuse. Neither file exists anywhere in this repository or
+its git history (`find`/`git log --all` both confirm this) — no
+`cv2.rectangle`/`cv2.putText`/`VideoWriter`/drawing code of any kind
+existed anywhere under `production/src/cv/` before this milestone, despite
+`context.md`'s prose describing Milestone 38 as "the only currently-
+completed, fully independent Track A deliverable." **This is now
+documented plainly rather than silently reused-as-if-real or silently
+patched over.** `production/src/cv/pixel_overlay_renderer.py` was built
+fresh this milestone to fill the gap (bounding boxes, team-color-coded via
+a NEW display-color mapping — `team_classifier.py` itself defines no
+colors, only role labels — track_id labels, ball marker), clearly labeled
+in its own docstring as new code, not a reuse or modification of anything
+prior.
+
+**What was built:**
+- `pipeline.py`: one ADDITIVE, backward-compatible yield key
+  (`render_frame_data`) exposing the raw per-frame tracks/ball/team data
+  `CVPipeline.process_video` already computes internally — no existing
+  key, behavior, or test changed (`test_cv_pipeline.py` passes unchanged).
+- `pixel_overlay_renderer.py` (new, see above) and
+  `tactical_map_renderer.py`: `transform_players_to_pitch_space` (Step 1;
+  reuses `pitch_keypoint_detector.py`'s `detect_pitch_keypoints`/
+  `solve_homography_from_keypoints(..., excluded_vertices=
+  ADR015_KNOWN_UNRELIABLE_VERTICES)` exactly, per ADR-015's recommended
+  call) and `render_tactical_map` (Step 2; top-down pitch diagram drawn
+  from `pitch_keypoint_detector.PITCH_KEYPOINTS_METERS`'s own verified
+  vertex table, not a re-derived pitch geometry).
+- `video_export.py` (new): `export_side_by_side_video`, composing the
+  pixel-space overlay and tactical map side by side, one output frame per
+  SOURCE video frame (including frames `process_video` itself skips
+  entirely — those render explicit "no data"/"unavailable" placeholders
+  rather than being dropped, which would desync the output's frame
+  count/timing from the source).
+- **Staleness handling, verified by test, not just described**: a failed/
+  stale homography solve (`solve_homography_from_keypoints`'s own
+  `is_stale`, ADR-016) makes `transform_players_to_pitch_space` return
+  `None` for that frame; `render_tactical_map` renders an explicit
+  "Tactical map unavailable this frame" placeholder, never a reused prior
+  frame's positions. The accuracy-caveat caption
+  (`"Approximate positions (~6-7m accuracy) -- visual reference only, not
+  validated for tactical/zone analysis"`) is drawn on every frame,
+  confirmed via pixel-region inspection (not just code review) to
+  actually render as pixels, on both the valid and unavailable paths.
+
+**Real-clip test (`data/raw/test_match.mp4`, 20 frames, real
+`CVPipeline.process_video` orchestration, real per-frame Roboflow API
+calls):** **20/20 frames (100%) produced a valid tactical map** — every
+sampled frame had enough confidently-detected, non-excluded keypoints to
+clear ADR-016's reliability floor. Render time ~1.1s/frame end-to-end
+(dominated by the hosted-API network round trip per frame, consistent
+with `pitch_keypoint_detector.py`'s own documented cost caveat — not
+representative of local-inference latency).
+
+**A second, more significant finding from the qualitative visual check —
+stated honestly, not glossed over.** Step 4.4 explicitly asked for a
+qualitative comparison between the rendered tactical-map dots and the
+real team shape visible in the pixel-space overlay on the SAME frame (no
+ground truth exists for this clip, so this is a sanity check, not a
+quantitative measurement). On two inspected frames, **the tactical map's
+dot positions did NOT look plausible relative to the real, visibly
+spread-out team shape in the broadcast frame**: players spanning roughly
+the left two-thirds to full width of the broadcast image collapsed onto a
+narrow band on the RIGHT side of the tactical-map pitch diagram (never
+reaching the left half of the diagram at all), rather than spreading
+proportionally to match the broadcast view's real spatial spread.
+
+**Why this is not a contradiction of ADR-015/016's ~6-7m figure, but a
+real gap in what that figure covers**: that figure was measured via
+leave-one-out cross-validation on DETECTED KEYPOINTS — i.e., accuracy
+INTERPOLATING within the region the correspondence points actually cover.
+This camera's detected keypoints cluster in the right-center of the frame
+(center circle through the right goal, per Milestone 39's own findings);
+PLAYER positions, by contrast, span the ENTIRE visible pitch, including
+regions well to the left of where any correspondence point was ever
+detected. A homography fit from one region can be accurate near that
+region and still EXTRAPOLATE badly outside it — a standard numerical-
+methods caveat that this milestone is the first to make visible, because
+it is the first time this pipeline has transformed PLAYER positions
+(spanning the full frame) rather than only validating KEYPOINT positions
+(concentrated in the region they were detected in).
+
+**This does not change ADR-015/016's own conclusions** — the fixed-list
+approach and its ~6-7m LOOCV figure remain accurate statements about what
+they actually measured. It DOES mean this milestone's own rendered output,
+while satisfying every process requirement (staleness handling, caption
+visibility, frame-complete output), is NOT yet demonstrated to produce
+visually trustworthy player positions across the FULL pitch — a real,
+newly-surfaced limitation, not a pass. Investigating and (if possible)
+correcting this extrapolation gap is the natural next item on this
+milestone's own follow-up list, separate from, and prior to, any future
+attempt to widen scope beyond visual rendering.
+
+**Update — ADR-017 trust-radius gating, the final resolution of the gap
+above.** ADR-017 measured HOW homography accuracy actually varies with
+pixel-space distance from a frame's reliable-keypoint cluster centroid:
+tight and bounded within ~150px (median 3.35m, max 3.86m, n=24), then
+both worse AND statistically unpredictable beyond it (Spearman r=0.582,
+p<0.0001, worst observed case 933m) — and found that **72.5%** of real
+detected players, on this clip, fall OUTSIDE that 150px radius. Rather
+than leave `tactical_map_renderer.py` rendering every player at equal,
+false confidence, `transform_players_to_pitch_space` and
+`render_tactical_map` were extended with TRUST-RADIUS GATING: each
+player's pixel distance from the SAME reliable-keypoint centroid is
+computed every frame; players within `TRUST_RADIUS_PX` (150px, ADR-017's
+measured boundary, reused verbatim) render as the original SOLID
+team-color dot, and players beyond it render as a distinct FAINT, HOLLOW
+(outline-only) marker in the same team color — deliberately never a
+solid dot, so the two confidence levels can never be visually confused. A
+second caption ("N/M players in reliable range (ADR-017, <150px)") was
+added alongside the original accuracy-caveat caption, both confirmed via
+pixel-region inspection to actually render, not just described.
+
+**Re-running the real-clip test after gating: two independent
+measurements now agree.** ADR-017's original measurement (25-frame
+whole-clip systematic sample) found **27.5%** of players within the trust
+radius. A fresh `export_side_by_side_video` run (20 frames from the start
+of the same clip — a DIFFERENT sample window, not a re-run of the same
+frames) found **100/460 = 21.7%**. These two numbers are not the same
+because they are not measuring the same frames — but both fall in the
+same ~20-27% range, and both support the identical underlying
+conclusion: **a minority of detected players — roughly a fifth to a
+quarter, consistently across two independent samples — fall within
+reliable homography range on this clip.** This replication, not just the
+original single measurement, is what makes the trust-radius gating
+decision solid rather than resting on one sample's noise.
+
+**Visual confirmation, on real data, not just synthetic tests.** A
+rendered frame from the gated output was inspected directly: five solid,
+filled team-color dots clustered near the right-center of the pitch
+(where the reliable-keypoint cluster actually sits), with the remaining
+detected players — spread across the rest of the pitch, matching the
+pixel-space overlay's real team shape on the same frame — rendered as
+small, faint, hollow markers, unambiguously distinct from the solid
+dots. Both captions rendered together and legibly. **The result is a
+sparse-but-trustworthy tactical map (a handful of confidently-placed
+dots), not the dense-but-unreliable one Milestone 41 originally
+produced** — the honest resolution ADR-017 called for, not a rendering
+tweak that quietly restored the appearance of full-pitch coverage.
+
+**What remains open, unchanged by this update**: whether the 150px trust
+radius, or the six-vertex exclusion list underneath it, generalizes to a
+different camera angle is still untested (ADR-015's own caveat, still
+load-bearing). Nothing here claims that question is resolved — only that,
+ON THIS camera framing, the renderer now honestly represents which
+player positions it does and does not trust, rather than presenting all
+of them with equal, false confidence.
+
 ---
 
 ## 3. The Real-Data Blocker
@@ -375,9 +722,10 @@ blur, compression artifacts, camera pan/zoom, or broadcast-graphics
 clutter — real video remains a categorically different and harder test
 this track has not yet faced.
 
-**Update:** the pipeline has since run end-to-end on one real, private,
-unannotated broadcast-style clip (see the Update note in the Executive
-Summary) — real tracking and real end-to-end throughput data now exist for
+**Update (Milestone 34B):** the pipeline has since run end-to-end on one
+real, private, unannotated broadcast-style clip (see the Update note in
+the Executive Summary) — real tracking and real end-to-end throughput
+data now exist for
 the first time (Milestones 26 and 32 above), and a real bug (ball
 detection's `imgsz` default) was found and fixed as a direct result. This
 is genuine progress, but it is **not the SoccerNet unblock**. This one
@@ -455,6 +803,42 @@ that "passes every automated test" is not the same claim as "works against
 the real system." Manual testing against a real running instance remains
 necessary even with a thorough automated suite in place.
 
+**(g) The detection-confidence-flicker discovery, and a standalone-harness
+vs. real-orchestrator discrepancy (post-Milestone-34B investigation,
+feeding directly into Milestone 37).** Investigating WHY the Milestone
+34B real clip showed 152 unique `track_id`s against a real ~22-25-person
+roster found the dominant cause was NOT occlusion: **~23% of all
+person-class detection candidates fall within ±0.1 confidence of the 0.5
+tracking threshold** (a near-even split, ~1,633 just below / ~1,820 just
+above, out of 33,078 total candidates on the M34B clip), and this
+borderline flicker — not two players' boxes overlapping — is what
+dominates short-lived track fragmentation (32% of track-runs ≤3 frames).
+Strict bounding-box overlap explains only **~3%** of fragmentation
+events; a looser "nearby" proxy (within 1.5x average box diagonal)
+explains **~29%** — the gap between these two numbers is itself the
+finding: true occlusion is rare, proximity-without-overlap is a weak
+partial explanation, and the true dominant cause is per-detection
+confidence noise, not any inter-player interaction. A secondary,
+independent finding: sub-threshold detections skew ~13% smaller and are
+1.4x overrepresented in the far half of frame (greater camera distance)
+versus confidently-tracked detections — a real, partial, non-exclusive
+contributing factor. **Separately, and just as important
+methodologically:** the original 152-unique-track-ID figure was traced
+to `tracker.py`'s standalone `run_tracking()` harness, which tracks every
+frame of a clip unconditionally — it has no import of, or call to,
+`shot_classifier`/`is_tactical_view` at all, confirmed directly by
+grepping the file. The REAL production orchestrator, `CVPipeline.process_video()`
+in `pipeline.py`, correctly gates tracking behind `is_tactical_view()`
+(confirmed directly at lines 291–306: the `continue` at line 301 executes
+before the tracking call at line 306 is ever reached). The two code paths
+behave differently on this exact point; the 152-ID figure describes the
+harness's behavior, not necessarily what the deployed orchestrator would
+produce on the same footage — a distinction that matters for anyone
+extrapolating from that figure. This confidence-flicker finding directly
+motivated Milestone 37's confidence-hysteresis and bounding-box-padding
+masking rules (see that milestone's entry in Section 2), rather than
+masking against static occlusion alone.
+
 ---
 
 ## 5. Future Validation Roadmap
@@ -492,6 +876,37 @@ blocker (real, legitimately-licensed footage with ground truth):
    clip's 28fps source rate. A broader characterization (multiple clips,
    multiple hardware targets, a GPU-vs-CPU breakdown, and a designed
    frame-skipping/rolling-buffer strategy for real-time use) remains open.
+7. **Test the Milestone 39 six-vertex exclusion pattern (19, 22, 23, 24,
+   25, 26) against a second, differently-angled real clip** — the current
+   exclusion list (ADR-015) was derived from the one camera framing
+   available throughout this project. Whether the same vertices are the
+   unreliable ones under a different camera elevation/angle is untested;
+   the foreshortening explanation is plausible but unverified beyond this
+   one clip. **Raised in priority by ADR-016**: two attempts to replace
+   the fixed list with a self-adapting mechanism (which would have made
+   this item moot) both measured worse than the fixed list and were
+   rejected, so there is currently no tested fallback if the list doesn't
+   transfer to a different angle — this item is the only way to actually
+   resolve that open question, not an optional nice-to-have.
+8. **Determine what positional accuracy the ML/physics pipeline
+   (`BiomechanicalPitchControl`, `DeepHit`) actually requires, and test
+   any future CV-derived positional estimate against that bar** —
+   Milestone 39's ~6m median error was judged adequate for a visual
+   overlay demo only, against no established quantitative threshold. The
+   real accuracy bar for feeding CV output into the StatsBomb-track
+   pipeline is currently unknown, not merely assumed to be unmet.
+9. **Investigate Milestone 41's keypoint-interpolation-vs-player-
+   extrapolation gap** — the ~6-7m LOOCV figure (ADR-015/016) measures
+   accuracy INTERPOLATING within the detected-keypoint region; Milestone
+   41's real-clip rendering test found player positions across the FULL
+   frame visually implausible (collapsing onto a narrow band far from
+   where the broadcast footage shows them), consistent with the
+   homography EXTRAPOLATING poorly outside the keypoint region. Candidate
+   directions (none attempted yet): constrain/clamp rendered positions to
+   a plausibility region, weight the homography fit to reduce
+   extrapolation error, or explicitly flag/exclude players detected far
+   from the fitted keypoint region rather than rendering their (likely
+   unreliable) transformed position at all.
 
 ---
 
@@ -530,10 +945,10 @@ production-proven against real footage (see Section 3):
   on missing parameters, path traversal attempts, nonexistent files, and
   genuinely unreadable/corrupt video files.
 
-**Update:** the full pipeline has now run end-to-end on one real, private,
-unannotated broadcast-style clip, yielding real tracked players, real ball
-detections (after the Milestone 29 `imgsz` fix), and a real (not
-real-time) throughput measurement — see the Update note in the Executive
+**Update (Milestone 34B):** the full pipeline has now run end-to-end on
+one real, private, unannotated broadcast-style clip, yielding real tracked
+players, real ball detections (after the Milestone 29 `imgsz` fix), and a
+real (not real-time) throughput measurement — see the Update note in the Executive
 Summary and the Milestone 26/29/32 entries above. This is real progress on
 integration correctness, not a validated-on-real-broadcast-video claim for
 any individual component's accuracy — see Section 3.
@@ -565,10 +980,11 @@ manual demonstration during Milestone 26 and not a hard-coded assertion in
 `test_cv_tracker.py`) regenerated fresh, byte-for-byte reproducibly, using
 the exact same construction, immediately before writing this document.
 
-**Figures added in the Update (first real-footage run):** the M26 real
-tracking figures (152 unique track_ids, 146 persisting, 15,090 nonzero
-velocity observations), the M29 `imgsz` A/B-test figures, and the M32
-throughput figures (116.73ms median, 127.23ms p95, 8.57 fps) were all
+**Figures added in the Update (Milestone 34B, first real-footage run):**
+the M26 real tracking figures (152 unique track_ids, 146 persisting,
+15,090 nonzero velocity observations), the M29 `imgsz` A/B-test figures,
+and the M32 throughput figures (116.73ms median, 127.23ms p95, 8.57 fps)
+were all
 directly measured by running the real code against `data/raw/test_match.mp4`
 in the same debugging session that produced this update, not recalled from
 a prior write-up — this is a first-time measurement, not a
