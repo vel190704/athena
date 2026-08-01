@@ -31,3 +31,19 @@ ultralytics
 SoccerNet
 opencv-python
 scikit-learn
+python-dotenv      # loads ROBOFLOW_API_KEY/SOCCERNET_PASSWORD from .env -- pitch_keypoint_detector.py
+                   # (Milestone 39/ADR-014); was actually installed and in use but missing from this
+                   # file until the engineering-review pinning pass found the gap -- see requirements-lock.txt
+roboflow           # pitch_keypoint_detector.py's _get_model() -- a deliberately LAZY, function-local
+                   # import (`from roboflow.models.keypoint_detection import KeypointDetectionModel`
+                   # inside _get_model(), not at module top), which is exactly why an earlier grep-based
+                   # check (anchored to column-0 "^import|^from" lines) missed it and incorrectly
+                   # reported this package as unused -- corrected by a follow-up transitive-import trace;
+                   # see requirements-lock.txt's header for the full correction
+
+# --- Reporting track (Milestones 40/42/43, visualization) -- matplotlib/
+# scipy were genuinely imported by player_visualizer.py/team_visualizer.py/
+# pitch_diagram.py/zone_explainer.py but, like python-dotenv above, were
+# missing from this file until the same transitive-import trace found them ---
+matplotlib
+scipy

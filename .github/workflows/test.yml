@@ -1,0 +1,58 @@
+# Engineering-review action item (immediate priority): CI for the existing
+# test suite. Runs `pytest production/tests/ -v` on every push and pull
+# request, on CPU only -- no GPU/CUDA runner, no real SoccerNet or broadcast
+# footage is fetched. This is meant to reproduce exactly what already runs
+# locally (158 passed, 1 skipped, at the time this workflow was last
+# reviewed), not a heavier or different validation standard.
+#
+# PYTHON VERSION NOTE, stated plainly rather than silently picked: this
+# project's own master design document (readme.txt) originally stated
+# "Python 3.11+", but the actual local development environment this
+# project has been built and validated in runs Python 3.14.4 -- a real,
+# pre-existing mismatch between documented requirement and actual
+# practice, not introduced by this workflow (readme.txt's wording has
+# since been corrected to state this plainly, not silently). 3.14 is used
+# here because it is the ONLY version this workflow's behavior could
+# actually be validated against locally (this machine has no
+# 3.11/3.12/3.13 interpreter installed) -- confirmed present in GitHub's
+# own `actions/python-versions` manifest (3.14.0 through 3.14.6 as of the
+# last check), so `setup-python` below will resolve it on the runner, not
+# fail to find it.
+#
+# ACTION VERSIONS, verified against the real, current tags on
+# github.com/actions/checkout and github.com/actions/setup-python (not
+# guessed) -- both pinned to their current major version (v7) as of the
+# last review, not an old-but-still-functional major version kept out of
+# inertia.
+#
+# DEPENDENCY FILE, deliberately `requirements-lock.txt`, NOT the unpinned
+# `requirements.txt` -- CI should install the EXACT versions this
+# project's real results were produced against (reproducibility is the
+# whole point of the lock file), not whatever the unpinned list happens
+# to resolve to on a given day. An earlier version of this workflow
+# pointed at the unpinned file, an oversight from before the lock file
+# existed in the same session -- corrected here, not a new decision.
+name: Tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-lock.txt
+
+      - name: Run test suite
+        run: |
+          pytest production/tests/ -v

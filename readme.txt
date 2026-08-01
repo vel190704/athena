@@ -148,7 +148,7 @@ Module 8: Digital Twin & Counterfactual Simulator
 
 4. Engineering Tech Stack & MLOps
 
-     Language: Python 3.11+
+     Language: Python 3.11+ as originally specified here; the actual local development environment this project has been built and validated in runs Python 3.14 (a real, pre-existing drift from this blueprint's original minimum, corrected in wording only -- CI now pins to 3.14 explicitly, see .github/workflows/test.yml)
      Core Math/ML: PyTorch (Primary GPU math), PyTorch Geometric (GNNs)
      Data Pipelines: Apache Kafka, TimescaleDB, Redis, Feast
      MLOps: MLflow (Experiment tracking), Triton Inference Server (Serving), DVC (Dataset Versioning), GitHub Actions (CI/CD)

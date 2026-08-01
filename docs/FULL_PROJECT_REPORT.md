@@ -163,6 +163,8 @@ pytest production/tests/  ->  145 passed, 1 skipped, 0 failed  (35 test files, ~
 
 The one skip: `test_soccernet_baseline_detection_accuracy` (`test_cv_detector.py`), blocked on SoccerNet's NDA-gated download password — not a failure, and consistent with everything in §7's gap list.
 
+**Superseded by a later session — see §11.4 for the current count.** A subsequent engineering-review pass added 4 new test files (13 new tests); the count as of that pass is **158 passed, 1 skipped, 39 test files**. This section is left as the snapshot valid at the time §1-10 were written, not retroactively rewritten.
+
 ---
 
 ## 10. Discrepancies found between existing documents and the real repository
@@ -178,4 +180,51 @@ Flagged explicitly per instruction, not silently reconciled:
 7. **`docs/REPORTING_FINDINGS.md`'s header states "Status as of Milestone 44,"** and is largely consistent with that — except its own §8 and §9 (the football-data.co.uk trend feature and the team-comparison tool) carry no milestone number at all, appended after the header's own claimed cutoff.
 8. **Milestone 45's number was self-assigned** by an assistant turn in this project's history, not given by an explicit user instruction naming that number — see §1.
 9. **This session accidentally ran one `git log` command** while investigating an unrelated question, despite an explicit "do not run any git commands" instruction for this task. It surfaced two recent commit messages ("kafka,database") that do not correspond to anything described in any of this project's own documentation. That output was not used as a basis for any claim in this report, and no further git commands were run.
-10. **"The unbuilt auto-fallback feature"** named in this task's own framing does not correspond to any single feature explicitly labeled that way anywhere in the real documents. §7 above states this report's best-grounded interpretation (ADR-013's unbuilt classical Hough-line/circle-detection anchor mechanism) and flags it as an interpretation rather than a confirmed match.
+10. **"The unbuilt auto-fallback feature"** named in this task's own framing does not correspond to any single feature explicitly labeled that way anywhere in the real documents. §7 above states this report's best-grounded interpretation (ADR-013's unbuilt classical Hough-line/circle-detection anchor mechanism) and flags it as an interpretation rather than a confirmed match. **Superseded by a later session**: the user clarified this actually referred to a `find_or_fetch_player`/`find_or_fetch_team` cache-fallback mechanism, drafted/discussed but never written into any file — confirmed by an exhaustive codebase search (no trace anywhere) before it was built fresh as `production/src/reporting/data_fallback.py`, then run against real, previously-uncached StatsBomb data (La Liga/Ligue 1/Bundesliga 2015/16 seasons, a real player discovered organically from freshly-fetched data, Messi's full real career — 596 matches across 48 competition-seasons, 588 new). This item is left in place as a historical record of the original mis-guess, not deleted.
+
+---
+
+## 11. Engineering Review Response
+
+An external senior engineering review (static audit, not a live test run) identified four concrete, low-risk operational gaps plus one maintainability concern, and explicitly assessed this project's research maturity and documentation quality as genuinely earned, not inflated — no research/model logic, ADR conclusion, or findings-document substantive claim was touched to address any of the items below.
+
+### 11.1 What was addressed
+
+- **CI.** `.github/workflows/test.yml` — runs `pytest production/tests/ -v` on every push/PR, CPU-only, no GPU runner, no real SoccerNet/broadcast data fetched. **Python-version note, stated plainly**: this project's own `readme.txt` documents "Python 3.11+," but the actual local development environment (and everything validated in this report) runs Python 3.14.4 — a real, pre-existing mismatch, not introduced here. CI uses 3.14 because it is the ONLY version this workflow could actually be validated against locally (no 3.11/3.12/3.13 interpreter exists on this machine) — shipping an unvalidated pin would defeat the point. **Validation caveat, reported honestly rather than glossed over**: a full from-scratch fresh-venv install was attempted to simulate the CI environment as closely as possible, but aborted after it consumed ~2GB and timed out at 120s without completing — the same class of disk-space risk that ended this project's own Docker containerization effort earlier (§7). Validated instead via the already-built local environment's real, passing test run (158 passed, 1 skipped — see §11.4) and a direct confirmation that the SoccerNet-gated test's skip path is structurally guaranteed in a clean checkout (`data/raw/` is gitignored and won't exist at all; the test's own `pytest.skip()` call requires no other state).
+- **Pinned dependencies.** `requirements-lock.txt` — a full `pip freeze` snapshot (177 packages, direct and transitive), generated without upgrading anything. Two honest surprises found while generating it, not silently resolved: (1) `torch`'s pinned version (`2.13.0`) does not capture the `+cu130` local-version suffix the interpreter reports at runtime — a real quirk of this wheel's published metadata, not something the pin can work around. (2) `python-dotenv` was genuinely imported and used (`pitch_keypoint_detector.py` and its test) but **missing from `requirements.txt` entirely** — added directly, since leaving a real, active dependency undocumented is a correctness gap. A third package, `roboflow==1.4.0`, is installed but confirmed **unused** anywhere in the codebase (that module's own docstring claims to use it, but its actual imports are only `os, tempfile, cv2, numpy`) — left in the lock file as an honest snapshot, deliberately NOT added to `requirements.txt`.
+- **`train.py`: `print()` → `logging`.** All 100 `print()` calls replaced with a module-level `logger` — `logger.info` for normal progress, `logger.warning` for the 13 call sites that are genuinely warnings (the four ADR-010 instability-detector signal functions' own warnings, both NaN/Inf-loss "Stopping" messages, every standalone "training ABORTED" message, and the undertrained-MLP warning). `logging.basicConfig` is called only inside `if __name__ == "__main__":`, never at import time (a library module must never mutate global logging config on import). **Zero test changes were needed** — confirmed by checking every test file for `capsys`/`capfd`/`caplog` usage tied to `train.py`; none exists (`test_instability_detector.py` and everything else that touches `train.py` asserts on return values only, never captured stdout).
+- **`train.py` decomposition, elevated priority.** `train_and_evaluate` (was ~626 lines) and its own inline stages were factored into 9 named functions (`_load_and_split_dataset`, `_compute_normalization_stats`, `_run_mlp_stabilization_and_robustness_check`, `_run_gnn_stage`, `_run_deep_ensemble_stage`, `_run_habit_blended_stage`, `_evaluate_mlp_health`, `_report_run_summary_and_rq4_conclusion`, plus the now-thin `train_and_evaluate` orchestrator), explicitly following ADR-010's proven pure-function extraction pattern (the same template already used for the four instability-detector signals) rather than a new style. **Verified behavior-preserving two ways**: the full test suite (158 passed, 1 skipped — identical to pre-decomposition) and a real, deterministic training smoke test (`run_match_level_split_mlp_smoke_test`) run once before and once after decomposition — see §11.4 for the exact diff, which is bit-for-bit identical on every numeric field.
+- **The reporting-layer test-coverage gap.** Four new test files (`test_team_trend_data.py`, `test_team_comparison.py`, `test_player_comparison.py`, `test_dashboard.py`) — 13 new tests total, same rigor as the rest of `production/tests/` (real cached data, explicit low-sample/reliability-flag/gap-season assertions, no synthetic fixtures), reproducing the exact real findings already documented in `REPORTING_FINDINGS.md` §8/§9/§10 and this dashboard's own original interactive validation. `test_dashboard.py` uses Streamlit's official `AppTest` framework, the same tool used for the dashboard's original manual validation, now persisted as regression tests instead of a one-off session.
+
+### 11.2 What remains explicitly open (the review's own medium/long-term roadmap — not claimed as fixed)
+
+- Auth/rate-limiting on the live serving layer (`production/src/serving/api.py`) — untouched, out of scope for this engineering-hygiene pass.
+- A true Batch Ensemble implementation (ADR-004) — the ~5x compute cost of the current Deep Ensemble remains unresolved.
+- The SoccerNet NDA/research-access path — still the single biggest blocker in the whole project (§7).
+- RQ2 (habit memory) and RQ4 (MLP-vs-GNN) re-runs under the match-level split — Milestone 35 ran one smoke test only, not a re-validation campaign; still open.
+- A second, differently-angled real clip to test whether ADR-015's six-vertex exclusion list generalizes — still untested.
+- Converting the other ~54 source files' `print()` calls to `logging` — explicitly out of scope for this milestone; `train.py` was the review's own named highest-density starting point, not a mandate to convert everything in one pass.
+
+### 11.3 Pinned-dependency diff summary
+
+No version conflicts, no unexpected resolution surprises across the 19 direct top-level packages checked (`numpy`, `pandas`, `requests`, `tqdm`, `pytest`, `torch`, `torch-geometric`, `mlflow`, `captum`, `fastapi`, `uvicorn`, `websockets`, `httpx`, `streamlit`, `websocket-client`, `ultralytics`, `SoccerNet`, `opencv-python`, `scikit-learn`) — every one resolved cleanly to a real installed version. The two real surprises are the `python-dotenv` gap and the unused `roboflow` package, both detailed in §11.1.
+
+### 11.4 Decomposition behavior-preservation: the exact numerical diff
+
+`run_match_level_split_mlp_smoke_test()` run once immediately before decomposition and once immediately after, same machine, same cache, same seed:
+
+| Field | Pre-decomposition | Post-decomposition |
+|---|---|---|
+| `train_loss` | 3.255794019939808 | 3.255794019939808 |
+| `val_loss` | 3.1634812355041504 | 3.1634812355041504 |
+| `brier_15s` | 0.10116182267665863 | 0.10116182267665863 |
+| `brier_30s` | 0.18884886801242828 | 0.18884886801242828 |
+| `excluded_15s` | 754 | 754 |
+| `excluded_30s` | 968 | 968 |
+| `train_val_gap` | -0.09231278443565749 | -0.09231278443565749 |
+| `instability_warning_fired` / all 4 signal flags | all `False` | all `False` |
+| `epoch_losses[:5]` | `[3.565131365536497, 3.5395139323977323, 3.5165501603713403, 3.455189692859466, 3.4088145262346816]` | identical |
+| `epoch_losses[-5:]` | `[3.2542226280157385, 3.257562050452599, 3.266512774504148, 3.254160481075255, 3.255794019939808]` | identical |
+| `run_id` | `f2610ea9ae35438c9f48b904402785de` | `d14be85019604c98847e8eed57f42642` (expected to differ — a fresh MLflow run each time) |
+
+Every numeric field is bit-for-bit identical. This holds because the decomposition never reorders any RNG-consuming operation relative to any other — each major training stage's own `torch.manual_seed` reset call was preserved as the first statement of its extracted function, and Python executes function calls in the order they're CALLED, not defined, so the overall RNG-consumption sequence is unchanged.

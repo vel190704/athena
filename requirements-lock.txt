@@ -1,0 +1,238 @@
+# Engineering-review action item: a fully-pinned, reproducible snapshot of
+# every package (direct AND transitive) actually installed in this
+# project's working environment at the time this file was generated --
+# via `pip freeze`, exactly, no manual editing of versions. This freezes
+# CURRENT REALITY (the exact versions every result in this project's
+# findings documents was actually produced against), not a modernized or
+# upgraded set. `requirements.txt` remains the human-readable, grouped,
+# commented list of DIRECT top-level dependencies -- use THIS file
+# (`pip install -r requirements-lock.txt`) when exact reproducibility
+# matters; use `requirements.txt` when you want the unpinned list with its
+# grouping/rationale comments intact.
+#
+# HONEST CAVEATS FOUND WHILE GENERATING/MAINTAINING THIS FILE, reported
+# rather than silently resolved:
+#
+# 1. `torch==2.13.0` here does NOT capture the `+cu130` local version
+#    suffix `torch.__version__` reports at runtime in this environment
+#    (`pip show torch` itself only reports the bare "2.13.0", even though
+#    the interpreter reports "2.13.0+cu130") -- a real quirk of how this
+#    wheel's metadata was published, not something this file can pin
+#    around. `pip install torch==2.13.0` should resolve to an equivalent
+#    build via the same default index this environment used, but bit-for-
+#    bit wheel identity is not 100% guaranteed by this pin alone.
+#
+# 2. FOUR packages this environment has installed and actually needs were
+#    NOT listed in `requirements.txt` -- all four now added there directly,
+#    since leaving a real, active dependency undocumented is a correctness
+#    gap: `python-dotenv`, `matplotlib`, `scipy`, and `roboflow`.
+#
+#    `roboflow==1.4.0` deserves its own note, because an EARLIER pass
+#    through this same review got it WRONG and said so explicitly in this
+#    file -- corrected here rather than left standing. That earlier check
+#    used a column-0-anchored grep (`^import|^from`) against
+#    `pitch_keypoint_detector.py` and concluded the package was unused,
+#    since only `os, tempfile, cv2, numpy` appeared at the top of the
+#    file. A later, more thorough pass -- tracing every import
+#    TRANSITIVELY from `production/tests/` through `production/src/`, via
+#    a full AST walk rather than a line-anchored grep -- found a real,
+#    deliberately LAZY, function-local import inside `_get_model()`:
+#    `from roboflow.models.keypoint_detection import KeypointDetectionModel`,
+#    indented inside the function body specifically so the (heavy,
+#    optional) package is only imported if a real `ROBOFLOW_API_KEY` is
+#    configured and that function actually runs. A grep anchored to
+#    line-start structurally cannot see an indented import; an AST walk
+#    (or any full-file parse) does. `roboflow` IS a real, direct
+#    dependency of running code and has been added to `requirements.txt`
+#    accordingly -- the prior claim that it was safe to leave undeclared
+#    was incorrect, not a judgment call that changed.
+#
+#    `matplotlib`/`scipy` are used directly by the reporting track's
+#    visualizers (`player_visualizer.py`, `team_visualizer.py`,
+#    `pitch_diagram.py`, `zone_explainer.py`) -- found by the same
+#    transitive trace, not previously checked at all since they were
+#    never imported by any test file DIRECTLY, only reached by following
+#    local imports into `production/src/reporting/`.
+#
+#    All three newly-added packages (`roboflow==1.4.0`, `matplotlib==3.11.1`,
+#    `scipy==1.18.0`) were verified against PyPI directly (not assumed):
+#    real, published, not yanked, with wheel files compatible with
+#    `ubuntu-latest` + Python 3.14 on x86_64 (the CI runner's actual
+#    platform) confirmed to exist.
+aiohappyeyeballs==2.7.1
+aiohttp==3.14.2
+aiosignal==1.4.0
+alembic==1.18.5
+altair==6.2.2
+annotated-doc==0.0.4
+annotated-types==0.7.0
+anyio==4.14.2
+attrs==26.1.0
+babel==2.18.0
+blinker==1.9.0
+boto3==1.43.56
+botocore==1.43.56
+cachetools==7.1.4
+captum==0.9.0
+certifi==2026.6.17
+cffi==2.1.0
+charset-normalizer==3.4.9
+click==8.4.2
+cloudpickle==3.1.2
+contourpy==1.3.3
+cryptography==48.0.1
+cuda-bindings==13.3.1
+cuda-pathfinder==1.5.6
+cuda-toolkit==13.0.3.0
+cycler==0.12.1
+databricks-sdk==0.122.0
+docker==7.2.0
+fastapi==0.139.2
+filelock==3.31.0
+filetype==1.2.0
+Flask==3.1.3
+flask-cors==6.0.5
+fonttools==4.63.0
+frozenlist==1.8.0
+fsspec==2026.6.0
+gitdb==4.0.12
+GitPython==3.1.54
+google-auth==2.56.2
+google-measurement-protocol==1.1.0
+graphene==3.4.3
+graphql-core==3.2.11
+graphql-relay==3.2.0
+greenlet==3.5.4
+gunicorn==26.0.0
+h11==0.16.0
+hf-xet==1.5.2
+httpcore==1.0.9
+httpcore2==2.9.1
+httptools==0.8.0
+httpx==0.28.1
+httpx2==2.9.1
+huey==3.2.1
+huggingface_hub==1.24.0
+idna==3.18
+importlib_metadata==9.0.0
+iniconfig==2.3.0
+itsdangerous==2.2.0
+Jinja2==3.1.6
+jmespath==1.1.0
+joblib==1.5.3
+jsonschema==4.26.0
+jsonschema-specifications==2025.9.1
+kiwisolver==1.5.0
+lap==0.5.13
+Mako==1.3.12
+markdown-it-py==4.2.0
+MarkupSafe==3.0.3
+matplotlib==3.11.1
+mdurl==0.1.2
+mlflow==3.14.0
+mlflow-skinny==3.14.0
+mlflow-tracing==3.14.0
+mpmath==1.3.0
+multidict==6.7.1
+narwhals==2.24.0
+networkx==3.6.1
+numpy==2.3.5
+nvidia-cublas==13.1.1.3
+nvidia-cuda-cupti==13.0.85
+nvidia-cuda-nvrtc==13.0.88
+nvidia-cuda-runtime==13.0.96
+nvidia-cudnn-cu13==9.20.0.48
+nvidia-cufft==12.0.0.61
+nvidia-cufile==1.15.1.6
+nvidia-curand==10.4.0.35
+nvidia-cusolver==12.0.4.66
+nvidia-cusparse==12.6.3.3
+nvidia-cusparselt-cu13==0.8.1
+nvidia-ml-py==13.610.43
+nvidia-nccl-cu13==2.29.7
+nvidia-nvjitlink==13.3.33
+nvidia-nvshmem-cu13==3.4.5
+nvidia-nvtx==13.0.85
+opencv-python==5.0.0.93
+opencv-python-headless==4.10.0.84
+opentelemetry-api==1.44.0
+opentelemetry-proto==1.44.0
+opentelemetry-sdk==1.44.0
+opentelemetry-semantic-conventions==0.65b0
+packaging==26.2
+pandas==2.3.3
+pi_heif==1.4.0
+pillow==12.3.0
+pillow-avif-plugin==1.6.0
+pluggy==1.6.0
+polars==1.43.0
+polars-runtime-32==1.43.0
+prettytable==3.18.0
+prices==1.1.1
+propcache==0.5.2
+protobuf==6.33.6
+psutil==7.2.2
+pyarrow==24.0.0
+pyasn1==0.6.4
+pyasn1_modules==0.4.2
+pycocoevalcap==1.2
+pycocotools==2.0.11
+pycparser==3.0
+pydantic==2.13.4
+pydantic_core==2.46.4
+pydeck==0.9.3
+pyflakes==3.4.0
+Pygments==2.20.0
+pyparsing==3.3.2
+pytest==9.1.1
+python-dateutil==2.9.0.post0
+python-dotenv==1.2.2
+python-multipart==0.0.32
+pytz==2026.2
+PyYAML==6.0.3
+referencing==0.37.0
+requests==2.34.2
+requests-toolbelt==1.0.0
+rich==15.0.0
+roboflow==1.4.0
+rpds-py==2026.6.3
+s3transfer==0.19.2
+scikit-learn==1.9.0
+scikit-video==1.1.11
+scipy==1.18.0
+setuptools==83.0.0
+shellingham==1.5.4
+six==1.17.0
+skops==0.14.0
+smmap==5.0.3
+SoccerNet==0.1.62
+SQLAlchemy==2.0.51
+sqlparse==0.5.5
+starlette==1.3.1
+streamlit==1.60.0
+sympy==1.14.0
+tenacity==9.1.4
+threadpoolctl==3.6.0
+toml==0.10.2
+torch==2.13.0
+torch-geometric==2.8.0.post1
+torchvision==0.28.0
+tqdm==4.69.0
+triton==3.7.1
+truststore==0.10.4
+typer==0.25.1
+typing-inspection==0.4.2
+typing_extensions==4.16.0
+tzdata==2026.3
+ultralytics==8.4.105
+ultralytics-thop==2.0.20
+urllib3==2.7.0
+uvicorn==0.51.0
+watchdog==6.0.0
+wcwidth==0.8.2
+websocket-client==1.9.0
+websockets==16.1.1
+Werkzeug==3.1.8
+xxhash==3.8.1
+yarl==1.24.5
+zipp==4.1.0

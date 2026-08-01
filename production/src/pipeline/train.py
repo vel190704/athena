@@ -23,6 +23,7 @@ baseline architectures.
 """
 
 import json
+import logging
 import os
 import tempfile
 from collections import defaultdict
@@ -70,6 +71,17 @@ from production.src.pipeline.survival_dataset import (
     TacticalSurvivalDataset,
 )
 from production.src.spatial.control import BiomechanicalPitchControl
+
+# Engineering-review action item: module-level logger, replacing this
+# file's former print()-based diagnostic output. A plain `getLogger(__name__)`
+# with NO handler/basicConfig configured here -- this module is imported by
+# tests and other modules, and a library module must never call
+# `logging.basicConfig` (or otherwise mutate global logging config) at
+# import time, since that would silently override whatever logging setup
+# the IMPORTING application already has. `basicConfig` is called once,
+# below, only inside the `if __name__ == "__main__":` guard, so it only
+# takes effect for this file's own standalone `python -m ...` entrypoint.
+logger = logging.getLogger(__name__)
 
 MLFLOW_EXPERIMENT_NAME = "project-athena-deephit"
 
@@ -279,7 +291,7 @@ def _match_chains_with_features(match_id: int, engine: BiomechanicalPitchControl
         matched_source_event_ids.append(rep_event["id"])
         matched_by_period[chain["period"]] += 1
 
-    print(
+    logger.info(
         f"  match {match_id}: {len(matched_chains)}/{len(chains)} chains matched to a "
         f"360 frame + features (by period: {dict(matched_by_period)})"
     )
@@ -295,9 +307,9 @@ def _match_chains_with_features(match_id: int, engine: BiomechanicalPitchControl
 
 def build_training_data():
     qualifying_competitions = find_360_competitions()
-    print(f"Competitions verified (via the live competitions index) to have 360 data ({len(qualifying_competitions)}):")
+    logger.info(f"Competitions verified (via the live competitions index) to have 360 data ({len(qualifying_competitions)}):")
     for c in qualifying_competitions:
-        print(
+        logger.info(
             f"  competition_id={c['competition_id']}, season_id={c['season_id']}: "
             f"{c['competition_name']} {c['season_name']}"
         )
@@ -306,7 +318,7 @@ def build_training_data():
         (c["competition_id"], c["season_id"]) for c in qualifying_competitions
     ]
     match_pool = batch_extract_valid_matches(competition_season_pairs, num_matches=MATCH_POOL_SIZE)
-    print(
+    logger.info(
         f"\nResolved {len(match_pool)} valid matches across {len(qualifying_competitions)} "
         f"qualifying competitions (pool target {MATCH_POOL_SIZE})"
     )
@@ -325,14 +337,14 @@ def build_training_data():
         used_match_ids.append(match_id)
 
         if len(all_features) >= TARGET_SAMPLE_COUNT:
-            print(
+            logger.info(
                 f"\nReached target sample count ({TARGET_SAMPLE_COUNT}) after "
                 f"{len(used_match_ids)} matches -- stopping early rather than "
                 "exhaustively processing the whole match pool."
             )
             break
 
-    print(
+    logger.info(
         f"Final: {len(all_features)} samples from {len(used_match_ids)} matches "
         f"(target was {TARGET_SAMPLE_COUNT}, requested range 5,000-10,000)"
     )
@@ -384,7 +396,7 @@ def _check_for_instability(model_type: str, epoch_losses: list[float]) -> bool:
 
     fired = max_relative_increase > INSTABILITY_THRESHOLD_FRACTION
     if fired:
-        print(
+        logger.warning(
             f"[{model_type}] WARNING: residual training instability detected -- loss "
             f"increased by {max_relative_increase:.1%} at epoch {culprit_epoch} "
             f"(threshold: single-epoch relative increase > {INSTABILITY_THRESHOLD_FRACTION:.0%})."
@@ -416,7 +428,7 @@ def _check_cumulative_drift(
     drift_fraction = (current_loss - prior_loss) / prior_loss if prior_loss > 0 else 0.0
     fired = drift_fraction > threshold_fraction
     if fired:
-        print(
+        logger.warning(
             f"[{model_type}] CUMULATIVE DRIFT WARNING at epoch {epoch}: loss increased "
             f"by {drift_fraction:.1%} over the last {window_epochs} epochs (from "
             f"{prior_loss:.4f} at epoch {epoch - window_epochs} to {current_loss:.4f} now) -- "
@@ -444,7 +456,7 @@ def _check_saturation(
     """
     fired = batch_variance < variance_threshold or mean_entropy < entropy_threshold
     if fired:
-        print(
+        logger.warning(
             f"[{model_type}] SATURATION WARNING at epoch {epoch}: output batch "
             f"variance={batch_variance:.2e} (threshold <{variance_threshold:.0e}), "
             f"mean entropy={mean_entropy:.4f} (threshold <{entropy_threshold}) -- "
@@ -470,7 +482,7 @@ def _check_frozen_val_loss(
     previous_check_epoch = max(val_loss_history.keys())
     fired = val_loss_history[previous_check_epoch] == epoch_val_loss
     if fired:
-        print(
+        logger.warning(
             f"[{model_type}] FROZEN VAL LOSS WARNING at epoch {epoch}: val_loss is "
             f"bit-for-bit identical to epoch {previous_check_epoch}'s value "
             f"({epoch_val_loss}) -- the weakest of these signals, since it only "
@@ -548,7 +560,7 @@ def _train_and_log_model(
             }
         )
 
-        print(
+        logger.info(
             f"\n[{model_type}] Training for {NUM_EPOCHS} epochs on {n_train} samples "
             f"({n_val} held out for validation)..."
         )
@@ -575,7 +587,7 @@ def _train_and_log_model(
                 loss = loss_fn(predictions, duration_bins_batch, events_batch)
 
                 if not torch.isfinite(loss):
-                    print(f"[{model_type}] NaN/Inf loss at epoch {epoch}, batch {batch_idx}. Stopping.")
+                    logger.warning(f"[{model_type}] NaN/Inf loss at epoch {epoch}, batch {batch_idx}. Stopping.")
                     return None
 
                 loss.backward()
@@ -594,7 +606,7 @@ def _train_and_log_model(
             mlflow.log_metric("train_loss", final_epoch_loss, step=epoch)
 
             if epoch % 10 == 0 or epoch == 1:
-                print(f"  [{model_type}] epoch {epoch:3d}/{NUM_EPOCHS}: training loss = {final_epoch_loss:.4f}")
+                logger.info(f"  [{model_type}] epoch {epoch:3d}/{NUM_EPOCHS}: training loss = {final_epoch_loss:.4f}")
 
             # Signal 2 (Milestone 14B): cumulative/windowed drift check.
             # Compares against the loss CUMULATIVE_DRIFT_WINDOW_EPOCHS
@@ -646,7 +658,7 @@ def _train_and_log_model(
                 )
                 val_loss_history[epoch] = epoch_val_loss
 
-        print(f"[{model_type}] Final training loss: {final_epoch_loss:.4f}")
+        logger.info(f"[{model_type}] Final training loss: {final_epoch_loss:.4f}")
 
         # Signal 1: single-epoch spike check (Milestone 12B, retained).
         spike_fired = _check_for_instability(model_type, epoch_losses)
@@ -659,7 +671,7 @@ def _train_and_log_model(
         mlflow.log_param("saturation_warning_fired", saturation_fired)
         mlflow.log_param("frozen_val_loss_warning_fired", frozen_val_loss_fired)
         mlflow.log_param("instability_warning_fired", instability_warning_fired)
-        print(
+        logger.info(
             f"[{model_type}] Warning summary -- spike: {spike_fired}, cumulative_drift: "
             f"{cumulative_drift_fired}, saturation: {saturation_fired}, frozen_val_loss: "
             f"{frozen_val_loss_fired}"
@@ -672,7 +684,7 @@ def _train_and_log_model(
             val_predictions = model(val_input)
 
             val_loss = loss_fn(val_predictions, val_duration_bins, val_events)
-            print(f"[{model_type}] Validation loss: {val_loss.item():.4f}")
+            logger.info(f"[{model_type}] Validation loss: {val_loss.item():.4f}")
 
             briers = {}
             for time_bin in BRIER_TIME_BINS:
@@ -680,7 +692,7 @@ def _train_and_log_model(
                     val_predictions, val_duration_bins, val_duration_bins, val_events, time_bin
                 )
                 seconds = time_bin * 5.0
-                print(f"  [{model_type}] time_bin={time_bin} ({seconds:.0f}s): Brier Score = {brier:.4f}")
+                logger.info(f"  [{model_type}] time_bin={time_bin} ({seconds:.0f}s): Brier Score = {brier:.4f}")
                 briers[time_bin] = (brier, num_excluded)
 
         brier_15s, excluded_15s = briers[3]
@@ -718,7 +730,7 @@ def _train_and_log_model(
         finally:
             os.remove(tmp_file_path)
 
-        print(f"[{model_type}] MLflow run ID: {run.info.run_id}")
+        logger.info(f"[{model_type}] MLflow run ID: {run.info.run_id}")
 
     return {
         "train_loss": final_epoch_loss,
@@ -807,7 +819,7 @@ def _train_and_log_deep_ensemble(
             }
         )
 
-        print(
+        logger.info(
             f"\n[DeepEnsemble] Training M={M} independent members for {NUM_EPOCHS} epochs on "
             f"{n_train} samples ({n_val} held out for validation)..."
         )
@@ -836,7 +848,7 @@ def _train_and_log_deep_ensemble(
                 )
 
                 if not torch.isfinite(loss):
-                    print(f"[DeepEnsemble] NaN/Inf loss at epoch {epoch}, batch {batch_idx}. Stopping.")
+                    logger.warning(f"[DeepEnsemble] NaN/Inf loss at epoch {epoch}, batch {batch_idx}. Stopping.")
                     return None
 
                 loss.backward()
@@ -851,7 +863,7 @@ def _train_and_log_deep_ensemble(
             mlflow.log_metric("train_loss", final_epoch_loss, step=epoch)
 
             if epoch % 10 == 0 or epoch == 1:
-                print(f"  [DeepEnsemble] epoch {epoch:3d}/{NUM_EPOCHS}: mean-member training loss = {final_epoch_loss:.4f}")
+                logger.info(f"  [DeepEnsemble] epoch {epoch:3d}/{NUM_EPOCHS}: mean-member training loss = {final_epoch_loss:.4f}")
 
             if epoch % VAL_LOSS_LOG_INTERVAL_EPOCHS == 0 and epoch > CUMULATIVE_DRIFT_WINDOW_EPOCHS:
                 drift_fired_this_epoch, drift_fraction = _check_cumulative_drift(
@@ -889,7 +901,7 @@ def _train_and_log_deep_ensemble(
                 )
                 val_loss_history[epoch] = epoch_val_loss
 
-        print(f"[DeepEnsemble] Final mean-member training loss: {final_epoch_loss:.4f}")
+        logger.info(f"[DeepEnsemble] Final mean-member training loss: {final_epoch_loss:.4f}")
 
         spike_fired = _check_for_instability("DeepEnsemble", epoch_losses)
         instability_warning_fired = (
@@ -900,7 +912,7 @@ def _train_and_log_deep_ensemble(
         mlflow.log_param("saturation_warning_fired", saturation_fired)
         mlflow.log_param("frozen_val_loss_warning_fired", frozen_val_loss_fired)
         mlflow.log_param("instability_warning_fired", instability_warning_fired)
-        print(
+        logger.info(
             f"[DeepEnsemble] Warning summary -- spike: {spike_fired}, cumulative_drift: "
             f"{cumulative_drift_fired}, saturation: {saturation_fired}, frozen_val_loss: "
             f"{frozen_val_loss_fired}"
@@ -917,7 +929,7 @@ def _train_and_log_deep_ensemble(
             val_loss = compute_disentangled_ensemble_loss(
                 model(val_input), val_duration_bins, val_events, loss_fn
             )
-            print(f"[DeepEnsemble] Validation loss (mean-member): {val_loss.item():.4f}")
+            logger.info(f"[DeepEnsemble] Validation loss (mean-member): {val_loss.item():.4f}")
 
             briers = {}
             for time_bin in BRIER_TIME_BINS:
@@ -925,7 +937,7 @@ def _train_and_log_deep_ensemble(
                     mean_pmf, val_duration_bins, val_duration_bins, val_events, time_bin
                 )
                 seconds = time_bin * 5.0
-                print(f"  [DeepEnsemble] time_bin={time_bin} ({seconds:.0f}s): Brier Score (mean PMF) = {brier:.4f}")
+                logger.info(f"  [DeepEnsemble] time_bin={time_bin} ({seconds:.0f}s): Brier Score (mean PMF) = {brier:.4f}")
                 briers[time_bin] = (brier, num_excluded)
 
             # Step 2.4: diversity metric -- mean, across the validation set,
@@ -934,7 +946,7 @@ def _train_and_log_deep_ensemble(
             # ensemble would show this near zero; logged explicitly so that
             # would be visible in MLflow, not just assumed away.
             diversity_std_ci_15s = std_cumulative_incidence.mean().item()
-            print(f"[DeepEnsemble] Diversity metric (mean std of per-member CI@15s across val set): {diversity_std_ci_15s:.6f}")
+            logger.info(f"[DeepEnsemble] Diversity metric (mean std of per-member CI@15s across val set): {diversity_std_ci_15s:.6f}")
 
         brier_15s, excluded_15s = briers[3]
         brier_30s, excluded_30s = briers[6]
@@ -961,7 +973,7 @@ def _train_and_log_deep_ensemble(
         finally:
             os.remove(tmp_file_path)
 
-        print(f"[DeepEnsemble] MLflow run ID: {run.info.run_id}")
+        logger.info(f"[DeepEnsemble] MLflow run ID: {run.info.run_id}")
 
     return {
         "train_loss": final_epoch_loss,
@@ -1034,7 +1046,7 @@ def _build_habit_blended_features(
     training_match_ids = sorted(all_match_ids_set - val_match_ids)
     validation_match_ids = sorted(val_match_ids)
 
-    print(
+    logger.info(
         f"\n[Milestone 23/35] {len(training_match_ids)} training-split matches, "
         f"{len(validation_match_ids)} validation-split matches -- an exact, complete partition "
         "under Milestone 35's match-level split (no match straddles both groups, so none is held "
@@ -1081,7 +1093,7 @@ def _build_habit_blended_features(
         "samples_with_known_actor": samples_with_known_actor,
         "total_samples": len(frames),
     }
-    print(
+    logger.info(
         f"[Milestone 23] {diagnostics['unique_actor_count']} unique actors found across "
         f"{diagnostics['samples_with_known_actor']}/{diagnostics['total_samples']} samples with a "
         f"known actor; {diagnostics['cold_start_count']} of those fell back to the uniform "
@@ -1090,9 +1102,15 @@ def _build_habit_blended_features(
     return blended_features, diagnostics
 
 
-def train_and_evaluate():
-    torch.manual_seed(RANDOM_SEED)
-
+def _load_and_split_dataset() -> dict:
+    """Data loading + Milestone 35 match-level split (ADR-011), extracted
+    from `train_and_evaluate()` (engineering-review action item: the
+    ADR-010 pure-named-sub-step extraction pattern, applied to the
+    OTHER large function in this file). Consumes no global RNG state
+    itself (`match_level_split` takes its own explicit `seed` argument,
+    not the global torch generator), so extracting it cannot change the
+    RNG sequence any later, seeded stage depends on.
+    """
     features, frames, chains, source_event_ids, match_ids, qualifying_competitions, sample_match_ids = (
         build_training_data()
     )
@@ -1101,9 +1119,9 @@ def train_and_evaluate():
     competition_season_summary = ",".join(
         f"{c['competition_id']}:{c['season_id']}" for c in qualifying_competitions
     )
-    print(f"\nTotal (feature, frame, chain) triples across {match_count} matches: {dataset_size}")
+    logger.info(f"\nTotal (feature, frame, chain) triples across {match_count} matches: {dataset_size}")
     if dataset_size < SMALL_DATASET_WARNING_THRESHOLD:
-        print(
+        logger.info(
             f"NOTE: {dataset_size} samples from {match_count} matches is a small dataset -- fine "
             "for a baseline smoke test, but the Brier Score numbers below should not be "
             "over-interpreted as a validated model."
@@ -1115,7 +1133,7 @@ def train_and_evaluate():
     # were fed the identical `parsed` dict from _match_chains_with_features,
     # so this is guaranteed by construction -- printed here as visible
     # evidence, not just an assumption.
-    print(
+    logger.info(
         f"\nSame-frame spot check (chain 0): scalar-feature source event_id="
         f"{source_event_ids[0]}, graph-data source event_id={source_event_ids[0]} "
         "(identical, by construction -- both were built from one resolved parse_360_frame call)"
@@ -1135,7 +1153,7 @@ def train_and_evaluate():
     train_set = Subset(dataset, train_indices)
     val_set = Subset(dataset, val_indices)
     n_train, n_val = len(train_set), len(val_set)
-    print(
+    logger.info(
         f"\n[Milestone 35] resulting sample-level ratio: {n_train} train / {n_val} val "
         f"({n_train / (n_train + n_val):.1%} / {n_val / (n_train + n_val):.1%}) -- NOT forced to "
         f"exactly {TRAIN_FRACTION:.0%}/{1 - TRAIN_FRACTION:.0%} since matches contribute different "
@@ -1146,14 +1164,47 @@ def train_and_evaluate():
     # that assumption explicitly rather than leaving it implicit.
     assert len(train_set) == n_train and len(val_set) == n_val
 
+    return {
+        "features": features,
+        "frames": frames,
+        "chains": chains,
+        "source_event_ids": source_event_ids,
+        "match_ids": match_ids,
+        "qualifying_competitions": qualifying_competitions,
+        "sample_match_ids": sample_match_ids,
+        "competition_season_summary": competition_season_summary,
+        "dataset": dataset,
+        "train_set": train_set,
+        "val_set": val_set,
+        "n_train": n_train,
+        "n_val": n_val,
+        "dataset_size": dataset_size,
+    }
+
+
+def _compute_normalization_stats(
+    dataset: TacticalSurvivalDataset, train_set: Subset
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Scalar (Milestone 7) AND graph (Milestone 12 Step 2.3) feature
+    normalization, both training-split-only (never the full dataset) --
+    a pure, independently-testable computation (feed it a small synthetic
+    dataset + index list, check the returned mean/std), extracted per the
+    review's own suggested 'data loading/normalization' category. Kept as
+    ONE function, not two, since both stats are always computed together,
+    in sequence, with no branching between them.
+
+    Returns `(feature_mean, feature_std, graph_feature_mean, graph_feature_std)`.
+    """
+    n_train = len(train_set)
+
     # Scalar feature normalization (Milestone 7's rule, unchanged):
     # statistics computed from the TRAINING split ONLY, after the split.
     train_features_raw = torch.stack([dataset[i][0] for i in train_set.indices])
     feature_mean = train_features_raw.mean(dim=0)
     feature_std = train_features_raw.std(dim=0).clamp(min=1e-8)  # guard a constant feature
-    print(f"\nScalar feature normalization stats (from {n_train} training samples):")
-    print(f"  mean: {feature_mean.tolist()}")
-    print(f"  std:  {feature_std.tolist()}")
+    logger.info(f"\nScalar feature normalization stats (from {n_train} training samples):")
+    logger.info(f"  mean: {feature_mean.tolist()}")
+    logger.info(f"  std:  {feature_std.tolist()}")
 
     # Graph continuous-feature normalization (Milestone 12 Step 2.3): same
     # training-split-only rule, applied to columns [x, y, dist_to_ball]
@@ -1169,31 +1220,35 @@ def train_and_evaluate():
     )
     graph_feature_mean = train_graph_continuous.mean(dim=0)
     graph_feature_std = train_graph_continuous.std(dim=0).clamp(min=1e-8)
-    print(f"\nGraph node feature normalization stats (x, y, dist_to_ball; from {n_train} training samples):")
-    print(f"  mean: {graph_feature_mean.tolist()}")
-    print(f"  std:  {graph_feature_std.tolist()}")
+    logger.info(f"\nGraph node feature normalization stats (x, y, dist_to_ball; from {n_train} training samples):")
+    logger.info(f"  mean: {graph_feature_mean.tolist()}")
+    logger.info(f"  std:  {graph_feature_std.tolist()}")
 
-    train_loader = DataLoader(
-        train_set,
-        batch_size=BATCH_SIZE,
-        shuffle=True,
-        generator=torch.Generator().manual_seed(RANDOM_SEED),
-    )
-    val_batch = next(iter(DataLoader(val_set, batch_size=len(val_set))))
+    return feature_mean, feature_std, graph_feature_mean, graph_feature_std
 
-    mlflow.set_tracking_uri("file:./mlruns")
-    mlflow.set_experiment(MLFLOW_EXPERIMENT_NAME)
 
-    # === Milestone 14B Step 2: MLP stabilization (same bundle as the GNN),
-    # PLUS a second weight-init seed as a robustness check. train_loader is
-    # the SAME shared object across every call below (as in every prior
-    # milestone's MLP-vs-GNN comparison) -- its shuffle order naturally
-    # differs call-to-call as its internal generator advances, but the
-    # train/val SPLIT itself (train_set/val_set, from split_generator) is
-    # held fixed at RANDOM_SEED=42 for every run in this function. Only
-    # each MLP run's WEIGHT INITIALIZATION seed differs (42 vs 43),
-    # isolating exactly the one variable Step 2.3 asks about.
-    print("\n=== Milestone 14B Step 2: MLP stabilization + robustness check ===")
+def _run_mlp_stabilization_and_robustness_check(
+    train_loader: DataLoader,
+    val_batch: tuple,
+    n_train: int,
+    n_val: int,
+    match_ids: list[int],
+    dataset_size: int,
+    competition_season_summary: str,
+    feature_mean: torch.Tensor,
+    feature_std: torch.Tensor,
+) -> dict[int, dict | None]:
+    """Milestone 14B Step 2: MLP stabilization (same bundle as the GNN),
+    PLUS a second weight-init seed as a robustness check. `train_loader`
+    is the SAME shared object across every call below (as in every prior
+    milestone's MLP-vs-GNN comparison) -- its shuffle order naturally
+    differs call-to-call as its internal generator advances, but the
+    train/val SPLIT itself (train_set/val_set, from split_generator) is
+    held fixed at RANDOM_SEED=42 for every run in this function. Only
+    each MLP run's WEIGHT INITIALIZATION seed differs (42 vs 43),
+    isolating exactly the one variable Step 2.3 asks about.
+    """
+    logger.info("\n=== Milestone 14B Step 2: MLP stabilization + robustness check ===")
     mlp_seed_results: dict[int, dict | None] = {}
     for seed in MLP_ROBUSTNESS_CHECK_SEEDS:
         torch.manual_seed(seed)
@@ -1241,14 +1296,32 @@ def train_and_evaluate():
             },
         )
 
+    return mlp_seed_results
+
+
+def _run_gnn_stage(
+    train_loader: DataLoader,
+    val_batch: tuple,
+    n_train: int,
+    n_val: int,
+    match_ids: list[int],
+    dataset_size: int,
+    competition_season_summary: str,
+    graph_feature_mean: torch.Tensor,
+    graph_feature_std: torch.Tensor,
+) -> dict | None:
+    """Milestone 14B Step 3: GNN retrain, with the exact same
+    hyperparameters as the MLP (both use the stabilization bundle) --
+    addresses the asymmetry noted (but not fixed) in Milestones 12B/14.
+    """
     # Reset the global RNG state before constructing the GNN, so its own
     # initialization isn't accidentally coupled to wherever the MLP seed
-    # loop left the global generator.
+    # loop left the global generator. MUST remain the first statement in
+    # this function -- the caller invokes this immediately after the MLP
+    # stage returns, preserving the exact same RNG-consumption sequence
+    # the pre-decomposition inline code had.
     torch.manual_seed(RANDOM_SEED)
 
-    # === Milestone 14B Step 3: GNN retrain, NOW with the exact same
-    # hyperparameters as the MLP (both use the stabilization bundle) --
-    # addresses the asymmetry noted (but not fixed) in Milestones 12B/14.
     gnn_model = GNNDeepHitSurvivalModel(num_node_features=7, num_bins=NUM_BINS, hidden_dim=GNN_HIDDEN_DIM)
     gnn_optimizer = torch.optim.Adam(
         gnn_model.parameters(), lr=GNN_LEARNING_RATE, weight_decay=GNN_WEIGHT_DECAY
@@ -1294,17 +1367,35 @@ def train_and_evaluate():
         },
     )
 
+    return gnn_results
+
+
+def _run_deep_ensemble_stage(
+    train_loader: DataLoader,
+    val_batch: tuple,
+    n_train: int,
+    n_val: int,
+    match_ids: list[int],
+    dataset_size: int,
+    feature_mean: torch.Tensor,
+    feature_std: torch.Tensor,
+) -> dict | None:
+    """Milestone 21: Deep Ensemble uncertainty quantification (ADR-004).
+    Same split, same normalization, same stabilization bundle as the
+    Milestone 14B MLP/GNN -- only the model and its per-member-
+    disentangled loss loop differ (see `_train_and_log_deep_ensemble`).
+    Includes Milestone 21's own warning-summary + baseline-comparison
+    report, since that report is this stage's own self-contained output,
+    not shared state other stages need.
+    """
     # Reset the global RNG state before constructing the ensemble, same
     # reasoning as before the GNN above: its M independent members'
     # initialization shouldn't be accidentally coupled to wherever the GNN
-    # training loop left the global generator.
+    # training loop left the global generator. MUST remain the first
+    # statement -- see `_run_gnn_stage`'s identical comment.
     torch.manual_seed(RANDOM_SEED)
 
-    # === Milestone 21: Deep Ensemble uncertainty quantification (ADR-004).
-    # Same split, same normalization, same stabilization bundle as the
-    # Milestone 14B MLP/GNN -- only the model and its per-member-
-    # disentangled loss loop differ (see _train_and_log_deep_ensemble).
-    print(f"\n=== Milestone 21: Deep Ensemble (M={DEEP_ENSEMBLE_M}) training ===")
+    logger.info(f"\n=== Milestone 21: Deep Ensemble (M={DEEP_ENSEMBLE_M}) training ===")
     deep_ensemble_model = DeepEnsembleDeepHit(
         num_features=len(FEATURE_KEYS), num_bins=NUM_BINS, M=DEEP_ENSEMBLE_M
     )
@@ -1340,32 +1431,32 @@ def train_and_evaluate():
         },
     )
 
-    print("\n=== Milestone 21: Deep Ensemble warning summary + baseline comparison ===")
+    logger.info("\n=== Milestone 21: Deep Ensemble warning summary + baseline comparison ===")
     if deep_ensemble_results is None:
-        print("DeepEnsemble: training ABORTED (NaN/Inf loss).")
+        logger.warning("DeepEnsemble: training ABORTED (NaN/Inf loss).")
     else:
-        print(
+        logger.info(
             f"DeepEnsemble: spike={deep_ensemble_results['spike_fired']}, "
             f"cumulative_drift={deep_ensemble_results['cumulative_drift_fired']}, "
             f"saturation={deep_ensemble_results['saturation_fired']}, "
             f"frozen_val_loss={deep_ensemble_results['frozen_val_loss_fired']}"
         )
-        print(
+        logger.info(
             f"DeepEnsemble diversity metric (mean std of per-member CI@15s): "
             f"{deep_ensemble_results['diversity_std_ci_15s']:.6f}"
         )
-        print(
+        logger.info(
             f"\n{'Model':<40} {'Params (approx)':>16} {'Brier@15s':>10} {'Brier@30s':>10}"
         )
-        print(
+        logger.info(
             f"{'Single MLP (Milestone 14B, seed=42)':<40} {'1x':>16} "
             f"{MILESTONE_14B_MLP_BRIER_15S:>10.4f} {MILESTONE_14B_MLP_BRIER_30S:>10.4f}"
         )
-        print(
+        logger.info(
             f"{f'Deep Ensemble (M={DEEP_ENSEMBLE_M}, mean PMF)':<40} {f'~{DEEP_ENSEMBLE_M}x':>16} "
             f"{deep_ensemble_results['brier_15s']:>10.4f} {deep_ensemble_results['brier_30s']:>10.4f}"
         )
-        print(
+        logger.info(
             "NOTE: this is NOT an equal-capacity comparison -- the Deep Ensemble has ~"
             f"{DEEP_ENSEMBLE_M}x the parameters and training/inference compute of the single MLP "
             "(same caveat already established for the Milestone 12 MLP-vs-GNN comparison). A "
@@ -1373,12 +1464,33 @@ def train_and_evaluate():
             "not evidence the ensembling technique itself is more parameter-efficient."
         )
 
-    # === Milestone 23 (RQ2): MLP with Bayesian habit blending enabled.
-    # Same hyperparameters, split, and instability detector as the
-    # Milestone 14B baseline -- the ONLY difference is that features are
-    # re-extracted with habit_heatmaps populated per Step 1's match-aware/
-    # split-aware discipline.
-    print("\n=== Milestone 23 (RQ2): building habit-blended features ===")
+    return deep_ensemble_results
+
+
+def _run_habit_blended_stage(
+    frames: list[dict],
+    chains: list[dict],
+    sample_match_ids: list[int],
+    match_ids: list[int],
+    train_set: Subset,
+    val_set: Subset,
+    n_train: int,
+    n_val: int,
+    dataset_size: int,
+    competition_season_summary: str,
+    deep_ensemble_results: dict | None,
+) -> tuple[dict | None, dict]:
+    """Milestone 23 (RQ2): MLP with Bayesian habit blending enabled. Same
+    hyperparameters, split, and instability detector as the Milestone 14B
+    baseline -- the ONLY difference is that features are re-extracted
+    with habit_heatmaps populated per Step 1's match-aware/split-aware
+    discipline. Includes the RQ2 conclusion report, since it's this
+    stage's own self-contained output (it needs `deep_ensemble_results`
+    only to print one extra comparison row, not as a real dependency).
+
+    Returns `(habit_mlp_results, habit_diagnostics)`.
+    """
+    logger.info("\n=== Milestone 23 (RQ2): building habit-blended features ===")
     habit_blend_engine = BiomechanicalPitchControl()
     habit_blended_features, habit_diagnostics = _build_habit_blended_features(
         frames=frames,
@@ -1466,39 +1578,39 @@ def train_and_evaluate():
         },
     )
 
-    print("\n=== Milestone 23 (RQ2): habit-blended MLP vs. non-blended baselines ===")
+    logger.info("\n=== Milestone 23 (RQ2): habit-blended MLP vs. non-blended baselines ===")
     if habit_mlp_results is None:
-        print("Habit-blended MLP: training ABORTED (NaN/Inf loss).")
+        logger.warning("Habit-blended MLP: training ABORTED (NaN/Inf loss).")
     else:
-        print(
+        logger.info(
             f"Habit-blended MLP: spike={habit_mlp_results['spike_fired']}, "
             f"cumulative_drift={habit_mlp_results['cumulative_drift_fired']}, "
             f"saturation={habit_mlp_results['saturation_fired']}, "
             f"frozen_val_loss={habit_mlp_results['frozen_val_loss_fired']}"
         )
-        print(f"\n{'Model':<40} {'Brier@15s':>10} {'Brier@30s':>10}")
-        print(f"{'MLP, no blending (Milestone 14B)':<40} {MILESTONE_14B_MLP_BRIER_15S:>10.4f} {MILESTONE_14B_MLP_BRIER_30S:>10.4f}")
-        print(f"{'MLP, habit blending (Milestone 23)':<40} {habit_mlp_results['brier_15s']:>10.4f} {habit_mlp_results['brier_30s']:>10.4f}")
+        logger.info(f"\n{'Model':<40} {'Brier@15s':>10} {'Brier@30s':>10}")
+        logger.info(f"{'MLP, no blending (Milestone 14B)':<40} {MILESTONE_14B_MLP_BRIER_15S:>10.4f} {MILESTONE_14B_MLP_BRIER_30S:>10.4f}")
+        logger.info(f"{'MLP, habit blending (Milestone 23)':<40} {habit_mlp_results['brier_15s']:>10.4f} {habit_mlp_results['brier_30s']:>10.4f}")
         if deep_ensemble_results is not None:
-            print(f"{f'Deep Ensemble, no blending (M={DEEP_ENSEMBLE_M}, Milestone 21)':<40} {deep_ensemble_results['brier_15s']:>10.4f} {deep_ensemble_results['brier_30s']:>10.4f}")
+            logger.info(f"{f'Deep Ensemble, no blending (M={DEEP_ENSEMBLE_M}, Milestone 21)':<40} {deep_ensemble_results['brier_15s']:>10.4f} {deep_ensemble_results['brier_30s']:>10.4f}")
 
         brier_15s_delta = habit_mlp_results["brier_15s"] - MILESTONE_14B_MLP_BRIER_15S
         brier_30s_delta = habit_mlp_results["brier_30s"] - MILESTONE_14B_MLP_BRIER_30S
         habit_healthy = not habit_mlp_results["instability_warning_fired"]
 
-        print(
+        logger.info(
             f"\nBrier delta vs. non-blended baseline: {brier_15s_delta:+.4f} @15s, "
             f"{brier_30s_delta:+.4f} @30s (negative = habit blending improved the score)."
         )
 
-        print("\n=== Step 3: RQ2 conclusion (conditional on evidence quality) ===")
+        logger.info("\n=== Step 3: RQ2 conclusion (conditional on evidence quality) ===")
         if not habit_healthy:
-            print(
+            logger.info(
                 "The habit-blended MLP triggered an instability warning -- NOT issuing an RQ2 "
                 "conclusion this run. Report the blocker, fix it, re-run -- do not force a verdict."
             )
         elif brier_15s_delta < 0 and brier_30s_delta < 0:
-            print(
+            logger.info(
                 f"RQ2 SUPPORTED (hedged): habit blending improved Brier Score at both horizons "
                 f"({brier_15s_delta:+.4f} @15s, {brier_30s_delta:+.4f} @30s). This is a notable "
                 "result given how diluted the blended signal could be: only 1 of ~22 visible "
@@ -1512,7 +1624,7 @@ def train_and_evaluate():
                 "live-deployment simulation."
             )
         else:
-            print(
+            logger.info(
                 f"RQ2 NOT supported by this run: Brier Score did not improve at both horizons "
                 f"({brier_15s_delta:+.4f} @15s, {brier_30s_delta:+.4f} @30s). Two distinct, "
                 "non-exclusive candidate explanations, not one: (a) the actor-only constraint "
@@ -1529,18 +1641,99 @@ def train_and_evaluate():
                 "implementation of it."
             )
 
-    print(f"\nDataset size: {dataset_size} total samples ({n_train} train / {n_val} val)")
+    return habit_mlp_results, habit_diagnostics
+
+
+def _evaluate_mlp_health(primary_mlp_results: dict | None) -> bool:
+    """Step 2.2 (revised per ADR-010): is the stabilized MLP genuinely
+    HEALTHY, not merely "not collapsed"? GATED on exactly two criteria:
+    (1) none of the four principled signals fired (spike, cumulative
+    drift, saturation/entropy, frozen val loss -- the entropy/variance
+    probing that has resolved every real ambiguous case in this
+    project's history, Milestones 12/14/23) and (2) Brier Score isn't
+    catastrophically bad. A THIRD criterion this health check used to
+    require -- "did total loss decrease by more than 10% from epoch 1 to
+    the final epoch" -- was REMOVED from the gate per ADR-010: it
+    produced a real false positive in Milestone 23 (a genuinely healthy,
+    fast-converging-then-plateauing MLP, confirmed healthy only by
+    manual entropy/variance probing), because a model that converges
+    quickly within its first epoch and then correctly holds near its
+    optimum for the rest of training shows exactly the same small
+    further decrease this check would misread as "not learning." It is
+    still computed and logged below as a non-blocking diagnostic --
+    useful context for a human glance, never a gate. Extracted as its own
+    function per the review's request, matching the SAME
+    compute-and-log-then-return-a-bool shape as the ADR-010 `_check_*`
+    signal functions above.
+    """
+    mlp_healthy = False
+    if primary_mlp_results is not None and not primary_mlp_results["instability_warning_fired"]:
+        first_loss = primary_mlp_results["epoch_losses"][0]
+        last_loss = primary_mlp_results["epoch_losses"][-1]
+        loss_decreased_meaningfully = (first_loss - last_loss) > 0.1 * first_loss
+        brier_in_sane_range = (
+            primary_mlp_results["brier_15s"] <= MLP_SANITY_BRIER_15S_CEILING
+            and primary_mlp_results["brier_30s"] <= MLP_SANITY_BRIER_30S_CEILING
+        )
+        mlp_healthy = brier_in_sane_range
+        logger.info(
+            f"\nMLP (seed={RANDOM_SEED}) health check: no instability warnings=True, Brier in "
+            f"sane range (<= {MLP_SANITY_BRIER_15S_CEILING:.4f} / "
+            f"{MLP_SANITY_BRIER_30S_CEILING:.4f})={brier_in_sane_range} (actual: "
+            f"{primary_mlp_results['brier_15s']:.4f} / {primary_mlp_results['brier_30s']:.4f})"
+        )
+        logger.info(
+            f"  [diagnostic only, per ADR-010 NOT part of the health gate] total loss change "
+            f"epoch 1 -> {NUM_EPOCHS}: {first_loss:.4f} -> {last_loss:.4f} "
+            f"({'>' if loss_decreased_meaningfully else '<='} 10% of epoch-1 loss). A small or "
+            "absent late-training decrease is EXPECTED and HEALTHY for a model that converged "
+            "quickly and is now correctly holding near its optimum -- this line is informational "
+            "only and never blocks a conclusion."
+        )
+        if not brier_in_sane_range:
+            logger.warning(
+                "WARNING: the 'same hyperparameters as the GNN' recipe produced a STABLE but "
+                "apparently UNDERTRAINED MLP (Brier far worse than the Milestone 12B sanity "
+                "floor) -- lr=1e-4 was tuned for SAGEConv's specific instability, not validated "
+                "as appropriate for this MLP. The 'purely architectural, hyperparameter-neutral' "
+                "comparison assumption does NOT hold cleanly here."
+            )
+    elif primary_mlp_results is not None:
+        logger.info(f"\nMLP (seed={RANDOM_SEED}) still triggered an instability warning -- see summary above.")
+    else:
+        logger.info(f"\nMLP (seed={RANDOM_SEED}) training was aborted (NaN/Inf loss).")
+
+    return mlp_healthy
+
+
+def _report_run_summary_and_rq4_conclusion(
+    mlp_seed_results: dict[int, dict | None],
+    gnn_results: dict | None,
+    dataset_size: int,
+    n_train: int,
+    n_val: int,
+) -> None:
+    """Step 3.2/3.4/5: warning summary across all runs, the ADR-010 MLP
+    health gate, robustness-check reporting, the four-way comparison
+    table, and the conditional RQ4 conclusion -- kept as ONE cohesive
+    reporting function (not fragmented further, per the review's own
+    "extract where it helps, don't atomize every line" guidance) since
+    every piece depends on state (`any_warnings_anywhere`, `mlp_healthy`,
+    primary/robustness results) derived earlier in this SAME sequence,
+    not on independent inputs a caller would ever want to vary alone.
+    """
+    logger.info(f"\nDataset size: {dataset_size} total samples ({n_train} train / {n_val} val)")
 
     # === Step 3.2: did ANY of the four warning signals fire, for either
     # model, across BOTH MLP seeds? ===
-    print("\n=== Step 3: warning summary across all runs (strengthened detector) ===")
+    logger.info("\n=== Step 3: warning summary across all runs (strengthened detector) ===")
     any_warnings_anywhere = False
     for seed, results in mlp_seed_results.items():
         if results is None:
-            print(f"MLP (seed={seed}): training ABORTED (NaN/Inf loss).")
+            logger.warning(f"MLP (seed={seed}): training ABORTED (NaN/Inf loss).")
             any_warnings_anywhere = True
             continue
-        print(
+        logger.info(
             f"MLP (seed={seed}): spike={results['spike_fired']}, "
             f"cumulative_drift={results['cumulative_drift_fired']}, "
             f"saturation={results['saturation_fired']}, "
@@ -1549,10 +1742,10 @@ def train_and_evaluate():
         any_warnings_anywhere = any_warnings_anywhere or results["instability_warning_fired"]
 
     if gnn_results is None:
-        print("GNN: training ABORTED (NaN/Inf loss).")
+        logger.warning("GNN: training ABORTED (NaN/Inf loss).")
         any_warnings_anywhere = True
     else:
-        print(
+        logger.info(
             f"GNN: spike={gnn_results['spike_fired']}, "
             f"cumulative_drift={gnn_results['cumulative_drift_fired']}, "
             f"saturation={gnn_results['saturation_fired']}, "
@@ -1568,68 +1761,16 @@ def train_and_evaluate():
     robustness_seed = next(s for s in MLP_ROBUSTNESS_CHECK_SEEDS if s != RANDOM_SEED)
     robustness_mlp_results = mlp_seed_results[robustness_seed]
 
-    # === Step 2.2 (revised per ADR-010): is the stabilized MLP genuinely
-    # HEALTHY, not merely "not collapsed"? GATED on exactly two criteria:
-    # (1) none of the four principled signals fired (spike, cumulative
-    # drift, saturation/entropy, frozen val loss -- the entropy/variance
-    # probing that has resolved every real ambiguous case in this
-    # project's history, Milestones 12/14/23) and (2) Brier Score isn't
-    # catastrophically bad. A THIRD criterion this health check used to
-    # require -- "did total loss decrease by more than 10% from epoch 1 to
-    # the final epoch" -- was REMOVED from the gate per ADR-010: it
-    # produced a real false positive in Milestone 23 (a genuinely healthy,
-    # fast-converging-then-plateauing MLP, confirmed healthy only by
-    # manual entropy/variance probing), because a model that converges
-    # quickly within its first epoch and then correctly holds near its
-    # optimum for the rest of training shows exactly the same small
-    # further decrease this check would misread as "not learning." It is
-    # still computed and printed below as a non-blocking diagnostic --
-    # useful context for a human glance, never a gate.
-    mlp_healthy = False
-    if primary_mlp_results is not None and not primary_mlp_results["instability_warning_fired"]:
-        first_loss = primary_mlp_results["epoch_losses"][0]
-        last_loss = primary_mlp_results["epoch_losses"][-1]
-        loss_decreased_meaningfully = (first_loss - last_loss) > 0.1 * first_loss
-        brier_in_sane_range = (
-            primary_mlp_results["brier_15s"] <= MLP_SANITY_BRIER_15S_CEILING
-            and primary_mlp_results["brier_30s"] <= MLP_SANITY_BRIER_30S_CEILING
-        )
-        mlp_healthy = brier_in_sane_range
-        print(
-            f"\nMLP (seed={RANDOM_SEED}) health check: no instability warnings=True, Brier in "
-            f"sane range (<= {MLP_SANITY_BRIER_15S_CEILING:.4f} / "
-            f"{MLP_SANITY_BRIER_30S_CEILING:.4f})={brier_in_sane_range} (actual: "
-            f"{primary_mlp_results['brier_15s']:.4f} / {primary_mlp_results['brier_30s']:.4f})"
-        )
-        print(
-            f"  [diagnostic only, per ADR-010 NOT part of the health gate] total loss change "
-            f"epoch 1 -> {NUM_EPOCHS}: {first_loss:.4f} -> {last_loss:.4f} "
-            f"({'>' if loss_decreased_meaningfully else '<='} 10% of epoch-1 loss). A small or "
-            "absent late-training decrease is EXPECTED and HEALTHY for a model that converged "
-            "quickly and is now correctly holding near its optimum -- this line is informational "
-            "only and never blocks a conclusion."
-        )
-        if not brier_in_sane_range:
-            print(
-                "WARNING: the 'same hyperparameters as the GNN' recipe produced a STABLE but "
-                "apparently UNDERTRAINED MLP (Brier far worse than the Milestone 12B sanity "
-                "floor) -- lr=1e-4 was tuned for SAGEConv's specific instability, not validated "
-                "as appropriate for this MLP. The 'purely architectural, hyperparameter-neutral' "
-                "comparison assumption does NOT hold cleanly here."
-            )
-    elif primary_mlp_results is not None:
-        print(f"\nMLP (seed={RANDOM_SEED}) still triggered an instability warning -- see summary above.")
-    else:
-        print(f"\nMLP (seed={RANDOM_SEED}) training was aborted (NaN/Inf loss).")
+    mlp_healthy = _evaluate_mlp_health(primary_mlp_results)
 
-    print(f"\nRobustness check (seed={robustness_seed}):")
+    logger.info(f"\nRobustness check (seed={robustness_seed}):")
     if robustness_mlp_results is not None:
-        print(
+        logger.info(
             f"  final train loss: {robustness_mlp_results['train_loss']:.4f}, any warning fired: "
             f"{robustness_mlp_results['instability_warning_fired']}, Brier@15s/30s: "
             f"{robustness_mlp_results['brier_15s']:.4f} / {robustness_mlp_results['brier_30s']:.4f}"
         )
-        print(
+        logger.info(
             "  (systematic-vs-one-off read: both seeds " +
             ("avoided every warning" if not any(
                 mlp_seed_results[s]["instability_warning_fired"] for s in MLP_ROBUSTNESS_CHECK_SEEDS
@@ -1638,45 +1779,45 @@ def train_and_evaluate():
             " -- see per-seed detail above.)"
         )
     else:
-        print("  training ABORTED (NaN/Inf loss).")
+        logger.warning("  training ABORTED (NaN/Inf loss).")
 
     # === Step 3.4: four-row comparison table ===
-    print("\n=== Step 3.4: four-way comparison (Milestone 14 vs Milestone 14B) ===")
-    print(f"{'Model (run)':<48} {'Dataset':>8} {'Brier@15s':>10} {'Brier@30s':>10}")
-    print(
+    logger.info("\n=== Step 3.4: four-way comparison (Milestone 14 vs Milestone 14B) ===")
+    logger.info(f"{'Model (run)':<48} {'Dataset':>8} {'Brier@15s':>10} {'Brier@30s':>10}")
+    logger.info(
         f"{'MLP (Milestone 14, COLLAPSED, for the record)':<48} {MILESTONE_14_DATASET_SIZE:>8} "
         f"{MILESTONE_14_MLP_COLLAPSED_BRIER_15S:>10.4f} {MILESTONE_14_MLP_COLLAPSED_BRIER_30S:>10.4f}"
     )
-    print(
+    logger.info(
         f"{'GNN (Milestone 14, stable)':<48} {MILESTONE_14_DATASET_SIZE:>8} "
         f"{MILESTONE_14_GNN_STABLE_BRIER_15S:>10.4f} {MILESTONE_14_GNN_STABLE_BRIER_30S:>10.4f}"
     )
     if primary_mlp_results is not None:
-        print(
+        logger.info(
             f"{'MLP (Milestone 14B, stabilized)':<48} {dataset_size:>8} "
             f"{primary_mlp_results['brier_15s']:>10.4f} {primary_mlp_results['brier_30s']:>10.4f}"
         )
     else:
-        print(f"{'MLP (Milestone 14B, stabilized)':<48} {dataset_size:>8} {'ABORTED':>10} {'ABORTED':>10}")
+        logger.info(f"{'MLP (Milestone 14B, stabilized)':<48} {dataset_size:>8} {'ABORTED':>10} {'ABORTED':>10}")
     if gnn_results is not None:
-        print(
+        logger.info(
             f"{'GNN (Milestone 14B, same hyperparams as MLP)':<48} {dataset_size:>8} "
             f"{gnn_results['brier_15s']:>10.4f} {gnn_results['brier_30s']:>10.4f}"
         )
     else:
-        print(f"{'GNN (Milestone 14B, same hyperparams as MLP)':<48} {dataset_size:>8} {'ABORTED':>10} {'ABORTED':>10}")
+        logger.info(f"{'GNN (Milestone 14B, same hyperparams as MLP)':<48} {dataset_size:>8} {'ABORTED':>10} {'ABORTED':>10}")
 
     # === Step 5: conditional RQ4 conclusion -- ONLY if evidence quality supports one ===
-    print("\n=== Step 5: RQ4 conclusion (conditional on evidence quality) ===")
+    logger.info("\n=== Step 5: RQ4 conclusion (conditional on evidence quality) ===")
     if any_warnings_anywhere:
-        print(
+        logger.info(
             "At least one run (MLP seed 42, MLP seed 43, or GNN) triggered an instability "
             "warning under the strengthened detector, or aborted outright. Per Milestone 12B's "
             "precedent: NOT issuing an RQ4 conclusion this run. Report the blocker, fix it, "
             "re-run -- do not force a verdict."
         )
     elif not mlp_healthy:
-        print(
+        logger.info(
             "No instability warnings fired, but the stabilized MLP does not pass the 'genuinely "
             "learning well' health check above -- it may be stable-but-undertrained rather than a "
             "fair comparison point. NOT issuing an RQ4 conclusion this run. The 'same "
@@ -1688,7 +1829,7 @@ def train_and_evaluate():
             gnn_results["brier_15s"] <= primary_mlp_results["brier_15s"] * 1.1
             and gnn_results["brier_30s"] <= primary_mlp_results["brier_30s"] * 1.1
         )
-        print(
+        logger.info(
             f"Both models are confirmed genuinely healthy: no warnings fired (spike, cumulative "
             f"drift, saturation, or frozen-val-loss) across both MLP seeds and the GNN, and the "
             f"MLP's loss decreased meaningfully with a sane Brier Score. MLP Brier@15s/30s = "
@@ -1696,7 +1837,7 @@ def train_and_evaluate():
             f"GNN = {gnn_results['brier_15s']:.4f} / {gnn_results['brier_30s']:.4f}."
         )
         if gnn_better_or_comparable:
-            print(
+            logger.info(
                 "The GNN is competitive with or better than the (now genuinely healthy) MLP at "
                 "this scale, using IDENTICAL hyperparameters for both -- real, if still "
                 "single-run, evidence in favor of graph representations for RQ4. Given this "
@@ -1705,15 +1846,84 @@ def train_and_evaluate():
                 "with the README's framing of RQs as working hypotheses."
             )
         else:
-            print(
+            logger.info(
                 "The MLP outperforms the GNN even with both confirmed healthy and using identical "
                 "hyperparameters -- RQ4's answer here leans toward the handcrafted scalar "
                 "features, though still hedged given how often this exact comparison has moved "
                 "across milestones as data scale and stabilization changed."
             )
 
-    print(f"\nMLflow experiment: {MLFLOW_EXPERIMENT_NAME}")
-    print("Run `mlflow ui` from the project root to inspect results visually.")
+    logger.info(f"\nMLflow experiment: {MLFLOW_EXPERIMENT_NAME}")
+    logger.info("Run `mlflow ui` from the project root to inspect results visually.")
+
+
+def train_and_evaluate():
+    """Milestone 7/8/9/10/10B/12/14/14B/21/23/35 end-to-end orchestrator --
+    decomposed (engineering-review action item, elevated above its
+    originally-suggested medium-term priority) into the named sub-steps
+    above, following the SAME pure-function extraction pattern ADR-010
+    already established for the four instability-detector signals. This
+    function's own job is now just SEQUENCING those steps in the exact
+    order the pre-decomposition inline version executed them -- critical
+    for determinism, since several steps consume global torch RNG state
+    (each explicitly RESETS it via `torch.manual_seed` immediately before
+    its own model construction, rather than relying on accumulated state
+    from whatever ran before it), and Python function calls execute in
+    the order they're CALLED, not defined -- so preserving call order
+    here is what keeps every result bit-for-bit identical to before this
+    decomposition, not just "the same code" in isolation.
+    """
+    torch.manual_seed(RANDOM_SEED)
+
+    loaded = _load_and_split_dataset()
+    dataset = loaded["dataset"]
+    train_set = loaded["train_set"]
+    val_set = loaded["val_set"]
+    n_train = loaded["n_train"]
+    n_val = loaded["n_val"]
+    match_ids = loaded["match_ids"]
+    dataset_size = loaded["dataset_size"]
+    competition_season_summary = loaded["competition_season_summary"]
+
+    feature_mean, feature_std, graph_feature_mean, graph_feature_std = _compute_normalization_stats(
+        dataset, train_set
+    )
+
+    train_loader = DataLoader(
+        train_set,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        generator=torch.Generator().manual_seed(RANDOM_SEED),
+    )
+    val_batch = next(iter(DataLoader(val_set, batch_size=len(val_set))))
+
+    mlflow.set_tracking_uri("file:./mlruns")
+    mlflow.set_experiment(MLFLOW_EXPERIMENT_NAME)
+
+    mlp_seed_results = _run_mlp_stabilization_and_robustness_check(
+        train_loader, val_batch, n_train, n_val, match_ids, dataset_size,
+        competition_season_summary, feature_mean, feature_std,
+    )
+
+    gnn_results = _run_gnn_stage(
+        train_loader, val_batch, n_train, n_val, match_ids, dataset_size,
+        competition_season_summary, graph_feature_mean, graph_feature_std,
+    )
+
+    deep_ensemble_results = _run_deep_ensemble_stage(
+        train_loader, val_batch, n_train, n_val, match_ids, dataset_size,
+        feature_mean, feature_std,
+    )
+
+    habit_mlp_results, habit_diagnostics = _run_habit_blended_stage(
+        loaded["frames"], loaded["chains"], loaded["sample_match_ids"], match_ids,
+        train_set, val_set, n_train, n_val, dataset_size, competition_season_summary,
+        deep_ensemble_results,
+    )
+
+    _report_run_summary_and_rq4_conclusion(
+        mlp_seed_results, gnn_results, dataset_size, n_train, n_val,
+    )
 
 
 def run_match_level_split_mlp_smoke_test() -> dict | None:
@@ -1750,7 +1960,7 @@ def run_match_level_split_mlp_smoke_test() -> dict | None:
     competition_season_summary = ",".join(
         f"{c['competition_id']}:{c['season_id']}" for c in qualifying_competitions
     )
-    print(
+    logger.info(
         f"\n[Milestone 35 smoke test] {dataset_size} samples across {len(match_ids)} matches "
         "(same data-fetch path as train_and_evaluate(); only the split mechanism and which "
         "model gets trained differ)."
@@ -1764,7 +1974,7 @@ def run_match_level_split_mlp_smoke_test() -> dict | None:
     train_set = Subset(dataset, train_indices)
     val_set = Subset(dataset, val_indices)
     n_train, n_val = len(train_set), len(val_set)
-    print(
+    logger.info(
         f"[Milestone 35 smoke test] resulting sample-level ratio: {n_train} train / {n_val} val "
         f"({n_train / (n_train + n_val):.1%} / {n_val / (n_train + n_val):.1%})"
     )
@@ -1829,17 +2039,17 @@ def run_match_level_split_mlp_smoke_test() -> dict | None:
         },
     )
 
-    print("\n=== Milestone 35 (ADR-011): match-level-split MLP result ===")
+    logger.info("\n=== Milestone 35 (ADR-011): match-level-split MLP result ===")
     if results is None:
-        print("MLP (match-level split): training ABORTED (NaN/Inf loss).")
+        logger.warning("MLP (match-level split): training ABORTED (NaN/Inf loss).")
     else:
-        print(
+        logger.info(
             "MLP (match-level split) -- INFORMATIONAL ONLY, NOT directly comparable to Milestone "
             f"14B's sample-level baseline (Brier@15s/30s = {MILESTONE_14B_MLP_BRIER_15S:.4f} / "
             f"{MILESTONE_14B_MLP_BRIER_30S:.4f}, run_id={MILESTONE_14B_MLP_RUN_ID}):"
         )
-        print(f"  Brier@15s = {results['brier_15s']:.4f}, Brier@30s = {results['brier_30s']:.4f}")
-        print(
+        logger.info(f"  Brier@15s = {results['brier_15s']:.4f}, Brier@30s = {results['brier_30s']:.4f}")
+        logger.info(
             f"  instability warnings -- spike: {results['spike_fired']}, cumulative_drift: "
             f"{results['cumulative_drift_fired']}, saturation: {results['saturation_fired']}, "
             f"frozen_val_loss: {results['frozen_val_loss_fired']}"
@@ -1848,4 +2058,10 @@ def run_match_level_split_mlp_smoke_test() -> dict | None:
 
 
 if __name__ == "__main__":
+    # Only configured here, for this file's own standalone entrypoint --
+    # see the module-level `logger` declaration's comment for why this must
+    # never run at import time. Plain single-line format, stdout -- matches
+    # this file's previous print()-based output closely enough that
+    # existing habits (piping to a file, grepping for "WARNING") still work.
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
     train_and_evaluate()

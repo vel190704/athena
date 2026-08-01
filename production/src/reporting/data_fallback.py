@@ -69,8 +69,12 @@ def find_or_fetch_team_matches(
     given `(competition_id, season_id)` pairs if provided.
 
     Returns one dict per match found: `match_id`, `competition_id`,
-    `season_id`, `competition_name`, `season_name`, `opponent`. Every
-    returned `match_id` is immediately usable as-is in
+    `season_id`, `competition_name`, `season_name`, `opponent`, `has_360`
+    (from that match's own `match_status_360` field, NOT the season-level
+    `match_available_360` flag on `competitions.json` -- the same
+    distinction `team_comparison.py`'s `_resolve_team_season_matches`
+    already draws, reused here for consistency). Every returned
+    `match_id` is immediately usable as-is in
     `generate_team_report(team_name, match_ids)` -- no further
     transformation needed.
     """
@@ -94,6 +98,7 @@ def find_or_fetch_team_matches(
                 "competition_name": comp_name,
                 "season_name": season_name,
                 "opponent": away if home == team_name else home,
+                "has_360": m.get("match_status_360") == "available",
             })
     return found
 
@@ -115,7 +120,9 @@ def find_or_fetch_player_matches(
 
     Returns one dict per match where `player_id` has at least one tagged
     event: `match_id`, `competition_id`, `season_id`, `competition_name`,
-    `season_name`. Every returned `match_id` is immediately usable in
+    `season_name`, `has_360` (see `find_or_fetch_team_matches`'s
+    docstring for why this is the per-match field, not the season-level
+    flag). Every returned `match_id` is immediately usable in
     `generate_player_report(player_id, match_ids)`.
     """
     pairs = _all_competition_season_pairs()
@@ -131,10 +138,13 @@ def find_or_fetch_player_matches(
             away = m["away_team"]["away_team_name"]
             if candidate_team_names is not None and home not in candidate_team_names and away not in candidate_team_names:
                 continue
-            candidate_matches.append((m["match_id"], comp_id, season_id, comp_name, season_name))
+            candidate_matches.append((
+                m["match_id"], comp_id, season_id, comp_name, season_name,
+                m.get("match_status_360") == "available",
+            ))
 
     found = []
-    for match_id, comp_id, season_id, comp_name, season_name in candidate_matches:
+    for match_id, comp_id, season_id, comp_name, season_name, has_360 in candidate_matches:
         events = fetch_match_events(match_id)
         if events is None:
             continue
@@ -145,5 +155,6 @@ def find_or_fetch_player_matches(
                 "season_id": season_id,
                 "competition_name": comp_name,
                 "season_name": season_name,
+                "has_360": has_360,
             })
     return found

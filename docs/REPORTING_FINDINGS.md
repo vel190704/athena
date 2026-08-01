@@ -553,3 +553,121 @@ Both Step-2 requirements confirmed on real data: the low-sample flag
 fires correctly for the thin side, and the caveat is a first-class,
 visible field on the comparison itself — never just a code-level flag a
 caller could silently ignore.
+
+## 10. Individual Player-Era Style Comparison — Enabled by the Data-Fallback Coverage Expansion
+
+### 10.1 What made this possible: `data_fallback.py`
+
+Every reporting tool through §9 required the caller to already know
+which real StatsBomb `match_id`s to pass in. A new module,
+`production/src/reporting/data_fallback.py`
+(`find_or_fetch_team_matches`/`find_or_fetch_player_matches`), removes
+that requirement: given a team name, or a player_id (optionally
+narrowed by candidate team names), it searches every competition/season
+in the LIVE `competitions.json` index — never a hardcoded list — and
+fetches/caches whatever match-lists or event files aren't already
+local. This had been discussed/planned earlier in this project's
+history but never actually written into any file; confirmed by an
+exhaustive codebase search before it was built.
+
+Run against Lionel Messi's full real career (`player_id=5503`, searched
+across 48 real competition-seasons — all 18 StatsBomb-covered La Liga
+seasons, both his Ligue 1 PSG seasons, 3 Champions League seasons, Copa
+América 2024, and the 2018/2022 World Cups): **596 total real matches
+found, 588 of them new** beyond the 8 previously cached. The local
+StatsBomb cache grew from 339 to 1,011 files (224 to 830 event files)
+as a direct, measured result — see the standalone coverage-expansion
+report for the full before/after breakdown, including the honest
+negative findings along the way (Bayern Munich's real 2015/16 Bundesliga
+release only covers 2 matches, not a full season; West Germany does not
+appear in the World Cup 1990 release at all — only Argentina v. Brazil
+does).
+
+### 10.2 `player_comparison.py`: design
+
+A new tool, `production/src/reporting/player_comparison.py`
+(`compare_player_seasons`/`compare_player_across_eras`), mirrors
+`team_comparison.py`'s proven design for individual players instead of
+teams — reusing `generate_player_report` (unmodified), `data_fallback.py`
+for match resolution, and `team_comparison.py`'s own `_zone_shares`/
+`_season_start_year` helpers directly rather than reimplementing them a
+second time.
+
+**One real architectural difference from `team_comparison.py`, stated
+plainly:** `team_comparison.py` has two genuinely different analysis
+modes because `generate_team_report` itself branches on 360
+availability. `generate_player_report` does not — it never calls
+`fetch_match_360` or `BiomechanicalPitchControl`, only
+`fetch_match_events` and `habit_memory.generate_player_heatmap`. So
+`player_comparison.py` has exactly ONE real mode (event-location/heatmap
+based). It still checks 360 availability per season and reports a
+`pitch_control_diagnostic` — but honestly labeled as informational only
+("would a future pitch-control-level comparison be possible in
+principle"), never presented as a real second mode the underlying reused
+function doesn't actually have.
+
+**Positional role diff, kept as its own explicit section, separate from
+the spatial zone diff:** the one thing genuinely specific to comparing a
+player (not a team) across eras — their tagged on-pitch role can itself
+change. `generate_player_report`'s existing `positional_distribution`
+field is diffed directly for this.
+
+**Data richness:** reuses `habit_memory.MIN_HISTORICAL_EVENTS` directly
+as `LOW_SAMPLE_EVENT_COUNT_THRESHOLD` — the same threshold
+`player_report.py`/`player_visualizer.py` already use for this exact
+signal (Milestone 44's discipline), not a new number.
+
+### 10.3 Real findings — Messi, three real career eras
+
+All three eras (2006-07: 26 matches/4,665 events; 2014-15: 39
+matches/9,988 events; 2022-23: 39 matches/8,864 events) confirmed
+well-supported before being compared — no low-sample flag fired
+anywhere.
+
+**2006-07 (early Barcelona) vs. 2014-15 (peak Barcelona).** Positional
+distribution, 2006-07: `Right Wing 73.7%, Left Wing 17.6%, Center
+Forward 6.4%, Right Center Forward 1.6%, Right Midfield 0.7%`. 2014-15:
+`Right Wing 68.7%, Center Forward 28.7%, Right Center Forward 1.8%, Left
+Center Forward 0.8%`. **Not the clean "winger → false-9" story a prior
+assumption might have predicted**: Right Wing remained his single
+largest tagged role in both eras. What actually shifted, and by the
+largest margin (+22.3 percentage points), was Center Forward involvement
+nearly quadrupling (6.4% → 28.7%) — a real role-broadening, not a full
+positional switch. Spatial activity moved modestly toward the attacking
+third (40.0% → 45.6%, 1.1x) and the left half (30.9% → 35.4%).
+
+**2014-15 (peak Barcelona) vs. 2022-23 (PSG).** Positional distribution,
+2014-15: as above. 2022-23: `Right Center Forward 53.9%, Right Attacking
+Midfield 20.8%, Right Wing 10.8%, Center Forward 9.4%, Center Attacking
+Midfield 5.1%`. **The largest single shift across either comparison:**
+Right Wing collapsed 68.7% → 10.8% (−57.9 percentage points), and an
+entirely new role — Right Attacking Midfield (20.8%) — appears with zero
+presence in 2014-15. **A genuine cross-check, not a repeated signal:**
+the independent spatial heatmap diff (computed from raw event
+coordinates, never from the position tags) tells the identical real
+story — middle-third share rose 53.2% → 59.3% while attacking-third
+share *fell* 45.6% → 37.9%, and left-half share rose 35.4% → 45.4%,
+consistent with a deeper, more central, withdrawn creative role at PSG
+versus peak-Barcelona's advanced wide/central threat. Two independently
+computed signals agreeing on the same conclusion is real, meaningful
+confirmation, not one metric assumed to match the other.
+
+**One honest, correctly-handled edge case:** the 2022-23 season's 39
+matches are ALL 360-covered (32 Ligue 1 + 7 World Cup 2022 matches, both
+fully 360-covered competitions) — yet `pitch_control_possible_in_principle`
+still correctly reports `false` for the 2014-15-vs-2022-23 comparison,
+since 2014-15 has zero 360 matches and the diagnostic requires both
+sides. Exactly the informational-only behavior the design calls for, not
+a missed opportunity to do more than `generate_player_report` actually
+supports.
+
+### 10.4 Why this is worth naming plainly
+
+This is the first genuine multi-era "how has an individual's style
+evolved" analysis in this project, made possible specifically by §10.1's
+coverage expansion — not a mock, not a single hardcoded example, but
+real evidence, from real event data, of how one player's actual tagged
+role and spatial behavior changed across three real, well-supported
+points in a real career, with two independently computed signals
+agreeing on the underlying story rather than one being assumed to
+confirm the other.
