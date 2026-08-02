@@ -2294,6 +2294,266 @@ def run_ci_bootstrap_training() -> None:
     logger.info("[CI bootstrap] Complete -- mlruns/ now has a real, tagged MLP and Deep Ensemble run.")
 
 
+# Genuine research re-run (NOT CI infrastructure -- do not confuse with
+# run_ci_bootstrap_training() above, which trains on a tiny fixed 4-match
+# slice purely so tests have a real MLflow run to load). ADR-011 (Milestone
+# 35) switched _load_and_split_dataset() to match_level_split
+# UNCONDITIONALLY, but explicitly deferred actually re-running the RQ2/RQ4
+# comparisons under it: "this milestone deliberately does NOT re-run the
+# full comparison suite under the new split... legitimate, separate future
+# work, not performed here." This function is that future work, finally
+# executed, at the SAME full multi-competition scale Milestone 14B used.
+#
+# Reference numbers below are Milestone 14B's SAMPLE-LEVEL-split results
+# (RESEARCH_FINDINGS.md's RQ4 table / Milestone 23's RQ2 section) -- kept
+# here as literal constants (not previously named in this file for the
+# GNN/habit-blended cases) purely as REFERENCE POINTS for this run's
+# comparison tables. They are NOT overwritten, recomputed, or treated as
+# invalidated by this run -- see this function's own docstring.
+MILESTONE_14B_GNN_RUN_ID = "b8565e5b4b2c4512b998bccbb39d64db"
+MILESTONE_14B_GNN_BRIER_15S = 0.1141
+MILESTONE_14B_GNN_BRIER_30S = 0.1932
+MILESTONE_23_HABIT_MLP_RUN_ID = "671fb22ed0334f34a6a74059d1a17a4e"
+MILESTONE_23_HABIT_MLP_BRIER_15S = 0.0950
+MILESTONE_23_HABIT_MLP_BRIER_30S = 0.1601
+MILESTONE_23_TRAINING_MATCH_COUNT = 4
+MILESTONE_23_COLD_START_FALLBACK_RATE = 0.68  # 5,495 of 8,070 samples with a known actor
+
+
+def run_match_level_rq2_rq4_full_revalidation() -> dict:
+    """RQ2 (habit-blended MLP) and RQ4 (GNN vs. MLP) re-validation under
+    Milestone 35/ADR-011's match-level split, at FULL research scale (the
+    same ~55-match, 12-competition dataset Milestone 14B/23 used) -- not
+    the single MLP-only smoke test Milestone 35 itself ran, and not the
+    tiny CI bootstrap.
+
+    Composes ALREADY-VALIDATED sub-functions in the SAME sequence
+    `train_and_evaluate()` uses for its own MLP/GNN/habit-blended stages --
+    none of `_load_and_split_dataset`, `_compute_normalization_stats`,
+    `_run_mlp_stabilization_and_robustness_check`, `_run_gnn_stage`,
+    `_evaluate_mlp_health`, `_build_habit_blended_features` (called inside
+    `_run_habit_blended_stage`), or `_run_habit_blended_stage` itself is
+    modified here. The one real, deliberate difference from
+    `train_and_evaluate()`: THIS function gates Step 3 (the habit-blended
+    re-run) behind BOTH the MLP's `_evaluate_mlp_health` result AND the
+    GNN's own four-signal detector -- `train_and_evaluate()` runs its Deep
+    Ensemble and habit-blended stages unconditionally and only evaluates
+    health in its final summary, which is the wrong order for a task that
+    explicitly must not build a habit-memory re-run on an unconfirmed
+    foundation. Also deliberately skips the Deep Ensemble stage entirely
+    (not requested here, and `_run_habit_blended_stage`'s
+    `deep_ensemble_results` parameter is only used to print one extra
+    comparison row -- `None` is a safe, real, supported input, not a
+    workaround).
+
+    Returns a dict of every real result (never silently dropped, even on
+    a failed health gate) for the caller to build its own final report
+    from -- this function prints its own tables/conclusions to the log as
+    it goes, but the caller is expected to do its own synthesis on top of
+    the returned dict, not parse log output.
+    """
+    torch.manual_seed(RANDOM_SEED)
+
+    logger.info("\n" + "=" * 80)
+    logger.info("STEP 1: full-scale dataset + match-level split (ADR-011)")
+    logger.info("=" * 80)
+    loaded = _load_and_split_dataset()
+    dataset = loaded["dataset"]
+    train_set = loaded["train_set"]
+    val_set = loaded["val_set"]
+    n_train = loaded["n_train"]
+    n_val = loaded["n_val"]
+    match_ids = loaded["match_ids"]
+    sample_match_ids = loaded["sample_match_ids"]
+    dataset_size = loaded["dataset_size"]
+    competition_season_summary = loaded["competition_season_summary"]
+
+    # Early, Step-1-scoped corpus-size report -- a plain set computation,
+    # the SAME one _build_habit_blended_features performs internally
+    # (Step 3 re-confirms it from the real habit-diagnostics dict below;
+    # this is not a second, independently-fallible computation, just an
+    # earlier look at the same partition already fixed by the split above).
+    val_match_ids_preview = {sample_match_ids[i] for i in val_set.indices}
+    training_match_ids_preview = sorted(set(match_ids) - val_match_ids_preview)
+    logger.info(
+        f"\n[Step 1] {len(match_ids)} total matches, {dataset_size} total samples. Match-level "
+        f"split: {len(training_match_ids_preview)} training-bucket-eligible matches / "
+        f"{len(val_match_ids_preview)} validation matches (Milestone 23's original sample-level "
+        f"corpus, for reference: {MILESTONE_23_TRAINING_MATCH_COUNT} matches)."
+    )
+    logger.info(
+        f"[Step 1] Sample-level split from the SAME match partition: {n_train} train / {n_val} val "
+        f"({n_train / dataset_size:.1%} / {n_val / dataset_size:.1%} of {dataset_size} total -- "
+        "NOT forced to a round percentage, see match_level_split's own report above)."
+    )
+
+    feature_mean, feature_std, graph_feature_mean, graph_feature_std = _compute_normalization_stats(
+        dataset, train_set
+    )
+
+    train_loader = DataLoader(
+        train_set,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        generator=torch.Generator().manual_seed(RANDOM_SEED),
+    )
+    val_batch = next(iter(DataLoader(val_set, batch_size=len(val_set))))
+
+    mlflow.set_tracking_uri("file:./mlruns")
+    mlflow.set_experiment(MLFLOW_EXPERIMENT_NAME)
+
+    logger.info("\n" + "=" * 80)
+    logger.info("STEP 2: retrain MLP (no habit blending) + GNN, matched Milestone 14B hyperparameters")
+    logger.info("=" * 80)
+    mlp_seed_results = _run_mlp_stabilization_and_robustness_check(
+        train_loader, val_batch, n_train, n_val, match_ids, dataset_size,
+        competition_season_summary, feature_mean, feature_std,
+    )
+    gnn_results = _run_gnn_stage(
+        train_loader, val_batch, n_train, n_val, match_ids, dataset_size,
+        competition_season_summary, graph_feature_mean, graph_feature_std,
+    )
+
+    # Reuse train_and_evaluate()'s own summary/RQ4-narrative function
+    # unmodified -- gives the standard warning breakdown and its own
+    # four-way (Milestone 14 / 14B) table for free, in addition to this
+    # function's own explicit, split_type-labeled table below.
+    _report_run_summary_and_rq4_conclusion(mlp_seed_results, gnn_results, dataset_size, n_train, n_val)
+
+    primary_mlp_results = mlp_seed_results[RANDOM_SEED]
+    mlp_healthy = _evaluate_mlp_health(primary_mlp_results)
+    gnn_healthy = gnn_results is not None and not gnn_results["instability_warning_fired"]
+
+    logger.info("\n" + "=" * 80)
+    logger.info("HEALTH GATE (must pass before Step 3 -- the RQ2 habit-memory re-run)")
+    logger.info("=" * 80)
+    if primary_mlp_results is not None:
+        logger.info(
+            f"MLP (seed={RANDOM_SEED}) four-signal detector: spike={primary_mlp_results['spike_fired']}, "
+            f"cumulative_drift={primary_mlp_results['cumulative_drift_fired']}, "
+            f"saturation={primary_mlp_results['saturation_fired']} (entropy/variance-based -- "
+            f"ADR-010's primary trusted signal for ambiguous cases), "
+            f"frozen_val_loss={primary_mlp_results['frozen_val_loss_fired']} -> mlp_healthy={mlp_healthy}"
+        )
+    else:
+        logger.warning(f"MLP (seed={RANDOM_SEED}): training ABORTED (NaN/Inf loss) -> mlp_healthy=False")
+    if gnn_results is not None:
+        logger.info(
+            f"GNN four-signal detector: spike={gnn_results['spike_fired']}, "
+            f"cumulative_drift={gnn_results['cumulative_drift_fired']}, "
+            f"saturation={gnn_results['saturation_fired']} (entropy/variance-based), "
+            f"frozen_val_loss={gnn_results['frozen_val_loss_fired']} -> gnn_healthy={gnn_healthy}"
+        )
+    else:
+        logger.warning("GNN: training ABORTED (NaN/Inf loss) -> gnn_healthy=False")
+
+    result = {
+        "dataset_size": dataset_size,
+        "n_train": n_train,
+        "n_val": n_val,
+        "match_count": len(match_ids),
+        "training_match_count_preview": len(training_match_ids_preview),
+        "val_match_count_preview": len(val_match_ids_preview),
+        "mlp_seed_results": mlp_seed_results,
+        "gnn_results": gnn_results,
+        "mlp_healthy": mlp_healthy,
+        "gnn_healthy": gnn_healthy,
+        "gate_passed": mlp_healthy and gnn_healthy,
+        "habit_mlp_results": None,
+        "habit_diagnostics": None,
+    }
+
+    logger.info(
+        "\n" + "=" * 80 + "\nSTEP 2 THREE-WAY COMPARISON -- this run (match_level) vs. Milestone "
+        "14B (sample_level, different methodology, NOT a directly equivalent baseline)\n" + "=" * 80
+    )
+    logger.info(f"{'Model':<50} {'split_type':>13} {'Brier@15s':>10} {'Brier@30s':>10}")
+    logger.info(
+        f"{'MLP (Milestone 14B reference)':<50} {'sample_level':>13} "
+        f"{MILESTONE_14B_MLP_BRIER_15S:>10.4f} {MILESTONE_14B_MLP_BRIER_30S:>10.4f}"
+    )
+    logger.info(
+        f"{'GNN (Milestone 14B reference)':<50} {'sample_level':>13} "
+        f"{MILESTONE_14B_GNN_BRIER_15S:>10.4f} {MILESTONE_14B_GNN_BRIER_30S:>10.4f}"
+    )
+    if primary_mlp_results is not None:
+        logger.info(
+            f"{'MLP (this run, NEW)':<50} {'match_level':>13} "
+            f"{primary_mlp_results['brier_15s']:>10.4f} {primary_mlp_results['brier_30s']:>10.4f}"
+        )
+    else:
+        logger.info(f"{'MLP (this run, NEW)':<50} {'match_level':>13} {'ABORTED':>10} {'ABORTED':>10}")
+    if gnn_results is not None:
+        logger.info(
+            f"{'GNN (this run, NEW)':<50} {'match_level':>13} "
+            f"{gnn_results['brier_15s']:>10.4f} {gnn_results['brier_30s']:>10.4f}"
+        )
+    else:
+        logger.info(f"{'GNN (this run, NEW)':<50} {'match_level':>13} {'ABORTED':>10} {'ABORTED':>10}")
+
+    if not result["gate_passed"]:
+        logger.warning(
+            "\nHEALTH GATE FAILED -- NOT proceeding to Step 3 (habit-memory RQ2 re-run). "
+            f"mlp_healthy={mlp_healthy}, gnn_healthy={gnn_healthy}. Per this task's explicit "
+            "instruction, stopping here rather than building a habit-memory re-run on top of an "
+            "unconfirmed MLP/GNN foundation."
+        )
+        return result
+
+    logger.info("\nHealth gate PASSED (mlp_healthy=True, gnn_healthy=True) -- proceeding to Step 3.")
+
+    logger.info("\n" + "=" * 80)
+    logger.info("STEP 3: habit-blended MLP re-run (RQ2) under match-level split, enlarged corpus")
+    logger.info("=" * 80)
+    habit_mlp_results, habit_diagnostics = _run_habit_blended_stage(
+        loaded["frames"], loaded["chains"], sample_match_ids, match_ids,
+        train_set, val_set, n_train, n_val, dataset_size, competition_season_summary,
+        None,  # deep_ensemble_results -- this re-run deliberately does not train a Deep Ensemble
+    )
+    result["habit_mlp_results"] = habit_mlp_results
+    result["habit_diagnostics"] = habit_diagnostics
+
+    if habit_diagnostics is not None:
+        known_actor = habit_diagnostics["samples_with_known_actor"]
+        cold_start_rate = habit_diagnostics["cold_start_count"] / known_actor if known_actor > 0 else float("nan")
+        logger.info(
+            f"\n[Step 3] Training-bucket corpus: {habit_diagnostics['training_match_count']} matches "
+            f"(Milestone 23's original sample-level corpus: {MILESTONE_23_TRAINING_MATCH_COUNT} matches)."
+        )
+        logger.info(
+            f"[Step 3] Cold-start fallback rate: {habit_diagnostics['cold_start_count']}/{known_actor} "
+            f"samples with a known actor ({cold_start_rate:.1%}) (Milestone 23's original rate: "
+            f"{MILESTONE_23_COLD_START_FALLBACK_RATE:.0%})."
+        )
+
+    logger.info(
+        "\n" + "=" * 80 + "\nSTEP 3 COMPARISON -- habit-blended MLP (this run) vs. this run's own "
+        "non-blended baseline (apples-to-apples) vs. Milestone 23 (sample_level, different "
+        "methodology)\n" + "=" * 80
+    )
+    logger.info(f"{'Model':<50} {'split_type':>13} {'corpus':>7} {'Brier@15s':>10} {'Brier@30s':>10}")
+    if primary_mlp_results is not None:
+        logger.info(
+            f"{'MLP, no blending (this run, same split)':<50} {'match_level':>13} {'n/a':>7} "
+            f"{primary_mlp_results['brier_15s']:>10.4f} {primary_mlp_results['brier_30s']:>10.4f}"
+        )
+    if habit_mlp_results is not None:
+        logger.info(
+            f"{'MLP, habit blending (this run, NEW)':<50} {'match_level':>13} "
+            f"{habit_diagnostics['training_match_count']:>7} "
+            f"{habit_mlp_results['brier_15s']:>10.4f} {habit_mlp_results['brier_30s']:>10.4f}"
+        )
+    else:
+        logger.info(f"{'MLP, habit blending (this run, NEW)':<50} {'match_level':>13} {'--':>7} {'ABORTED':>10} {'ABORTED':>10}")
+    logger.info(
+        f"{'MLP, habit blending (Milestone 23 reference)':<50} {'sample_level':>13} "
+        f"{MILESTONE_23_TRAINING_MATCH_COUNT:>7} "
+        f"{MILESTONE_23_HABIT_MLP_BRIER_15S:>10.4f} {MILESTONE_23_HABIT_MLP_BRIER_30S:>10.4f}"
+    )
+
+    return result
+
+
 if __name__ == "__main__":
     # Only configured here, for this file's own standalone entrypoint --
     # see the module-level `logger` declaration's comment for why this must
@@ -2303,5 +2563,7 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     if "--ci-bootstrap" in sys.argv:
         run_ci_bootstrap_training()
+    elif "--rq2-rq4-revalidation" in sys.argv:
+        run_match_level_rq2_rq4_full_revalidation()
     else:
         train_and_evaluate()

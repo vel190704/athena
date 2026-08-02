@@ -54,8 +54,12 @@ validation smoke test (the seed=42 stabilized MLP, Milestone 14B's exact
 hyperparameters, retrained under the new match-level split) is logged in MLflow tagged
 `split_type="match_level"` for the record, explicitly NOT as a new headline number; every
 pre-existing run remains implicitly `split_type="sample_level"`. Re-running RQ2 and RQ4's
-full comparisons under match-level splitting is legitimate, separate future work (see
-Future Work §6), not performed as part of this update.
+full comparisons under match-level splitting was, at the time this paragraph was
+originally written, legitimate, separate future work. **That re-run has since been
+performed** (full research scale, matched hyperparameters, health-gated) — see the
+"Update" subsections appended to RQ2 and RQ4 below. This paragraph is left otherwise
+unedited as a record of what was and wasn't known at the time; the new evidence is
+appended, not backfilled into this paragraph's original wording.
 
 ---
 
@@ -139,6 +143,71 @@ be read as a null result for this specific, heavily limited implementation — n
 general verdict on Bayesian habit memory. See Future Work §6 for what a fairer test would
 require.
 
+**Update — full re-validation under the match-level split (ADR-011), APPENDED, not
+superseding the finding above.** Milestone 35 (ADR-011) fixed the sample-level-split
+methodology that starved this RQ's original training-bucket corpus to 4 matches, but
+deliberately did not re-run the comparison itself — "legitimate, separate future work,
+not performed here." That re-run has now been executed, at full research scale (the same
+~55-match, 12-competition, 8,074-sample dataset used above), reusing every already-
+validated sub-function unmodified (`_load_and_split_dataset`, `_run_mlp_stabilization_and_robustness_check`,
+`_run_gnn_stage`, `_build_habit_blended_features`, `_run_habit_blended_stage` — see
+`run_match_level_rq2_rq4_full_revalidation()` in `train.py`). **This is one additional
+data point under a corrected methodology — it does not retroactively invalidate the
+result above, which remains an accurate statement about what was found under sample-level
+splitting.**
+
+*Match-level split (seed=42):* 42 training matches / 10 validation matches → 6,642 train
+/ 1,432 validation samples (82.3% / 17.7%, not forced to a round percentage — see
+`match_level_split`'s own report). The habit-memory training-bucket corpus itself is
+**45 matches**, slightly larger than the 42 training-split matches: `_build_habit_blended_features`
+also credits the 3 matches that were pooled but yielded zero 360-covered chains (no
+training *samples*) with their real raw event data for other players' historical
+heatmaps — a real, correct property of the existing code, not a discrepancy.
+
+*Health gate (both models confirmed genuinely healthy before proceeding):* the
+stabilized MLP (seed=42, matched Milestone 14B hyperparameters: lr=1e-4, grad clipping,
+weight_decay=1e-4, 50 epochs) and the GNN both cleared all four ADR-010 instability
+signals (spike, cumulative drift, saturation/entropy, frozen-val-loss — every one
+`False`) and the MLP's Brier-sanity check. A seed=43 MLP robustness check
+(Brier@15s/30s = 0.1002/0.1864) confirmed seed=42's result (0.1009/0.1873) was not a
+one-off. Non-blended MLP baseline this run: **Brier@15s = 0.1009, Brier@30s = 0.1873**.
+
+*Cold-start fallback rate, the figure this re-run exists to fix:* **2,164 of 8,070
+samples with a known actor (26.8%)** fell back to the uniform cold-start prior — down
+sharply from the original **68%** (5,495/8,070) at the 4-match corpus. The corpus-size
+problem ADR-011 set out to fix is real and substantially fixed.
+
+*Habit-blended MLP result (match-level, NEW):* **Brier@15s = 0.1017, Brier@30s =
+0.1891** — all four instability signals `False` (genuinely healthy). Compared against
+THIS run's own non-blended baseline (the correct apples-to-apples comparison, same split,
+same hyperparameters): **+0.0008 @15s, +0.0018 @30s — both horizons WORSE**, the
+identical direction as the original Milestone 23 result.
+
+| Comparison | split_type | corpus | Brier@15s | Brier@30s | Δ vs. own non-blended baseline |
+|---|---|---|---|---|---|
+| MLP, habit blending (Milestone 23) | sample_level | 4 matches | 0.0950 | 0.1601 | +0.0008 / +0.0013 (worse) |
+| MLP, habit blending (this run, NEW) | match_level | 45 matches | 0.1017 | 0.1891 | +0.0008 / +0.0018 (worse) |
+
+**This is the notable finding this re-run was designed to surface either way.** The
+delta habit blending imposes on Brier Score is **essentially unchanged** between the
+original 4-match, 68%-cold-start corpus and this run's 45-match, 26.8%-cold-start
+corpus — despite an 11x larger historical corpus and a cold-start rate cut by more than
+half. **This argues against corpus size having been the primary driver of RQ2's original
+null result.** The two scope limitations named alongside the original finding — the
+actor-only blending constraint (only 1 of ~22 visible players' positions is ever
+adjusted) and the chain's representative actor not consistently being the attacking-side
+actor (diluting/scrambling the feature direction the blended signal pushes) — now read as
+the more likely primary explanations, not merely co-listed caveats. This is a single run
+at one corpus size increase, not a dose-response sweep across multiple corpus sizes, so
+this conclusion is itself a hedged, not definitive, updated reading — but it is a real,
+informative result, reported as such rather than assumed away.
+
+**Updated verdict, hedged:** RQ2 remains **not supported**, now under BOTH the original
+constrained-corpus implementation AND a corrected-methodology, ~11x-larger-corpus
+re-run — a more robust null result than either run alone, and one that shifts the most
+likely explanation away from "not enough historical data" toward the actor-only/
+feature-direction limitations named above.
+
 ### RQ3 — Does latent friction estimation improve pass trajectory prediction?
 
 **Question (README):** *"Does latent friction estimation improve pass trajectory
@@ -212,6 +281,44 @@ comparison has already reversed direction twice (Stage 1: MLP wins → Stage 2 a
 measured: GNN "wins" via MLP's silent failure → Stage 2 corrected: MLP wins again), this
 should be treated as the current data point, not a permanently settled architectural
 verdict.
+
+**Update — Stage 3: full re-validation under the match-level split (ADR-011), APPENDED,
+not superseding the finding above.** Same re-run described in RQ2's update above (same
+dataset, same split, same health gate) also retrained the GNN with matched
+hyperparameters, giving RQ4 its first properly-conducted comparison under match-level
+splitting (Milestone 35 itself ran only a single MLP-only smoke test, no GNN). Both
+models cleared all four ADR-010 instability signals before this comparison was trusted.
+
+| Model | split_type | Brier@15s | Brier@30s |
+|---|---|---|---|
+| MLP (Milestone 14B reference) | sample_level | 0.0942 | 0.1588 |
+| GNN (Milestone 14B reference, `b8565e5b4b2c4512b998bccbb39d64db`) | sample_level | 0.1141 | 0.1932 |
+| MLP (this run, NEW) | match_level | 0.1009 | 0.1873 |
+| GNN (this run, NEW) | match_level | 0.1198 | 0.2437 |
+
+**Within this run, the MLP again clearly outperforms the GNN at both horizons** (0.1009
+vs. 0.1198 @15s; 0.1873 vs. 0.2437 @30s) — a third data point favoring the handcrafted
+scalar features, using a cleaner train/val methodology than either prior comparison. A
+second, independent observation worth naming: **both models score worse in absolute
+terms under the match-level split than their sample-level-split references** (MLP +0.0067
+@15s/+0.0285 @30s; GNN +0.0057 @15s/+0.0505 @30s, the GNN degrading noticeably more).
+This is plausibly real signal, not noise: match-level splitting requires generalizing to
+possession chains from MATCHES the model never saw any sample from, whereas sample-level
+splitting let the validation set benefit from the model having already seen other chains
+from the same match's tactical patterns — a harder, arguably more honest test of
+generalization, and the GNN's larger degradation under it is itself a new, notable
+observation about which architecture generalizes better across matches, not just within
+them.
+
+**Updated verdict, hedged (explicitly, per this project's own repeated caution about this
+exact comparison):** the MLP wins again — now under three methodologically distinct
+conditions (Stage 1 single-competition, Stage 2 corrected multi-competition, and this
+match-level-split re-run) — but this comparison has already reversed direction twice
+before in this project's own history, and a third confirming data point is still one
+more data point, not a settled architectural verdict. The GNN's larger relative
+degradation under match-level splitting is a new thread worth investigating on its own
+(e.g., whether the GNN overfits to within-match structure more readily than the MLP),
+not yet explained by anything in this run alone.
 
 ### RQ5 — Can counterfactual simulations predict the tactical effects of substitutions?
 
@@ -443,14 +550,19 @@ Prioritized, not exhaustive:
    independent limitation from the split level itself — see RQ2's Thread scope notes
    above and ADR-011); and (b) actually re-running RQ2's habit-blended MLP and RQ4's
    MLP-vs-GNN comparisons under the new split — Milestone 35 only ran a single MLP smoke
-   test, explicitly not a re-validation campaign. Both re-runs are the natural next step,
-   now that the training-bucket corpus a habit-blending re-run could draw on has grown
-   from 4 matches to as many as 42 (out of ~52 matches contributing any samples) purely
-   as a side effect of this refactor.
-2. **Larger-scale dataset**, for two independent reasons: a fairer RQ4 re-evaluation at a
-   scale less sensitive to any single training run's noise, and — jointly with (1) — a
-   training-bucket corpus for RQ2 larger than the 4 matches Milestone 23 had to work
-   with, which alone likely explains much of that null result.
+   test, explicitly not a re-validation campaign. **Update: both re-runs have since been
+   performed** (full research scale, matched Milestone 14B hyperparameters, health-gated
+   before proceeding) — see the "Update" subsections appended to RQ2 and RQ4 above. The
+   real corpus turned out to be 45 matches, not the ~42 estimated here (see RQ2's update
+   for why). Item (a) above (chronological ordering) remains open and untouched by this
+   re-run.
+2. ~~**Larger-scale dataset**~~ **— substantially addressed for RQ2 by the match-level
+   re-run above** (training-bucket corpus 4 → 45 matches, cold-start rate 68% → 26.8%),
+   though notably this did NOT resolve RQ2's null result the way this item originally
+   speculated it might (see RQ2's update — the null result persisted at nearly the same
+   magnitude, arguing against corpus size as the primary driver). RQ4's fairer
+   re-evaluation at scale remains only partially addressed: this was still a single run,
+   not a repeated/multi-seed campaign at this larger scale.
 3. **True Batch Ensembles** (per ADR-004): the current Deep Ensemble is a valid but ~5x
    parameter/compute alternative. If ensemble inference latency becomes a real
    constraint — most plausibly once uncertainty quantification needs to feed the live
