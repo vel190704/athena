@@ -15,7 +15,10 @@ exists specifically so Captum attributes THAT quantity, not the model's
 raw output.
 """
 
+import asyncio
 import json
+import logging
+import os
 import re
 from functools import partial
 from pathlib import Path
@@ -24,11 +27,52 @@ import mlflow
 import mlflow.pytorch
 import torch
 from captum.attr import IntegratedGradients
+from dotenv import load_dotenv
+from google import genai
+from google.genai import types as genai_types
 
 from production.src.pipeline.survival_dataset import FEATURE_KEYS
 
+# Loads GEMINI_API_KEY (and anything else) from a git-ignored .env file if
+# one exists, same convention as ROBOFLOW_API_KEY (ADR-014) -- called here,
+# at module level, rather than left to whichever caller happens to import
+# this module first (this module is imported by both api.py's live
+# `uvicorn` entrypoint and by reporting/test code, and only the test files
+# could otherwise be relied on to have called this themselves). A no-op if
+# no .env file exists or GEMINI_API_KEY isn't in it.
+load_dotenv()
+
+# Only configured by this file's own callers if they need it; this module
+# itself never calls logging.basicConfig() (would mutate global logging
+# config on import -- the same discipline train.py's module-level logger
+# comment establishes).
+logger = logging.getLogger(__name__)
+
 MLFLOW_EXPERIMENT_NAME = "project-athena-deephit"
 BIN_SIZE_SECONDS = 5.0  # Milestone 6A convention, kept local to avoid a training-pipeline import
+
+# Verified against the real, current Gemini API docs and the google-genai
+# PyPI/GitHub pages immediately before this was written (not recalled from
+# memory -- model names and SDK packages both changed multiple times across
+# this project's own history, e.g. the roboflow/AGPL investigation in
+# ADR-014). As of this check: `google-genai` (PyPI, v2.16.0) is Google's
+# current, GA-recommended SDK -- the older `google-generativeai` package is
+# deprecated and specifically NOT used here. The Gemini model lineup has
+# moved to a Gemini 3 generation since this project's own knowledge cutoff;
+# `gemini-3.5-flash-lite` is the current fastest/most cost-effective
+# Flash-Lite variant (confirmed present on both ai.google.dev's models page
+# and its pricing page), not the older `gemini-2.5-flash-lite` a
+# from-memory guess would have produced. Free-tier RPM/TPM/RPD numbers are
+# NOT published as a static table in the current docs (unlike some older
+# API generations) -- Google's own docs direct users to their account's
+# live AI Studio dashboard for exact figures, so no specific quota number
+# is hardcoded or assumed here; the spike-triggered (not per-frame) calling
+# pattern this project already uses (ADR-006) keeps real call volume low
+# regardless of the exact figure.
+GEMINI_MODEL_ID = "gemini-3.5-flash-lite"
+GEMINI_TIMEOUT_SECONDS = 10.0
+GEMINI_MAX_OUTPUT_TOKENS = 200
+GEMINI_TEMPERATURE = 0.3  # low, deliberately -- a grounded explanation task, not creative writing
 
 
 def select_deterministic_mlp_run_id() -> str:
@@ -245,3 +289,138 @@ async def generate_explanation(prompt: str) -> str:
         f"Key drivers: {driver_text}. "
         f"Mitigating factors: {mitigator_text}."
     )
+
+
+# =============================================================================
+# ADR-006 Update: real Gemini Flash-Lite integration (see that ADR's own
+# "Update" section for the full decision). ADDITIVE ONLY -- `generate_explanation`
+# above is UNCHANGED and remains the permanent, deterministic fallback and
+# the default test-time executor; both existing test files call it directly
+# to unit-test its own parsing logic, which must keep working identically
+# regardless of whether a real API key happens to be present in this
+# environment.
+# =============================================================================
+
+# A REAL LLM, unlike the deterministic mock above, can plausibly hallucinate
+# exactly the kind of unsupported claim Milestone 43's zone-explainer
+# (`zone_explainer.build_zone_explanation_prompt`) already proved this
+# project's data cannot support -- no frame-to-frame trajectory analysis or
+# player-movement computation exists anywhere in this project (see
+# REPORTING_FINDINGS.md Section 4). Sent via the SDK's own `system_instruction`
+# channel (not string-concatenated into the user prompt), so it applies
+# uniformly to BOTH `build_tactical_prompt`'s output (Milestone 15, which has
+# no such constraint built into its own text) and
+# `build_zone_explanation_prompt`'s output (Milestone 43, which already
+# states a version of this constraint inline, as defense in depth, not as a
+# substitute for this one) -- and so neither existing, already-tested
+# prompt-builder function needs to change to get this protection.
+_HONESTY_SYSTEM_INSTRUCTION = (
+    "You are a tactical explanation generator for a live football analytics system. "
+    "You explain an ALREADY-COMPUTED model prediction; you never make your own prediction. "
+    "Follow these rules strictly:\n"
+    "1. Only describe what is explicitly present in the data provided in the user message "
+    "(the predicted threat percentage and the named factors with their signed attribution "
+    "magnitudes).\n"
+    "2. Never state or imply a timing, duration, or speed claim (for example: 'for the next "
+    "few seconds', 'briefly', 'quickly', 'soon') -- this system computes no such quantity "
+    "anywhere, for any feature.\n"
+    "3. Never state or imply a specific player movement, positioning change, or recovery "
+    "direction (for example: 'the defender is recovering', 'players are shifting left', "
+    "'closing down') -- this system computes no player-level trajectory or movement data "
+    "anywhere.\n"
+    "4. If you are not certain a specific detail is directly supported by the data provided, "
+    "omit it rather than guess or embellish.\n"
+    "5. Keep the response to 2-3 concise sentences."
+)
+
+
+def _safe_error_text(exc: BaseException) -> str:
+    """`str(exc)`, with the real `GEMINI_API_KEY` value masked out if
+    present. Defensive, not reactive -- no known google-genai error
+    message actually echoes the key back, but this project's "never log,
+    print, or write the key anywhere, including in error messages" rule
+    (same discipline as `ROBOFLOW_API_KEY`/`SOCCERNET_PASSWORD`) is
+    absolute, not conditional on today's SDK behavior staying the same.
+    """
+    text = str(exc)
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if api_key and api_key in text:
+        text = text.replace(api_key, "***REDACTED***")
+    return text
+
+
+async def generate_explanation_real(prompt: str) -> str:
+    """Real Gemini Flash-Lite call (`google-genai`'s native async client --
+    `client.aio.models.generate_content`, not a sync call wrapped in
+    `asyncio.to_thread`, since an awaitable version already exists; the
+    `asyncio.to_thread` pattern this project established at Milestone 16 is
+    for genuinely synchronous SDKs, e.g. Captum in `_build_alert_prompt_sync`,
+    not a substitute demanded everywhere regardless of what a library
+    actually offers).
+
+    Deliberately raises on ANY failure (timeout, API error, empty/malformed
+    response) rather than catching anything itself -- see
+    `generate_tactical_explanation` for the fallback-to-mock behavior. This
+    split keeps this function directly, cleanly testable in isolation (e.g.
+    simulating an invalid key and asserting it raises) without conflating
+    "did the real call fail" with "did the fallback correctly kick in" in
+    one function's control flow.
+    """
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY is not set.")
+
+    client = genai.Client(api_key=api_key)
+    response = await asyncio.wait_for(
+        client.aio.models.generate_content(
+            model=GEMINI_MODEL_ID,
+            contents=prompt,
+            config=genai_types.GenerateContentConfig(
+                system_instruction=_HONESTY_SYSTEM_INSTRUCTION,
+                max_output_tokens=GEMINI_MAX_OUTPUT_TOKENS,
+                temperature=GEMINI_TEMPERATURE,
+            ),
+        ),
+        timeout=GEMINI_TIMEOUT_SECONDS,
+    )
+
+    text = response.text
+    if not text or not text.strip():
+        raise RuntimeError("Gemini returned an empty/malformed response (no text content).")
+    return text.strip()
+
+
+async def generate_tactical_explanation(prompt: str) -> str:
+    """Public entrypoint call sites (the WebSocket spike-alert pipeline in
+    `api.py`, the zone-level reporting flow in `zone_explainer.py`) should
+    use going forward -- internally decides real-vs-mock so no call site
+    needs to know or care which executor is active. `generate_explanation`
+    (the mock) is never removed and stays directly callable on its own.
+
+    Real Gemini is attempted ONLY if `GEMINI_API_KEY` is set (checked here,
+    not inside `generate_explanation_real`, so the absent-key case never
+    constructs a client or makes a network call at all). On ANY failure --
+    timeout, rate limit, invalid key, malformed response, or anything else
+    -- this logs a single clear WARNING (via `logging`, never the key
+    itself or anything that could contain it -- see `_safe_error_text`) and
+    falls back to the mock. This function itself never raises for a
+    Gemini-side failure; the live WebSocket alert flow and reporting-tool
+    calls that depend on it must never crash because an external API had a
+    bad moment.
+    """
+    if not os.environ.get("GEMINI_API_KEY"):
+        return await generate_explanation(prompt)
+
+    try:
+        return await generate_explanation_real(prompt)
+    except Exception as exc:  # noqa: BLE001 -- deliberately broad: ANY real-API
+        # failure mode (timeout, rate limit, auth, malformed response, a
+        # transient SDK/network error not yet seen) must fall back, not
+        # propagate -- narrowing this to specific exception types would
+        # silently reintroduce exactly the crash risk Step 2.2 exists to
+        # prevent.
+        logger.warning(
+            f"[explainer] Real Gemini call failed ({type(exc).__name__}) -- falling back to "
+            f"the mock executor for this call. Error: {_safe_error_text(exc)}"
+        )
+        return await generate_explanation(prompt)

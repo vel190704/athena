@@ -59,6 +59,16 @@
 #    real, published, not yanked, with wheel files compatible with
 #    `ubuntu-latest` + Python 3.14 on x86_64 (the CI runner's actual
 #    platform) confirmed to exist.
+#
+# 3. ADR-006 Update (real Gemini Flash-Lite integration): `google-genai==2.16.0`
+#    added, plus its two genuinely new transitive deps (`distro==1.9.0`,
+#    `sniffio==1.3.1` -- everything else it depends on, e.g. httpx/pydantic/
+#    requests/websockets/tenacity/google-auth, was already installed as a
+#    transitive dep of existing packages). Verified as the current,
+#    GA-recommended Google GenAI SDK against real, current documentation
+#    before installing -- the older `google-generativeai` package is
+#    deprecated and deliberately not used. See ADR-006's own "Update"
+#    section for the full integration decision.
 aiohappyeyeballs==2.7.1
 aiohttp==3.14.2
 aiosignal==1.4.0
@@ -86,6 +96,7 @@ cuda-pathfinder==1.5.6
 cuda-toolkit==13.0.3.0
 cycler==0.12.1
 databricks-sdk==0.122.0
+distro==1.9.0
 docker==7.2.0
 fastapi==0.139.2
 filelock==3.31.0
@@ -98,6 +109,7 @@ fsspec==2026.6.0
 gitdb==4.0.12
 GitPython==3.1.54
 google-auth==2.56.2
+google-genai==2.16.0
 google-measurement-protocol==1.1.0
 graphene==3.4.3
 graphql-core==3.2.11
@@ -205,6 +217,7 @@ shellingham==1.5.4
 six==1.17.0
 skops==0.14.0
 smmap==5.0.3
+sniffio==1.3.1
 SoccerNet==0.1.62
 SQLAlchemy==2.0.51
 sqlparse==0.5.5

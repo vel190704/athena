@@ -8,11 +8,14 @@ this project's established preference for real-data verification over
 memory/assumption.
 """
 
+import asyncio
 import math
 import os
+import re
 
 os.environ.setdefault("MLFLOW_ALLOW_FILE_STORE", "true")
 
+import pytest
 import torch
 
 from production.src.ingestion.statsbomb_io import (
@@ -25,10 +28,19 @@ from production.src.models.explainer import (
     build_tactical_prompt,
     compute_attributions,
     generate_explanation,
+    generate_explanation_real,
+    generate_tactical_explanation,
     load_deterministic_mlp,
 )
 from production.src.pipeline.feature_extractor import extract_features
 from production.src.pipeline.survival_dataset import FEATURE_KEYS
+
+# Same pattern test_zone_explainer.py's own honesty check uses (Milestone 43)
+# -- duplicated here, not cross-imported from another test file, since it's
+# a small, self-contained regex and tests should not depend on each other.
+_UNSUPPORTED_CLAIM_PATTERN = re.compile(
+    r"\b(second|seconds|minute|minutes|recovering|recovers|sprint|sprinting)\b", re.IGNORECASE
+)
 
 MATCH_ID = 3857276
 TIME_BIN = 3  # 15s horizon, matching Milestones 8/13/14
@@ -139,3 +151,67 @@ def test_explainer_end_to_end_on_real_match_state():
     assert isinstance(mock_response, str)
     assert len(mock_response) > 0
     assert "Tactical Analysis:" in mock_response
+
+
+def test_explainer_real_gemini_integration():
+    """ADR-006 Update: exercises the REAL Gemini Flash-Lite call end-to-end,
+    only when `GEMINI_API_KEY` is genuinely present -- SKIPPED (not failed)
+    otherwise, the SAME pattern `test_cv_detector.py`'s SoccerNet-gated test
+    uses (a real credential this environment may or may not have, not
+    something to fake or fail on). CI does not and should not have this
+    key, so this test skips cleanly there, never blocking a push.
+
+    Covers two requirements together: (1) the honesty check (real output,
+    not the mock's, must contain no unsupported temporal/movement claim --
+    the same regex `test_zone_explainer.py`'s own honesty check uses), and
+    (2) graceful fallback (a deliberately invalid key must still produce
+    the deterministic mock's output, never crash or propagate the real
+    API's error).
+    """
+    if not os.environ.get("GEMINI_API_KEY"):
+        pytest.skip(
+            "GEMINI_API_KEY is not set. This test exercises the real Gemini Flash-Lite "
+            "integration and requires a real API key -- set it in the environment, or in a "
+            "git-ignored .env file loaded via python-dotenv (same convention as "
+            "ROBOFLOW_API_KEY, see ADR-014)."
+        )
+
+    model, normalization_mean, normalization_std, run_id = load_deterministic_mlp()
+    features_dict = _fetch_baseline_features()
+    scalar_features = [features_dict[key] for key in FEATURE_KEYS]
+    raw_tensor = torch.tensor([scalar_features], dtype=torch.float32)
+    normalized_input = (raw_tensor - normalization_mean) / normalization_std
+    normalized_input.requires_grad_(True)
+    baseline_tensor = torch.zeros_like(normalized_input)
+    attributions = compute_attributions(model, normalized_input, baseline_tensor, time_bin=TIME_BIN)
+    with torch.no_grad():
+        ci = _cumulative_incidence_forward(model, normalized_input, time_bin=TIME_BIN).item()
+    prompt = build_tactical_prompt(features_dict, attributions, ci, time_bin=TIME_BIN)
+
+    real_output = asyncio.run(generate_explanation_real(prompt))
+    print(f"\n=== Real Gemini output ===\n{real_output}")
+
+    assert isinstance(real_output, str)
+    assert real_output.strip(), "real Gemini call returned an empty response"
+
+    unsupported = _UNSUPPORTED_CLAIM_PATTERN.findall(real_output)
+    assert not unsupported, (
+        f"real Gemini output contains unsupported temporal/movement claim(s): {unsupported} -- "
+        "the honesty-constraint system instruction needs strengthening, not this test relaxing"
+    )
+
+    # Graceful-fallback check: a deliberately invalid key must still yield
+    # the mock's output via generate_tactical_explanation, never a crash or
+    # a propagated API error. Real key is restored in `finally` regardless
+    # of outcome, and never printed/logged at any point.
+    real_key = os.environ["GEMINI_API_KEY"]
+    os.environ["GEMINI_API_KEY"] = "test-deliberately-invalid-key-not-a-real-credential"
+    try:
+        fallback_output = asyncio.run(generate_tactical_explanation(prompt))
+    finally:
+        os.environ["GEMINI_API_KEY"] = real_key
+
+    assert "Tactical Analysis:" in fallback_output, (
+        "an invalid API key should fall back to the deterministic mock executor's output, "
+        "not crash or propagate the real API's error"
+    )

@@ -41,7 +41,7 @@ from production.src.models.explainer import (
     _cumulative_incidence_forward,
     build_tactical_prompt,
     compute_attributions,
-    generate_explanation,
+    generate_tactical_explanation,
     load_deterministic_mlp,
 )
 from production.src.pipeline.feature_extractor import extract_features
@@ -164,15 +164,18 @@ async def _run_alert_pipeline(
     cumulative_incidence: float,
 ) -> None:
     """Background task (Step 3.7/3.8): computes attributions, builds the
-    prompt, runs the Milestone-15 mock LLM executor, then sends the alert
-    -- guarded by the SAME connection-scoped lock the main loop uses for
-    `threat` messages, so this send can never interleave with (and
-    corrupt) a concurrent `threat` send on the same connection.
+    prompt, runs the explanation executor (Milestone 15's mock, or a real
+    Gemini Flash-Lite call if GEMINI_API_KEY is set -- see ADR-006's Update
+    section; the choice is entirely internal to `generate_tactical_explanation`,
+    this call site does not know or need to know which one actually ran),
+    then sends the alert -- guarded by the SAME connection-scoped lock the
+    main loop uses for `threat` messages, so this send can never interleave
+    with (and corrupt) a concurrent `threat` send on the same connection.
     """
     prompt = await asyncio.to_thread(
         _build_alert_prompt_sync, features_dict, normalized_input, cumulative_incidence
     )
-    explanation = await generate_explanation(prompt)
+    explanation = await generate_tactical_explanation(prompt)
 
     async with connection_lock:
         await websocket.send_json({"type": "alert", "explanation": explanation})

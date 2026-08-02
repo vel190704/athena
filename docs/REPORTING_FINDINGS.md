@@ -240,6 +240,31 @@ different fixes:**
    if any appear) precisely so this constraint cannot be silently dropped
    by a future edit that only touches the prompt wording.
 
+**Update — gap 1 (prose flatness) addressed via a real LLM call; gap 2
+(duration/movement claims) remains, exactly as this finding always said it
+would.** ADR-006's Update section records the full integration (Gemini
+Flash-Lite via `google-genai`, gated so the mock remains the default and
+permanent fallback). With a real call now wired in, prose flatness is
+resolved: real output reads as flowing, grounded sentences (e.g., for
+Argentina's real aggregate zone data, "The model estimates a threat level
+of 20.2%... driven primarily by spatial control in the
+attacking_third_central_channel, which increases the threat estimate with
+a magnitude of +0.3872. Conversely, this offensive potential is tempered
+by dampening factors located in the middle_third_left_side at -0.1066 and
+the defensive_third_central_channel at -0.1012" — verbatim real output,
+not paraphrased), not the mock's terse "Key drivers: X. Mitigating
+factors: Y." template. **Gap 2 is explicitly NOT addressed by this
+change, and was never expected to be**: this was always a DATA limitation
+(no frame-to-frame trajectory or player-movement computation exists
+anywhere in this project), not a prompting one — the point item 2 above
+makes directly. Confirmed, not just asserted: the same real call was
+tested against the exact honesty-check regex that would catch a
+duration/movement claim, and passed on the first attempt, with no prompt
+iteration needed, for both the scalar-feature prompt (Milestone 15) and
+this zone-level prompt. A real LLM did not close gap 2 because a better
+LLM was never what gap 2 needed — only a temporal/transition-state layer
+(still unbuilt, still a separate, unscoped piece of future work) could.
+
 ## 5. Output Format
 
 Every function above returns a plain, JSON-serializable `dict` (nested

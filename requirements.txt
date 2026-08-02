@@ -47,3 +47,9 @@ roboflow           # pitch_keypoint_detector.py's _get_model() -- a deliberately
 # missing from this file until the same transitive-import trace found them ---
 matplotlib
 scipy
+
+# --- Real LLM integration (ADR-006 Update) -- explainer.py's real Gemini
+# Flash-Lite executor. `google-genai` is Google's current, GA-recommended
+# SDK (verified against real, current docs, not assumed) -- the older
+# `google-generativeai` package is deprecated and deliberately NOT used. ---
+google-genai
