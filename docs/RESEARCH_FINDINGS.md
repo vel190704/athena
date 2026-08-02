@@ -320,6 +320,93 @@ degradation under match-level splitting is a new thread worth investigating on i
 (e.g., whether the GNN overfits to within-match structure more readily than the MLP),
 not yet explained by anything in this run alone.
 
+**Update — repeated-measurement investigation of the 30s-horizon gap: partially
+confirmed, magnitude was an outlier, APPENDED as a correction to the paragraph above,
+not a deletion of it.** The single-run 0.0564 @30s gap (GNN−MLP) above was explicitly
+flagged as "not yet explained by anything in this run alone" — a genuine investigation
+followed, before building any explanatory hypothesis on top of it, exactly to check
+whether it was real and repeatable.
+
+*Model-init-seed check (same split_seed=42, 3 init seeds — reused the existing seed=42/43
+MLP+GNN runs, trained one more of each fresh):* all six runs cleared every ADR-010
+instability signal (genuinely healthy, none excluded).
+
+| init_seed | MLP@15s | MLP@30s | GNN@15s | GNN@30s | gap@30s (GNN−MLP) |
+|---|---|---|---|---|---|
+| 42 | 0.1009 | 0.1873 | 0.1198 | 0.2437 | **+0.0564** |
+| 43 | 0.1002 | 0.1864 | 0.1196 | 0.2001 | +0.0137 |
+| 44 | 0.1015 | 0.1894 | 0.1284 | 0.2256 | +0.0363 |
+
+*Split-seed check (same init_seed=42, 3 split seeds — genuinely different match
+partitions):*
+
+| split_seed | MLP@15s | MLP@30s | GNN@15s | GNN@30s | gap@30s (GNN−MLP) |
+|---|---|---|---|---|---|
+| 42 | 0.1009 | 0.1873 | 0.1198 | 0.2437 | **+0.0564** |
+| 43 | 0.0934 | 0.1593 | 0.1057 | 0.1802 | +0.0209 |
+| 44 | 0.1070 | 0.1798 | 0.1328 | 0.2174 | +0.0375 |
+
+**Direction held in all 5 additional (init_seed, split_seed) combinations tested — the
+GNN was worse than the MLP at 30s every single time, never reversing.** But magnitude
+varied more than 4x (0.0137–0.0564), and **the original run happened to be the single
+largest gap observed** — the mean of the other four is 0.0271, well under half the
+0.0564 figure this document originally reported. That figure should be read as an upper
+bound from this evidence, not a representative or typical value.
+
+*Per-time-bin decomposition (all 12 bins, train AND validation, for 3 (init_seed,
+split_seed) pairs, computed from freshly-trained models evaluated immediately in-process
+— see the methodological caveat below on why reloading an already-trained model from
+MLflow was deliberately avoided for this specific check):*
+
+- **(42, 42) and (43, 42)** (both split_seed=42) show a genuine, if noisy, late-bin-
+  concentrated pattern: the validation gap (GNN−MLP) is small/negative through the early
+  bins (0–25s), turns positive around the 30s bin, and grows through the 45–50s bins. The
+  GNN's OWN train→val gap widens markedly more than the MLP's at these same late bins
+  (e.g., at (42,42), bin 9 (45s): GNN train-val gap 0.0129 vs. MLP's 0.0059 — more than
+  double) — the direct signature of horizon-specific overfitting the investigation set
+  out to check for.
+- **(42, 44)** (a genuinely different match partition) shows **no such pattern at all** —
+  the validation gap stays small and mostly flat/negative across every single bin (-0.004
+  to +0.004), and the GNN's train-val gap tracks the MLP's own closely at every horizon,
+  with no late-bin blowup.
+
+**Honest Step 4 conclusion, not forced toward either extreme:** the horizon-specific GNN
+degradation is **(a) a robust finding in DIRECTION** (GNN worse at 30s than the MLP,
+confirmed in every one of 5 additional seed/split combinations, never reversing) **but
+(b) not robust in MAGNITUDE or in the late-bin-overfitting MECHANISM** — the original
+0.0564 figure was the largest of six measurements, and the specific "wider GNN train-val
+gap concentrated in late bins" signature that would explain *why* was clearly present
+under split_seed=42 (both init seeds checked) but **completely absent** under
+split_seed=44. This should be read as: the GNN reliably underperforms the MLP at longer
+horizons by a real but modest and noisy margin, with the ORIGINAL run's specific
+magnitude and its apparent late-bin-overfitting texture being at least partly properties
+of split_seed=42's own particular validation partition, not a settled, split-independent
+architectural property of the GNN. The original single-run observation is walked back
+from "a new, notable observation" to "a real but noisy direction, whose originally-
+reported magnitude was not representative" — exactly the kind of correction this
+project's own discipline (ADR-016's two rejected adaptive-rejection attempts are the
+direct precedent) treats as a first-class, reportable outcome, not a failure to hide.
+
+**A genuine, separate methodological finding surfaced during this investigation, reported
+here because it could affect future work reusing this pattern:** an initial version of
+the per-bin check reloaded already-trained GNN models from MLflow
+(`mlflow.pytorch.load_model`) to avoid retraining. This reload was found to give
+**substantially different predictions** on the full-size (~1,400+ graph) validation batch
+than the model's own original in-process training-time evaluation — confirmed real and
+reproducible via extensive isolation testing (byte-identical weights via state_dict
+checksum, byte-identical match-level split and normalization stats, byte-identical
+model-loading path, correct model_id resolution under MLflow 3.x's Logged Models API —
+all directly verified, none of them the cause). A clean, single-process train→save→
+reload→compare test on a toy model showed the reload IS perfectly faithful when the
+comparison itself is done correctly — meaning the discrepancy traces to something
+specific about reloading THIS GNN architecture's PyG `SAGEConv` layers and re-running
+them on a very large batch built in a genuinely separate process, not simply "save/load
+is broken." The exact mechanism was not pinned down further given time constraints; this
+per-bin investigation avoided the issue entirely by retraining fresh and evaluating
+immediately in-process rather than reloading. **Flagged as an open item**: any future
+code that reloads a trained GNN from MLflow for inference on a large batch should
+independently verify its predictions against a smaller reference before trusting them.
+
 ### RQ5 — Can counterfactual simulations predict the tactical effects of substitutions?
 
 **Question (README):** *"Can counterfactual simulations predict the tactical effects of

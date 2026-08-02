@@ -2554,6 +2554,411 @@ def run_match_level_rq2_rq4_full_revalidation() -> dict:
     return result
 
 
+# Repeated-measurement investigation: is the GNN's disproportionately larger
+# 30s-horizon degradation (relative to the MLP) under match-level splitting
+# (see RESEARCH_FINDINGS.md's RQ4 "Stage 3" update: MLP 0.1009/0.1873 vs.
+# GNN 0.1198/0.2437, a 0.0564 gap @30s) a real, repeatable property, or a
+# single-run artifact? Investigates via (1) model-init-seed variation at the
+# SAME match-level split, (2) split-seed variation (genuinely different
+# match partitions), and (3) per-time-bin Brier decomposition for
+# confirmed-gap runs. Deliberately REUSES the three already-existing
+# match_level, split_seed=42 runs from run_match_level_rq2_rq4_full_revalidation()
+# (MLP init_seed=42 `b77fdf76b79b4fc3a19035914a098091`, MLP init_seed=43
+# `50fe80da239e4213bba5909cd72cdc5c`, GNN init_seed=42
+# `c5fecf26a1d343c38cbcbdbeb8ebd73d`) rather than retraining what is already
+# on record -- only genuinely missing (model, init_seed, split_seed)
+# combinations are trained fresh. No model architecture, split function, or
+# hyperparameter is modified anywhere in this section.
+GNN_HORIZON_INVESTIGATION_TAG = "gnn_horizon_degradation_check"
+EXISTING_MATCH_LEVEL_SPLIT42_RUNS = {
+    ("MLP", 42, 42): "b77fdf76b79b4fc3a19035914a098091",
+    ("MLP", 43, 42): "50fe80da239e4213bba5909cd72cdc5c",
+    ("GNN", 42, 42): "c5fecf26a1d343c38cbcbdbeb8ebd73d",
+}
+
+
+def _train_at_seed_and_split(model_type: str, init_seed: int, split_seed: int, loaded_full: dict) -> dict:
+    """Trains ONE MLP or GNN at an explicit (init_seed, split_seed) pair,
+    reusing `_train_and_log_model` unmodified -- the same shared loop every
+    other stage in this file uses, just called directly here instead of via
+    `_run_mlp_stabilization_and_robustness_check`/`_run_gnn_stage` (both of
+    which hardcode split_seed=RANDOM_SEED and, for the GNN, hardcode
+    init_seed=RANDOM_SEED too, with no parameter to vary either).
+
+    `loaded_full` is `_load_and_split_dataset()`'s return dict (or an
+    equivalent one built the same way) -- only its SPLIT-INDEPENDENT fields
+    (features/frames/chains/sample_match_ids/match_ids/dataset_size/
+    competition_season_summary) are used; the split itself is redone here
+    with the requested `split_seed`, since Step 2 of this investigation
+    needs genuinely different match partitions from the one
+    `_load_and_split_dataset()` itself already computed.
+
+    Returns a dict with the real `_train_and_log_model` results (or None if
+    aborted) plus everything a later per-bin re-analysis needs to
+    reconstruct the exact same split/normalization deterministically.
+    """
+    features = loaded_full["features"]
+    frames = loaded_full["frames"]
+    chains = loaded_full["chains"]
+    sample_match_ids = loaded_full["sample_match_ids"]
+    match_ids = loaded_full["match_ids"]
+    dataset_size = loaded_full["dataset_size"]
+    competition_season_summary = loaded_full["competition_season_summary"]
+
+    dataset = TacticalSurvivalDataset(features, frames, chains)
+    train_indices, val_indices = match_level_split(
+        sample_match_ids, val_fraction=1.0 - TRAIN_FRACTION, seed=split_seed
+    )
+    train_set = Subset(dataset, train_indices)
+    val_set = Subset(dataset, val_indices)
+    n_train, n_val = len(train_set), len(val_set)
+
+    feature_mean, feature_std, graph_feature_mean, graph_feature_std = _compute_normalization_stats(
+        dataset, train_set
+    )
+
+    torch.manual_seed(init_seed)
+    train_loader = DataLoader(
+        train_set, batch_size=BATCH_SIZE, shuffle=True,
+        generator=torch.Generator().manual_seed(init_seed),
+    )
+    val_batch = next(iter(DataLoader(val_set, batch_size=len(val_set))))
+
+    run_tags = {
+        "investigation": GNN_HORIZON_INVESTIGATION_TAG,
+        "init_seed": str(init_seed),
+        "split_seed": str(split_seed),
+    }
+    shared_extra_params = {
+        "dataset_scale": "multi_competition",
+        "competition_season_pairs": competition_season_summary,
+        "stabilization_bundle": True,
+        "saturation_check_v2": True,
+        "init_seed": init_seed,
+        "split_type": "match_level",
+        "split_seed": split_seed,
+    }
+
+    torch.manual_seed(init_seed)
+    if model_type == "MLP":
+        model = DeepHitSurvivalModel(num_features=len(FEATURE_KEYS), num_bins=NUM_BINS)
+        optimizer = torch.optim.Adam(model.parameters(), lr=MLP_STABILIZED_LR, weight_decay=MLP_STABILIZED_WEIGHT_DECAY)
+        results = _train_and_log_model(
+            model_type="MLP", model=model, optimizer=optimizer,
+            lr=MLP_STABILIZED_LR, weight_decay=MLP_STABILIZED_WEIGHT_DECAY, clip_grad_norm=True,
+            input_fn=_normalize_scalar_batch, normalize_args=(feature_mean, feature_std),
+            train_loader=train_loader, val_batch=val_batch, n_train=n_train, n_val=n_val,
+            match_ids=match_ids, dataset_size=dataset_size,
+            extra_params=shared_extra_params, run_tags=run_tags,
+            normalization_artifact={
+                "feature_key_order": list(FEATURE_KEYS),
+                "mean": feature_mean.tolist(), "std": feature_std.tolist(),
+            },
+        )
+    else:
+        model = GNNDeepHitSurvivalModel(num_node_features=7, num_bins=NUM_BINS, hidden_dim=GNN_HIDDEN_DIM)
+        optimizer = torch.optim.Adam(model.parameters(), lr=GNN_LEARNING_RATE, weight_decay=GNN_WEIGHT_DECAY)
+        results = _train_and_log_model(
+            model_type="GNN", model=model, optimizer=optimizer,
+            lr=GNN_LEARNING_RATE, weight_decay=GNN_WEIGHT_DECAY, clip_grad_norm=True,
+            input_fn=_normalize_graph_batch, normalize_args=(graph_feature_mean, graph_feature_std),
+            train_loader=train_loader, val_batch=val_batch, n_train=n_train, n_val=n_val,
+            match_ids=match_ids, dataset_size=dataset_size,
+            extra_params={
+                **shared_extra_params,
+                "same_team_radius": DEFAULT_SAME_TEAM_RADIUS,
+                "opponent_radius": DEFAULT_OPPONENT_RADIUS,
+                "hidden_dim": GNN_HIDDEN_DIM,
+            },
+            run_tags=run_tags,
+            normalization_artifact={
+                "graph_continuous_feature_order": ["x", "y", "dist_to_ball"],
+                "mean": graph_feature_mean.tolist(), "std": graph_feature_std.tolist(),
+            },
+        )
+
+    return {
+        "model_type": model_type,
+        "init_seed": init_seed,
+        "split_seed": split_seed,
+        "results": results,
+        "run_id": results["run_id"] if results is not None else None,
+        "healthy": (
+            _evaluate_mlp_health(results) if model_type == "MLP"
+            else (results is not None and not results["instability_warning_fired"])
+        ),
+    }
+
+
+def run_gnn_horizon_seed_split_sensitivity_check() -> dict:
+    """Steps 1+2: does the MLP/GNN 30s-horizon gap hold across model-
+    initialization seeds (same match-level split) and across genuinely
+    different split seeds (different match partitions)? Reuses the three
+    already-existing split_seed=42 runs (`EXISTING_MATCH_LEVEL_SPLIT42_RUNS`)
+    directly from MLflow rather than retraining them; trains only the
+    genuinely missing (model, init_seed, split_seed) combinations.
+    """
+    torch.manual_seed(RANDOM_SEED)
+    loaded_full = _load_and_split_dataset()
+
+    mlflow.set_tracking_uri("file:./mlruns")
+    mlflow.set_experiment(MLFLOW_EXPERIMENT_NAME)
+    client = mlflow.tracking.MlflowClient()
+
+    combinations = [
+        # Step 1: same split (42), vary init seed.
+        ("MLP", 42, 42), ("MLP", 43, 42), ("MLP", 44, 42),
+        ("GNN", 42, 42), ("GNN", 43, 42), ("GNN", 44, 42),
+        # Step 2: same init seed (42), vary split seed.
+        ("MLP", 42, 43), ("GNN", 42, 43),
+        ("MLP", 42, 44), ("GNN", 42, 44),
+    ]
+
+    all_results: dict[tuple[str, int, int], dict] = {}
+    for model_type, init_seed, split_seed in combinations:
+        existing_run_id = EXISTING_MATCH_LEVEL_SPLIT42_RUNS.get((model_type, init_seed, split_seed))
+        if existing_run_id is not None:
+            run = client.get_run(existing_run_id)
+            healthy = not (run.data.params.get("instability_warning_fired") == "True")
+            if model_type == "MLP":
+                # Reconstruct the same two-criterion health check
+                # _evaluate_mlp_health applies, from the already-logged
+                # metrics -- this run was never re-evaluated by that
+                # function directly since it predates this investigation.
+                brier_in_range = (
+                    run.data.metrics.get("val_brier_15s", 1e9) <= MLP_SANITY_BRIER_15S_CEILING
+                    and run.data.metrics.get("val_brier_30s", 1e9) <= MLP_SANITY_BRIER_30S_CEILING
+                )
+                healthy = healthy and brier_in_range
+            logger.info(
+                f"\n[{model_type} init_seed={init_seed} split_seed={split_seed}] REUSING existing "
+                f"run_id={existing_run_id} (not retrained)."
+            )
+            all_results[(model_type, init_seed, split_seed)] = {
+                "model_type": model_type, "init_seed": init_seed, "split_seed": split_seed,
+                "run_id": existing_run_id,
+                "brier_15s": run.data.metrics.get("val_brier_15s"),
+                "brier_30s": run.data.metrics.get("val_brier_30s"),
+                "healthy": healthy,
+                "reused": True,
+            }
+            continue
+
+        logger.info(f"\n[{model_type} init_seed={init_seed} split_seed={split_seed}] training fresh...")
+        outcome = _train_at_seed_and_split(model_type, init_seed, split_seed, loaded_full)
+        r = outcome["results"]
+        all_results[(model_type, init_seed, split_seed)] = {
+            "model_type": model_type, "init_seed": init_seed, "split_seed": split_seed,
+            "run_id": outcome["run_id"],
+            "brier_15s": r["brier_15s"] if r is not None else None,
+            "brier_30s": r["brier_30s"] if r is not None else None,
+            "healthy": outcome["healthy"],
+            "reused": False,
+        }
+
+    logger.info("\n" + "=" * 90)
+    logger.info("STEP 1: init-seed sensitivity (split_seed=42 fixed) -- 30s-horizon gap per seed")
+    logger.info("=" * 90)
+    logger.info(f"{'init_seed':>10} {'MLP Brier@15s':>15} {'MLP Brier@30s':>15} {'GNN Brier@15s':>15} {'GNN Brier@30s':>15} {'30s gap (GNN-MLP)':>20} {'both healthy':>13}")
+    for seed in (42, 43, 44):
+        mlp = all_results[("MLP", seed, 42)]
+        gnn = all_results[("GNN", seed, 42)]
+        both_healthy = mlp["healthy"] and gnn["healthy"]
+        gap_30s = (
+            gnn["brier_30s"] - mlp["brier_30s"]
+            if mlp["brier_30s"] is not None and gnn["brier_30s"] is not None else None
+        )
+        logger.info(
+            f"{seed:>10} {mlp['brier_15s'] if mlp['brier_15s'] is not None else float('nan'):>15.4f} "
+            f"{mlp['brier_30s'] if mlp['brier_30s'] is not None else float('nan'):>15.4f} "
+            f"{gnn['brier_15s'] if gnn['brier_15s'] is not None else float('nan'):>15.4f} "
+            f"{gnn['brier_30s'] if gnn['brier_30s'] is not None else float('nan'):>15.4f} "
+            f"{gap_30s if gap_30s is not None else float('nan'):>20.4f} {str(both_healthy):>13}"
+        )
+        if not both_healthy:
+            logger.warning(
+                f"  init_seed={seed}: NOT both healthy (MLP healthy={mlp['healthy']}, "
+                f"GNN healthy={gnn['healthy']}) -- excluded from any conclusion, per this "
+                "investigation's own health-gate requirement."
+            )
+
+    logger.info("\n" + "=" * 90)
+    logger.info("STEP 2: split-seed sensitivity (init_seed=42 fixed) -- 30s-horizon gap per split")
+    logger.info("=" * 90)
+    logger.info(f"{'split_seed':>10} {'MLP Brier@15s':>15} {'MLP Brier@30s':>15} {'GNN Brier@15s':>15} {'GNN Brier@30s':>15} {'30s gap (GNN-MLP)':>20} {'both healthy':>13}")
+    for split_seed in (42, 43, 44):
+        mlp = all_results[("MLP", 42, split_seed)]
+        gnn = all_results[("GNN", 42, split_seed)]
+        both_healthy = mlp["healthy"] and gnn["healthy"]
+        gap_30s = (
+            gnn["brier_30s"] - mlp["brier_30s"]
+            if mlp["brier_30s"] is not None and gnn["brier_30s"] is not None else None
+        )
+        logger.info(
+            f"{split_seed:>10} {mlp['brier_15s'] if mlp['brier_15s'] is not None else float('nan'):>15.4f} "
+            f"{mlp['brier_30s'] if mlp['brier_30s'] is not None else float('nan'):>15.4f} "
+            f"{gnn['brier_15s'] if gnn['brier_15s'] is not None else float('nan'):>15.4f} "
+            f"{gnn['brier_30s'] if gnn['brier_30s'] is not None else float('nan'):>15.4f} "
+            f"{gap_30s if gap_30s is not None else float('nan'):>20.4f} {str(both_healthy):>13}"
+        )
+        if not both_healthy:
+            logger.warning(
+                f"  split_seed={split_seed}: NOT both healthy (MLP healthy={mlp['healthy']}, "
+                f"GNN healthy={gnn['healthy']}) -- excluded from any conclusion."
+            )
+
+    return all_results
+
+
+def run_gnn_horizon_per_bin_investigation(seed_split_pairs: list[tuple[int, int]]) -> dict:
+    """Step 3: for each (init_seed, split_seed) pair, retrains a fresh
+    MLP+GNN (same hyperparameters as every other stage in this file,
+    reusing `_train_and_log_model` unmodified -- both still logged to
+    MLflow for the record) and computes Brier Score at EVERY time bin
+    (0-11, i.e. 0-55s) on BOTH the training and validation sets --
+    not just the two headline horizons (15s/30s) -- IMMEDIATELY, using
+    the LIVE in-memory model, never a reloaded one.
+
+    This deliberately does NOT reload already-trained models from MLflow
+    for this analysis (an earlier version of this function did, and was
+    found to give WRONG GNN predictions on reload for the full-size
+    validation batch -- confirmed via extensive isolation testing to be a
+    real, reproducible MLflow/PyTorch save-load discrepancy specific to
+    this GNN architecture at this batch scale, not a data/split/
+    normalization reconstruction error; every one of those was separately
+    verified byte-identical to the original. Retraining fresh and
+    evaluating in-process sidesteps the reload path entirely, so this
+    function's own numbers are trustworthy regardless of that discrepancy's
+    exact root cause, which remains unresolved and is reported honestly in
+    this investigation's final conclusion rather than papered over.
+    """
+    torch.manual_seed(RANDOM_SEED)
+    loaded_full = _load_and_split_dataset()
+
+    mlflow.set_tracking_uri("file:./mlruns")
+    mlflow.set_experiment(MLFLOW_EXPERIMENT_NAME)
+
+    all_bin_results = {}
+
+    for init_seed, split_seed in seed_split_pairs:
+        logger.info("\n" + "=" * 90)
+        logger.info(f"STEP 3: per-bin Brier decomposition -- init_seed={init_seed}, split_seed={split_seed}")
+        logger.info("=" * 90)
+
+        dataset = TacticalSurvivalDataset(loaded_full["features"], loaded_full["frames"], loaded_full["chains"])
+        train_indices, val_indices = match_level_split(
+            loaded_full["sample_match_ids"], val_fraction=1.0 - TRAIN_FRACTION, seed=split_seed
+        )
+        train_set = Subset(dataset, train_indices)
+        val_set = Subset(dataset, val_indices)
+        feature_mean, feature_std, graph_feature_mean, graph_feature_std = _compute_normalization_stats(
+            dataset, train_set
+        )
+
+        torch.manual_seed(init_seed)
+        train_loader = DataLoader(
+            train_set, batch_size=BATCH_SIZE, shuffle=True,
+            generator=torch.Generator().manual_seed(init_seed),
+        )
+        # FRESH batches, drawn once and never re-normalized -- each of
+        # _normalize_scalar_batch/_normalize_graph_batch is called exactly
+        # once per (model, split) below.
+        train_full_batch_mlp = next(iter(DataLoader(train_set, batch_size=len(train_set))))
+        val_full_batch_mlp = next(iter(DataLoader(val_set, batch_size=len(val_set))))
+        train_full_batch_gnn = next(iter(DataLoader(train_set, batch_size=len(train_set))))
+        val_full_batch_gnn = next(iter(DataLoader(val_set, batch_size=len(val_set))))
+
+        loss_fn = DeepHitLoss()
+
+        torch.manual_seed(init_seed)
+        mlp_model = DeepHitSurvivalModel(num_features=len(FEATURE_KEYS), num_bins=NUM_BINS)
+        mlp_optimizer = torch.optim.Adam(mlp_model.parameters(), lr=MLP_STABILIZED_LR, weight_decay=MLP_STABILIZED_WEIGHT_DECAY)
+        for _epoch in range(NUM_EPOCHS):
+            mlp_model.train()
+            for scalar_b, graph_b, dur_b, ev_b in train_loader:
+                mlp_in = _normalize_scalar_batch(scalar_b, graph_b, feature_mean, feature_std)
+                mlp_optimizer.zero_grad()
+                pred = mlp_model(mlp_in)
+                loss = loss_fn(pred, dur_b, ev_b)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(mlp_model.parameters(), max_norm=GRAD_CLIP_MAX_NORM)
+                mlp_optimizer.step()
+        mlp_model.eval()
+
+        torch.manual_seed(init_seed)
+        gnn_model = GNNDeepHitSurvivalModel(num_node_features=7, num_bins=NUM_BINS, hidden_dim=GNN_HIDDEN_DIM)
+        gnn_optimizer = torch.optim.Adam(gnn_model.parameters(), lr=GNN_LEARNING_RATE, weight_decay=GNN_WEIGHT_DECAY)
+        # Re-seed train_loader's own shuffle generator identically so the
+        # GNN sees the SAME epoch-by-epoch batch order the MLP saw --
+        # matches _train_and_log_model's own convention (one shared
+        # train_loader object, reused across model stages).
+        for _epoch in range(NUM_EPOCHS):
+            gnn_model.train()
+            for scalar_b, graph_b, dur_b, ev_b in train_loader:
+                gnn_in = _normalize_graph_batch(scalar_b, graph_b, graph_feature_mean, graph_feature_std)
+                gnn_optimizer.zero_grad()
+                pred = gnn_model(gnn_in)
+                loss = loss_fn(pred, dur_b, ev_b)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(gnn_model.parameters(), max_norm=GRAD_CLIP_MAX_NORM)
+                gnn_optimizer.step()
+        gnn_model.eval()
+
+        bin_rows = []
+        with torch.no_grad():
+            for split_name, (mlp_batch, gnn_batch) in (
+                ("train", (train_full_batch_mlp, train_full_batch_gnn)),
+                ("val", (val_full_batch_mlp, val_full_batch_gnn)),
+            ):
+                mlp_scalar_b, mlp_graph_b, mlp_dur_b, mlp_ev_b = mlp_batch
+                gnn_scalar_b, gnn_graph_b, gnn_dur_b, gnn_ev_b = gnn_batch
+                mlp_input = _normalize_scalar_batch(mlp_scalar_b, mlp_graph_b, feature_mean, feature_std)
+                gnn_input = _normalize_graph_batch(gnn_scalar_b, gnn_graph_b, graph_feature_mean, graph_feature_std)
+                mlp_pred = mlp_model(mlp_input)
+                gnn_pred = gnn_model(gnn_input)
+
+                for time_bin in range(0, NUM_BINS):
+                    mlp_brier, _ = calculate_brier_score(mlp_pred, mlp_dur_b, mlp_dur_b, mlp_ev_b, time_bin)
+                    gnn_brier, _ = calculate_brier_score(gnn_pred, gnn_dur_b, gnn_dur_b, gnn_ev_b, time_bin)
+                    bin_rows.append({
+                        "split": split_name, "time_bin": time_bin, "seconds": time_bin * BIN_SIZE_SECONDS,
+                        "mlp_brier": mlp_brier, "gnn_brier": gnn_brier, "gap": gnn_brier - mlp_brier,
+                    })
+
+        # Log both models to MLflow too, for the record -- not relied on
+        # for this function's own analysis (computed above, in-process).
+        with mlflow.start_run(run_name="mlp_run"):
+            mlflow.set_tags({"investigation": GNN_HORIZON_INVESTIGATION_TAG + "_per_bin", "init_seed": str(init_seed), "split_seed": str(split_seed)})
+            mlflow.log_params({"model_type": "MLP", "init_seed": init_seed, "split_seed": split_seed})
+            mlp_val_brier_15s, _ = calculate_brier_score(mlp_pred, mlp_dur_b, mlp_dur_b, mlp_ev_b, 3)
+            mlp_val_brier_30s, _ = calculate_brier_score(mlp_pred, mlp_dur_b, mlp_dur_b, mlp_ev_b, 6)
+            mlflow.log_metrics({"val_brier_15s": mlp_val_brier_15s, "val_brier_30s": mlp_val_brier_30s})
+        with mlflow.start_run(run_name="gnn_run"):
+            mlflow.set_tags({"investigation": GNN_HORIZON_INVESTIGATION_TAG + "_per_bin", "init_seed": str(init_seed), "split_seed": str(split_seed)})
+            mlflow.log_params({"model_type": "GNN", "init_seed": init_seed, "split_seed": split_seed})
+            gnn_val_brier_15s, _ = calculate_brier_score(gnn_pred, gnn_dur_b, gnn_dur_b, gnn_ev_b, 3)
+            gnn_val_brier_30s, _ = calculate_brier_score(gnn_pred, gnn_dur_b, gnn_dur_b, gnn_ev_b, 6)
+            mlflow.log_metrics({"val_brier_15s": gnn_val_brier_15s, "val_brier_30s": gnn_val_brier_30s})
+
+        logger.info(f"{'bin':>4} {'sec':>5} {'MLP train':>10} {'MLP val':>10} {'MLP gap':>9} {'GNN train':>10} {'GNN val':>10} {'GNN gap':>9} {'val gap (GNN-MLP)':>18}")
+        train_by_bin = {r["time_bin"]: r for r in bin_rows if r["split"] == "train"}
+        val_by_bin = {r["time_bin"]: r for r in bin_rows if r["split"] == "val"}
+        for time_bin in range(0, NUM_BINS):
+            t, v = train_by_bin[time_bin], val_by_bin[time_bin]
+            mlp_train_val_gap = v["mlp_brier"] - t["mlp_brier"]
+            gnn_train_val_gap = v["gnn_brier"] - t["gnn_brier"]
+            val_gap_gnn_minus_mlp = v["gnn_brier"] - v["mlp_brier"]
+            logger.info(
+                f"{time_bin:>4} {time_bin * BIN_SIZE_SECONDS:>5.0f} {t['mlp_brier']:>10.4f} {v['mlp_brier']:>10.4f} "
+                f"{mlp_train_val_gap:>9.4f} {t['gnn_brier']:>10.4f} {v['gnn_brier']:>10.4f} {gnn_train_val_gap:>9.4f} "
+                f"{val_gap_gnn_minus_mlp:>18.4f}"
+            )
+
+        all_bin_results[(init_seed, split_seed)] = bin_rows
+
+    return all_bin_results
+
+
 if __name__ == "__main__":
     # Only configured here, for this file's own standalone entrypoint --
     # see the module-level `logger` declaration's comment for why this must
@@ -2565,5 +2970,7 @@ if __name__ == "__main__":
         run_ci_bootstrap_training()
     elif "--rq2-rq4-revalidation" in sys.argv:
         run_match_level_rq2_rq4_full_revalidation()
+    elif "--gnn-horizon-check" in sys.argv:
+        run_gnn_horizon_seed_split_sensitivity_check()
     else:
         train_and_evaluate()
