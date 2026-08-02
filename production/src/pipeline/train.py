@@ -25,6 +25,7 @@ baseline architectures.
 import json
 import logging
 import os
+import sys
 import tempfile
 from collections import defaultdict
 
@@ -2057,6 +2058,242 @@ def run_match_level_split_mlp_smoke_test() -> dict | None:
     return results
 
 
+# Engineering-review follow-up (real CI failure, reproduced locally by moving
+# mlruns/ aside and re-running the full suite): `mlruns/` is gitignored, same
+# as `data/raw/` -- a completely fresh checkout (every GitHub Actions run,
+# starting from nothing) has no trained model for the ~10 test files that
+# load one via `explainer.load_deterministic_mlp()` / this module's own
+# `DeepEnsemble_MLP`-tagged lookup (`test_uncertainty.py`) -- directly, or
+# transitively through `team_report.generate_team_report()` or the live
+# FastAPI app's `lifespan` startup handler. The reproduction found 25
+# failures across 10 files, all the identical
+# `RuntimeError: MLflow experiment 'project-athena-deephit' not found`.
+CI_BOOTSTRAP_MATCH_IDS = [3857264, 3857289, 3857300, 3869151]  # Argentina, World Cup
+# 2022 -- the SAME 4 real, 360-covered matches already used throughout
+# production/tests/test_reporting.py, test_zone_explainer.py, and
+# test_report_visualizer.py's own real-data validation. Reused verbatim here
+# (not a new, separately-judged choice) specifically so this bootstrap's data
+# provenance is already proven real, fetchable, and 360-covered.
+
+
+def run_ci_bootstrap_training() -> None:
+    """CI-only setup step -- NOT a research run, NOT a re-validation
+    campaign, and NOT a replacement for a real contributor's own, much
+    larger, locally-built `mlruns/` history (which is never touched or
+    overwritten by this function outside of a fresh checkout that has no
+    `mlruns/` at all).
+
+    Trains ONE real MLP and ONE real (M=5) Deep Ensemble, tagged EXACTLY
+    the way `select_deterministic_mlp_run_id()` / `test_uncertainty.py`'s
+    own `DeepEnsemble_MLP` tag-filtered lookup expect, so those lookups
+    (and everything that calls them) succeed on a fresh CI runner. This
+    deliberately reuses this module's own real training code
+    (`_train_and_log_model`, `_train_and_log_deep_ensemble`, the exact
+    `MLP_STABILIZED_LR`/`MLP_STABILIZED_WEIGHT_DECAY` bundle every
+    production run uses) against real StatsBomb data -- NOT a synthetic
+    fixture, NOT a separately-maintained CI-only training recipe --
+    specifically because several of the tests this unblocks
+    (`test_oracle.py`'s real-substitution validation,
+    `test_reporting.py`'s `attacking_third > defensive_third` threat-
+    direction sanity check) assert genuine, football-plausible properties
+    of the loaded model's real behavior; a model trained on synthetic data
+    would make those tests pass without them meaning what they currently
+    mean.
+
+    Deliberately scoped to `CI_BOOTSTRAP_MATCH_IDS` (4 real matches, on
+    the order of a few hundred samples) rather than `build_training_data`'s
+    full 12-competition/~8,000-sample search -- the full search is correct
+    for a real research run but would add real minutes of wall-clock and
+    dozens of network fetches to every single push, which is not
+    appropriate for a job meant to run on every push/PR. This is a
+    genuinely fast, genuinely real bootstrap, not a scaled-down
+    approximation pretending to be the full pipeline.
+    """
+    torch.manual_seed(RANDOM_SEED)
+
+    engine = BiomechanicalPitchControl()
+    all_features, all_frames, all_chains = [], [], []
+    all_sample_match_ids: list[int] = []
+    for match_id in CI_BOOTSTRAP_MATCH_IDS:
+        features, frames, chains, _ = _match_chains_with_features(match_id, engine)
+        all_features.extend(features)
+        all_frames.extend(frames)
+        all_chains.extend(chains)
+        all_sample_match_ids.extend([match_id] * len(features))
+
+    dataset_size = len(all_features)
+    logger.info(
+        f"\n[CI bootstrap] {dataset_size} samples across {len(CI_BOOTSTRAP_MATCH_IDS)} matches"
+    )
+    if dataset_size == 0:
+        raise RuntimeError(
+            "[CI bootstrap] Zero samples resolved from CI_BOOTSTRAP_MATCH_IDS -- cannot "
+            "train. Check StatsBomb open-data connectivity, or whether these match IDs "
+            "still resolve to real, 360-covered matches."
+        )
+
+    dataset = TacticalSurvivalDataset(all_features, all_frames, all_chains)
+
+    train_indices, val_indices = match_level_split(
+        all_sample_match_ids, val_fraction=1.0 - TRAIN_FRACTION, seed=RANDOM_SEED
+    )
+    train_set = Subset(dataset, train_indices)
+    val_set = Subset(dataset, val_indices)
+    n_train, n_val = len(train_set), len(val_set)
+    logger.info(f"[CI bootstrap] {n_train} train / {n_val} val samples")
+
+    train_features_raw = torch.stack([dataset[i][0] for i in train_set.indices])
+    feature_mean = train_features_raw.mean(dim=0)
+    feature_std = train_features_raw.std(dim=0).clamp(min=1e-8)
+
+    train_loader = DataLoader(
+        train_set,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        generator=torch.Generator().manual_seed(RANDOM_SEED),
+    )
+    val_batch = next(iter(DataLoader(val_set, batch_size=len(val_set))))
+
+    mlflow.set_tracking_uri("file:./mlruns")
+    mlflow.set_experiment(MLFLOW_EXPERIMENT_NAME)
+
+    normalization_artifact = {
+        "feature_key_order": list(FEATURE_KEYS),
+        "mean": feature_mean.tolist(),
+        "std": feature_std.tolist(),
+    }
+    run_tags = {
+        "milestone": "ci_bootstrap",
+        "split_type": "match_level",
+        "comparability_note": (
+            "CI-only bootstrap run on a deliberately small, fixed 4-match dataset -- NOT "
+            "comparable to any research-scale run (Milestone 14B, 21, 23, 35). Exists only "
+            "so tests that require a real, tagged MLflow run can load one on a fresh "
+            "checkout. See run_ci_bootstrap_training()'s docstring in train.py."
+        ),
+    }
+
+    mlp_model = DeepHitSurvivalModel(num_features=len(FEATURE_KEYS), num_bins=NUM_BINS)
+    mlp_optimizer = torch.optim.Adam(
+        mlp_model.parameters(), lr=MLP_STABILIZED_LR, weight_decay=MLP_STABILIZED_WEIGHT_DECAY
+    )
+    mlp_results = _train_and_log_model(
+        model_type="MLP",
+        model=mlp_model,
+        optimizer=mlp_optimizer,
+        lr=MLP_STABILIZED_LR,
+        weight_decay=MLP_STABILIZED_WEIGHT_DECAY,
+        clip_grad_norm=True,
+        input_fn=_normalize_scalar_batch,
+        normalize_args=(feature_mean, feature_std),
+        train_loader=train_loader,
+        val_batch=val_batch,
+        n_train=n_train,
+        n_val=n_val,
+        match_ids=CI_BOOTSTRAP_MATCH_IDS,
+        dataset_size=dataset_size,
+        extra_params={
+            "dataset_scale": "ci_bootstrap",
+            "stabilization_bundle": True,
+            "saturation_check_v2": True,
+            "init_seed": RANDOM_SEED,
+            "split_type": "match_level",
+        },
+        run_tags=run_tags,
+        normalization_artifact=normalization_artifact,
+    )
+    if mlp_results is None:
+        raise RuntimeError("[CI bootstrap] MLP training aborted (NaN/Inf loss) -- cannot proceed.")
+    logger.info(
+        f"[CI bootstrap] MLP done: brier_15s={mlp_results['brier_15s']:.4f}, "
+        f"brier_30s={mlp_results['brier_30s']:.4f}"
+    )
+
+    # test_gnn_simulator.py's own deterministic-selection lookup filters on
+    # `params.model_type = 'GNN'` alone (no stabilization_bundle/
+    # saturation_check_v2 requirement, unlike the MLP/DeepEnsemble
+    # selectors) -- still trained with the same stabilized hyperparameter
+    # bundle for consistency with every other model this function trains.
+    train_graph_continuous = torch.cat(
+        [dataset[i][1].x[:, [0, 1, 6]] for i in train_set.indices], dim=0
+    )
+    graph_feature_mean = train_graph_continuous.mean(dim=0)
+    graph_feature_std = train_graph_continuous.std(dim=0).clamp(min=1e-8)
+
+    torch.manual_seed(RANDOM_SEED)
+    gnn_model = GNNDeepHitSurvivalModel(num_node_features=7, num_bins=NUM_BINS, hidden_dim=GNN_HIDDEN_DIM)
+    gnn_optimizer = torch.optim.Adam(
+        gnn_model.parameters(), lr=GNN_LEARNING_RATE, weight_decay=GNN_WEIGHT_DECAY
+    )
+    gnn_results = _train_and_log_model(
+        model_type="GNN",
+        model=gnn_model,
+        optimizer=gnn_optimizer,
+        lr=GNN_LEARNING_RATE,
+        weight_decay=GNN_WEIGHT_DECAY,
+        clip_grad_norm=True,
+        input_fn=_normalize_graph_batch,
+        normalize_args=(graph_feature_mean, graph_feature_std),
+        train_loader=train_loader,
+        val_batch=val_batch,
+        n_train=n_train,
+        n_val=n_val,
+        match_ids=CI_BOOTSTRAP_MATCH_IDS,
+        dataset_size=dataset_size,
+        extra_params={
+            "same_team_radius": DEFAULT_SAME_TEAM_RADIUS,
+            "opponent_radius": DEFAULT_OPPONENT_RADIUS,
+            "hidden_dim": GNN_HIDDEN_DIM,
+            "dataset_scale": "ci_bootstrap",
+            "stabilization_bundle": True,
+            "saturation_check_v2": True,
+            "init_seed": RANDOM_SEED,
+            "split_type": "match_level",
+        },
+        run_tags=run_tags,
+        normalization_artifact={
+            "graph_continuous_feature_order": ["x", "y", "dist_to_ball"],
+            "mean": graph_feature_mean.tolist(),
+            "std": graph_feature_std.tolist(),
+        },
+    )
+    if gnn_results is None:
+        raise RuntimeError("[CI bootstrap] GNN training aborted (NaN/Inf loss) -- cannot proceed.")
+    logger.info(
+        f"[CI bootstrap] GNN done: brier_15s={gnn_results['brier_15s']:.4f}, "
+        f"brier_30s={gnn_results['brier_30s']:.4f}"
+    )
+
+    torch.manual_seed(RANDOM_SEED)
+    ensemble_model = DeepEnsembleDeepHit(num_features=len(FEATURE_KEYS), num_bins=NUM_BINS)
+    ensemble_optimizer = torch.optim.Adam(
+        ensemble_model.parameters(), lr=MLP_STABILIZED_LR, weight_decay=MLP_STABILIZED_WEIGHT_DECAY
+    )
+    ensemble_results = _train_and_log_deep_ensemble(
+        model=ensemble_model,
+        optimizer=ensemble_optimizer,
+        train_loader=train_loader,
+        val_batch=val_batch,
+        n_train=n_train,
+        n_val=n_val,
+        match_ids=CI_BOOTSTRAP_MATCH_IDS,
+        dataset_size=dataset_size,
+        normalization_mean=feature_mean,
+        normalization_std=feature_std,
+        normalization_artifact=normalization_artifact,
+        run_tags=run_tags,
+    )
+    if ensemble_results is None:
+        raise RuntimeError(
+            "[CI bootstrap] Deep Ensemble training aborted (NaN/Inf loss) -- cannot proceed."
+        )
+    logger.info(
+        f"[CI bootstrap] Deep Ensemble done: brier_15s={ensemble_results['brier_15s']:.4f}, "
+        f"brier_30s={ensemble_results['brier_30s']:.4f}"
+    )
+    logger.info("[CI bootstrap] Complete -- mlruns/ now has a real, tagged MLP and Deep Ensemble run.")
+
+
 if __name__ == "__main__":
     # Only configured here, for this file's own standalone entrypoint --
     # see the module-level `logger` declaration's comment for why this must
@@ -2064,4 +2301,7 @@ if __name__ == "__main__":
     # this file's previous print()-based output closely enough that
     # existing habits (piping to a file, grepping for "WARNING") still work.
     logging.basicConfig(level=logging.INFO, format="%(message)s")
-    train_and_evaluate()
+    if "--ci-bootstrap" in sys.argv:
+        run_ci_bootstrap_training()
+    else:
+        train_and_evaluate()
