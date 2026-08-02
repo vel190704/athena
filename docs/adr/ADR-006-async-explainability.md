@@ -143,3 +143,37 @@ check, all in one pass.
   behavior directly, independently testable (simulate a bad key, assert the *real*
   function raises; assert the *dispatcher* still returns mock output) rather than
   entangling "did the call fail" with "did the fallback work" inside one function.
+- **A bounded retry (e.g., one retry with a short backoff) before falling back to the
+  mock on a failed real call**: considered directly, **rejected**. The tradeoff, stated
+  explicitly rather than left implicit:
+  - **What a retry would cost.** `generate_explanation_real` feeds `api.py`'s live
+    spike-alert pipeline (`_run_alert_pipeline`), dispatched via `asyncio.create_task` —
+    genuinely fire-and-forget relative to the main per-frame `threat` stream, so a retry
+    here would NOT block or degrade that primary signal (this ADR's own founding
+    principle, unaffected either way). What a retry WOULD cost is the alert message's
+    OWN timeliness: at the current `GEMINI_TIMEOUT_SECONDS = 10.0` per attempt, adding
+    even one retry (plus backoff) could push the worst-case time before the mock
+    fallback kicks in to 20+ seconds — for a message whose entire point is being a
+    timely, attention-grabbing notice of a live tactical spike. A stale "spike alert"
+    arriving 20 seconds after the spike it describes has already passed is a real
+    degradation of the FEATURE, even though it never touches the PRIMARY stream this
+    ADR protects.
+  - **What a retry would buy.** Recovery from ONLY the subset of failures that are
+    genuinely transient (a brief network blip, a momentary rate-limit bounce). Every
+    other failure mode this integration actually handles — an absent or invalid key, a
+    quota genuinely exhausted, a persistent outage — is not helped by retrying at all;
+    the retry would just double the wasted latency before reaching the SAME, already-
+    correct fallback.
+  - **What already exists at zero cost regardless.** The mock executor is an instant,
+    always-available, always-correct fallback for every one of these failure modes,
+    transient or not — per this ADR's own founding framing, "explainability is
+    diagnostic and human-facing, not a control input to any downstream automated
+    decision," so a mock-quality explanation on a bad API day is an acceptable outcome,
+    not a degraded one in any load-bearing sense.
+  - **Decision: no retry.** The bounded set of failures a retry would actually help
+    with is narrow, the safety net for ALL failures (transient or not) already exists at
+    zero latency cost, and the downside (materially staler alerts on exactly the days
+    the API is having trouble) is concrete and real. Revisiting this is legitimate
+    FUTURE work if production ever shows a measured, non-trivial rate of genuinely
+    transient failures worth recovering from — a data-driven decision, not a
+    speculative one made in advance of any evidence it's needed.

@@ -44,6 +44,7 @@ If you only read one thing for a fast orientation: read `context.md`. If you wan
 ```bash
 pip install -r requirements-lock.txt            # exact versions this project was built/validated against
 # or: pip install -r requirements.txt            # unpinned, human-readable, grouped-by-track list instead
+cp .env.example .env                             # optional -- fill in whichever keys you actually need (all optional, see the file itself)
 python -m production.src.pipeline.train        # full StatsBomb training pipeline (expensive)
 pytest production/tests/                        # full test suite
 mlflow ui                                        # inspect logged runs (from repo root)

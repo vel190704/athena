@@ -12,6 +12,7 @@ import asyncio
 import math
 import os
 import re
+import time
 
 os.environ.setdefault("MLFLOW_ALLOW_FILE_STORE", "true")
 
@@ -188,7 +189,46 @@ def test_explainer_real_gemini_integration():
         ci = _cumulative_incidence_forward(model, normalized_input, time_bin=TIME_BIN).item()
     prompt = build_tactical_prompt(features_dict, attributions, ci, time_bin=TIME_BIN)
 
-    real_output = asyncio.run(generate_explanation_real(prompt))
+    # Retried HERE, in the test itself, only -- NOT in generate_explanation_real
+    # or generate_tactical_explanation (explainer.py's production dispatcher
+    # logic). ADR-006's Update explicitly decided AGAINST a production retry:
+    # a retry there would delay the live spike-alert's own timeliness for a
+    # benefit the mock fallback already provides at zero cost. That tradeoff
+    # does not apply here -- this call goes through generate_explanation_real
+    # directly (deliberately, so a failure here means "the real call itself
+    # failed," not "the fallback masked it").
+    #
+    # BACKOFF, not just retry count, matters here -- confirmed empirically,
+    # not assumed: an EARLIER version of this retry used 3 immediate
+    # attempts (no delay) and still failed on `asyncio.TimeoutError` on
+    # roughly half of repeated full-suite runs, with all 3 attempts timing
+    # out in a row. That pattern (every attempt failing the SAME way, back
+    # to back) is the signature of a SUSTAINED contention window, not an
+    # independent per-attempt blip a bare retry would fix -- most plausibly
+    # the event loop briefly starved of scheduling time by other tests'
+    # heavy synchronous CPU-bound work (GNN/MLP training elsewhere in this
+    # same suite run) or by test_api.py's own real Gemini calls (it runs
+    # BEFORE this file alphabetically and also exercises the real API when
+    # a key is present). A real delay between attempts gives that window
+    # time to clear; retrying immediately into the same conditions does not.
+    real_output = None
+    last_exc = None
+    backoff_seconds = (0, 3, 6, 10)
+    for attempt, delay in enumerate(backoff_seconds, start=1):
+        if delay:
+            time.sleep(delay)
+        try:
+            real_output = asyncio.run(generate_explanation_real(prompt))
+            break
+        except Exception as exc:  # noqa: BLE001 -- retrying broadly on purpose here
+            last_exc = exc
+            print(
+                f"\n[test] real Gemini call attempt {attempt}/{len(backoff_seconds)} failed "
+                f"({type(exc).__name__}); retrying..."
+            )
+    if real_output is None:
+        raise AssertionError(f"real Gemini call failed on all {len(backoff_seconds)} attempts; last error: {last_exc}")
+
     print(f"\n=== Real Gemini output ===\n{real_output}")
 
     assert isinstance(real_output, str)

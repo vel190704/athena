@@ -21,9 +21,43 @@ from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 import production.src.serving.api as api_module
+from production.src.models.explainer import generate_explanation as _mock_generate_explanation
 from production.src.serving.api import app
 
 MATCH_ID = 3857276
+
+
+@pytest.fixture(autouse=True)
+def _force_mock_explanation_executor(monkeypatch):
+    """This file tests WebSocket/CV-pipeline plumbing (connection
+    isolation, non-blocking pacing, path-safety) -- never real LLM output
+    quality, which is `test_explainer.py`'s own dedicated, opt-in real-API
+    test. Forces the mock executor unconditionally here (even if a real
+    `GEMINI_API_KEY` happens to be present in this environment's `.env`),
+    so these tests never depend on network access or silently consume
+    real, rate-limited API quota as a side effect of `api.py`'s own
+    real-vs-mock gating.
+
+    Patches the CALLABLE `api_module.generate_tactical_explanation` refers
+    to, not the `GEMINI_API_KEY` environment variable -- an earlier version
+    of this fixture used `monkeypatch.delenv`, which has a real race: the
+    spike-alert pipeline runs via `asyncio.create_task` (fire-and-forget),
+    so its own `os.environ.get(...)` check can execute after this
+    function-scoped fixture has already torn down and restored the key.
+    Patching the module-level name directly is synchronous and immediate,
+    with no such window.
+
+    Found the hard way, not preemptively: this file's own spike-alert
+    tests were making real Gemini calls whenever a key was present (an
+    accidental consequence of Step 5's `generate_tactical_explanation`
+    wiring, since these tests never mocked that call), intermittently
+    exhausting shared quota right before
+    `test_explainer_real_gemini_integration`'s own dedicated real-API test
+    ran later in the same suite -- causing IT to time out on every retry
+    attempt, even with backoff. Retrying harder in the other test was
+    treating the symptom; this is the actual fix.
+    """
+    monkeypatch.setattr(api_module, "generate_tactical_explanation", _mock_generate_explanation)
 
 
 def _try_receive_json(websocket, timeout: float = 2.0):
