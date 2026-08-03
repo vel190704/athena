@@ -27,7 +27,10 @@ import numpy as np
 
 from production.src.cv.pipeline import CVPipeline
 from production.src.cv.pixel_overlay_renderer import render_pixel_overlay
-from production.src.cv.tactical_map_renderer import render_tactical_map, transform_players_to_pitch_space
+from production.src.cv.tactical_map_renderer import (
+    render_tactical_map,
+    transform_players_to_pitch_space,
+)
 from production.src.pipeline.feature_extractor import PITCH_LENGTH, PITCH_WIDTH
 
 
@@ -78,7 +81,7 @@ def export_side_by_side_video(
     # Tactical-map panel width chosen to preserve the pitch's true 100:68
     # aspect ratio at the source video's height, rather than an arbitrary
     # fixed size that would visually distort it.
-    tactical_map_size = (int(round(frame_height * PITCH_LENGTH / PITCH_WIDTH)), frame_height)
+    tactical_map_size = (round(frame_height * PITCH_LENGTH / PITCH_WIDTH), frame_height)
     output_size = (frame_width + tactical_map_size[0], frame_height)
 
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")

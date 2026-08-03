@@ -44,6 +44,7 @@ import torch
 from torch.utils.data import Subset
 from torch_geometric.loader import DataLoader
 
+from production.src.constants import MLFLOW_EXPERIMENT_NAME
 from production.src.ingestion.statsbomb_io import (
     batch_extract_valid_matches,
     fetch_match_360,
@@ -51,12 +52,18 @@ from production.src.ingestion.statsbomb_io import (
     find_360_competitions,
     parse_360_frame,
 )
-from production.src.models.deep_ensemble import DeepEnsembleDeepHit, compute_disentangled_ensemble_loss
+from production.src.models.deep_ensemble import (
+    DeepEnsembleDeepHit,
+    compute_disentangled_ensemble_loss,
+)
 from production.src.models.deephit import DeepHitSurvivalModel
 from production.src.models.deephit_loss import DeepHitLoss
 from production.src.models.evaluation import calculate_brier_score
 from production.src.models.gnn_model import GNNDeepHitSurvivalModel
-from production.src.models.graph_builder import DEFAULT_OPPONENT_RADIUS, DEFAULT_SAME_TEAM_RADIUS
+from production.src.models.graph_builder import (
+    DEFAULT_OPPONENT_RADIUS,
+    DEFAULT_SAME_TEAM_RADIUS,
+)
 from production.src.pipeline.chain_builder import build_possession_chains
 from production.src.pipeline.data_split import match_level_split
 from production.src.pipeline.feature_extractor import extract_features
@@ -84,7 +91,9 @@ from production.src.spatial.control import BiomechanicalPitchControl
 # takes effect for this file's own standalone `python -m ...` entrypoint.
 logger = logging.getLogger(__name__)
 
-MLFLOW_EXPERIMENT_NAME = "project-athena-deephit"
+# MLFLOW_EXPERIMENT_NAME now comes from production.src.constants
+# (engineering-review de-duplication -- was defined locally here before,
+# and independently in explainer.py; value unchanged).
 
 # Milestone 14: scaled from a single competition (World Cup 2022 only,
 # Milestones 8-12B) to ALL competitions StatsBomb's live competitions index
@@ -2773,7 +2782,7 @@ def run_gnn_horizon_seed_split_sensitivity_check() -> dict:
             f"{mlp['brier_30s'] if mlp['brier_30s'] is not None else float('nan'):>15.4f} "
             f"{gnn['brier_15s'] if gnn['brier_15s'] is not None else float('nan'):>15.4f} "
             f"{gnn['brier_30s'] if gnn['brier_30s'] is not None else float('nan'):>15.4f} "
-            f"{gap_30s if gap_30s is not None else float('nan'):>20.4f} {str(both_healthy):>13}"
+            f"{gap_30s if gap_30s is not None else float('nan'):>20.4f} {both_healthy!s:>13}"
         )
         if not both_healthy:
             logger.warning(
@@ -2799,7 +2808,7 @@ def run_gnn_horizon_seed_split_sensitivity_check() -> dict:
             f"{mlp['brier_30s'] if mlp['brier_30s'] is not None else float('nan'):>15.4f} "
             f"{gnn['brier_15s'] if gnn['brier_15s'] is not None else float('nan'):>15.4f} "
             f"{gnn['brier_30s'] if gnn['brier_30s'] is not None else float('nan'):>15.4f} "
-            f"{gap_30s if gap_30s is not None else float('nan'):>20.4f} {str(both_healthy):>13}"
+            f"{gap_30s if gap_30s is not None else float('nan'):>20.4f} {both_healthy!s:>13}"
         )
         if not both_healthy:
             logger.warning(
@@ -2917,7 +2926,7 @@ def run_gnn_horizon_per_bin_investigation(seed_split_pairs: list[tuple[int, int]
                 mlp_pred = mlp_model(mlp_input)
                 gnn_pred = gnn_model(gnn_input)
 
-                for time_bin in range(0, NUM_BINS):
+                for time_bin in range(NUM_BINS):
                     mlp_brier, _ = calculate_brier_score(mlp_pred, mlp_dur_b, mlp_dur_b, mlp_ev_b, time_bin)
                     gnn_brier, _ = calculate_brier_score(gnn_pred, gnn_dur_b, gnn_dur_b, gnn_ev_b, time_bin)
                     bin_rows.append({
@@ -2943,7 +2952,7 @@ def run_gnn_horizon_per_bin_investigation(seed_split_pairs: list[tuple[int, int]
         logger.info(f"{'bin':>4} {'sec':>5} {'MLP train':>10} {'MLP val':>10} {'MLP gap':>9} {'GNN train':>10} {'GNN val':>10} {'GNN gap':>9} {'val gap (GNN-MLP)':>18}")
         train_by_bin = {r["time_bin"]: r for r in bin_rows if r["split"] == "train"}
         val_by_bin = {r["time_bin"]: r for r in bin_rows if r["split"] == "val"}
-        for time_bin in range(0, NUM_BINS):
+        for time_bin in range(NUM_BINS):
             t, v = train_by_bin[time_bin], val_by_bin[time_bin]
             mlp_train_val_gap = v["mlp_brier"] - t["mlp_brier"]
             gnn_train_val_gap = v["gnn_brier"] - t["gnn_brier"]

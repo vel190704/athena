@@ -18,6 +18,7 @@ TacticalSurvivalDataset's docstring for why that matters.
 import torch
 from torch.utils.data import Dataset
 
+from production.src.constants import BIN_SIZE_SECONDS
 from production.src.models.graph_builder import build_graph_from_frame
 
 # Fixed, documented key order for flattening a feature dict into a tensor.
@@ -33,9 +34,10 @@ FEATURE_KEYS = (
 # DeepHit (ADR-001) requires discretizing time into fixed-width bins. A
 # 60-second horizon in 5-second bins gives 12 bins. These are tunable
 # hyperparameters to be validated against real possession-duration
-# statistics in a later milestone, not derived constants.
+# statistics in a later milestone, not derived constants. BIN_SIZE_SECONDS
+# itself now comes from production.src.constants (engineering-review
+# de-duplication -- unchanged value, was defined locally here before).
 MAX_DURATION_SECONDS = 60.0
-BIN_SIZE_SECONDS = 5.0
 NUM_BINS = int(MAX_DURATION_SECONDS // BIN_SIZE_SECONDS)  # 12
 
 

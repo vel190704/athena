@@ -9,7 +9,7 @@ gather below indexes each sample's own F/S at its own duration bin using
 """
 
 import torch
-import torch.nn as nn
+from torch import nn
 
 # Applied immediately before every torch.log() call in this module. An
 # untrained network can assign near-zero PMF mass to a bin; unclamped
@@ -76,7 +76,6 @@ class DeepHitLoss(nn.Module):
         (model thinks i survives past t_i better than j does) drives it
         positive -> large loss.
         """
-        batch_size = predictions.shape[0]
         survival = self._survival_function(predictions)  # [batch, num_bins]
 
         duration_idx = durations.unsqueeze(1)  # [batch, 1]

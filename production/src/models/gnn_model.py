@@ -20,7 +20,7 @@ symmetric normalization does.
 """
 
 import torch
-import torch.nn as nn
+from torch import nn
 from torch_geometric.nn import SAGEConv, global_mean_pool
 
 NUM_NODE_FEATURES = 7  # [x, y, vx, vy, is_attacker, is_defender, dist_to_ball] -- graph_builder.py

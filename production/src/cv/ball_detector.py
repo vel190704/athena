@@ -163,10 +163,10 @@ def detect_ball_fallback(
     image_h, image_w = image.shape[:2]
     prev_x, prev_y = prev_ball_pos
 
-    crop_x1 = max(0, int(round(prev_x - search_radius_px)))
-    crop_y1 = max(0, int(round(prev_y - search_radius_px)))
-    crop_x2 = min(image_w, int(round(prev_x + search_radius_px)))
-    crop_y2 = min(image_h, int(round(prev_y + search_radius_px)))
+    crop_x1 = max(0, round(prev_x - search_radius_px))
+    crop_y1 = max(0, round(prev_y - search_radius_px))
+    crop_x2 = min(image_w, round(prev_x + search_radius_px))
+    crop_y2 = min(image_h, round(prev_y + search_radius_px))
 
     if crop_x2 <= crop_x1 or crop_y2 <= crop_y1:
         return None

@@ -16,16 +16,16 @@ that field would mean modifying `team_report.py`'s return contract, which
 this milestone's scope explicitly excludes.
 """
 
-import numpy as np
 import matplotlib
+import numpy as np
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.colors import TwoSlopeNorm
 from matplotlib.gridspec import GridSpec
 
-from production.src.reporting.pitch_diagram import draw_pitch_outline
 from production.src.pipeline.feature_extractor import PITCH_LENGTH, PITCH_WIDTH
+from production.src.reporting.pitch_diagram import draw_pitch_outline
 
 
 def _draw_control_heatmap(ax, control_heatmap_grid: list[list[float | None]]) -> None:

@@ -10,7 +10,7 @@ Python loops over players or grid cells.
 """
 
 import torch
-import torch.nn as nn
+from torch import nn
 
 
 class BiomechanicalPitchControl(nn.Module):

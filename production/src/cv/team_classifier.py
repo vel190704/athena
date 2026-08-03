@@ -67,10 +67,10 @@ def extract_jersey_color(image: np.ndarray, bbox: list[float]) -> list[float]:
     x, y, w, h = bbox
     image_h, image_w = image.shape[:2]
 
-    crop_x1 = int(round(x + (1.0 - CROP_WIDTH_FRACTION) / 2.0 * w))
-    crop_x2 = int(round(x + (1.0 + CROP_WIDTH_FRACTION) / 2.0 * w))
-    crop_y1 = int(round(y))
-    crop_y2 = int(round(y + CROP_HEIGHT_FRACTION * h))
+    crop_x1 = round(x + (1.0 - CROP_WIDTH_FRACTION) / 2.0 * w)
+    crop_x2 = round(x + (1.0 + CROP_WIDTH_FRACTION) / 2.0 * w)
+    crop_y1 = round(y)
+    crop_y2 = round(y + CROP_HEIGHT_FRACTION * h)
 
     crop_x1 = max(0, min(crop_x1, image_w))
     crop_x2 = max(0, min(crop_x2, image_w))
@@ -197,7 +197,7 @@ def classify_teams(players_data: list[dict], random_state: int = 42) -> dict[int
     # for removal before refitting -- a heuristic fraction, not the final
     # outlier decision (that happens in step 5, against ALL points).
     outlier_candidate_fraction = 0.2
-    num_candidates = max(1, int(round(outlier_candidate_fraction * n_points)))
+    num_candidates = max(1, round(outlier_candidate_fraction * n_points))
     candidate_outlier_indices = set(
         np.argsort(naive_distances)[-num_candidates:].tolist()
     )

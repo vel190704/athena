@@ -15,18 +15,21 @@ import os
 
 os.environ.setdefault("MLFLOW_ALLOW_FILE_STORE", "true")
 
+from production.src.models.explainer import load_deterministic_mlp
 from production.src.reporting.player_report import generate_player_report
-from production.src.reporting.team_report import generate_team_report
+from production.src.reporting.team_report import (
+    _build_pitch_grid,
+    _match_representative_chain_frames,
+    generate_team_report,
+)
 from production.src.reporting.zone_explainer import (
+    _active_grid_and_controls,
+    _zone_features_from_grid,
     aggregate_zone_attributions,
     compute_zone_attributions,
     zone_attributions_to_grid,
-    _active_grid_and_controls,
-    _zone_features_from_grid,
 )
-from production.src.reporting.team_report import _match_representative_chain_frames, _build_pitch_grid
 from production.src.spatial.control import BiomechanicalPitchControl
-from production.src.models.explainer import load_deterministic_mlp
 
 MESSI_PLAYER_ID = 5503
 MESSI_MATCH_IDS = [3773386, 3857264, 3857289, 3857300, 3869151, 3869321, 3869519, 3869685]

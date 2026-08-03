@@ -21,7 +21,10 @@ os.environ.setdefault("MLFLOW_ALLOW_FILE_STORE", "true")
 
 from production.src.ingestion.statsbomb_io import fetch_match_events
 from production.src.models.explainer import load_deterministic_mlp
-from production.src.pipeline.oracle_validator import find_substitutions, validate_oracle_substitutions
+from production.src.pipeline.oracle_validator import (
+    find_substitutions,
+    validate_oracle_substitutions,
+)
 
 MATCH_ID = 3857276
 
@@ -104,8 +107,8 @@ def test_validate_oracle_substitutions_end_to_end():
             f"{result['sub_id']:>6} {result['team']:<10} {result['minute']:>6} "
             f"{result['player_off']:<22.22} {result['player_on']:<22.22} "
             f"{result['threat_pre']:>8.4f} {result['threat_post']:>8.4f} {result['actual_delta']:>+8.4f} "
-            f"{result['classification']:<28} {str(result['perspective_verified']):>8} "
-            f"{str(result['overlapping_with']):<12}"
+            f"{result['classification']:<28} {result['perspective_verified']!s:>8} "
+            f"{result['overlapping_with']!s:<12}"
         )
 
     overlapping_results = [r for r in results if r["overlapping_with"]]

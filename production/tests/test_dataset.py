@@ -20,7 +20,6 @@ from torch_geometric.data import Data
 
 from production.src.pipeline.survival_dataset import (
     FEATURE_KEYS,
-    MAX_DURATION_SECONDS,
     NUM_BINS,
     TacticalSurvivalDataset,
 )

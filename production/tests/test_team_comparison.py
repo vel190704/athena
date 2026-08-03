@@ -11,7 +11,10 @@ fetched during that module's own original validation, so these tests run
 offline.
 """
 
-from production.src.reporting.team_comparison import compare_team_seasons, LOW_SAMPLE_MATCH_THRESHOLD
+from production.src.reporting.team_comparison import (
+    LOW_SAMPLE_MATCH_THRESHOLD,
+    compare_team_seasons,
+)
 
 
 def test_compare_team_seasons_well_supported_both_sides_real_data():

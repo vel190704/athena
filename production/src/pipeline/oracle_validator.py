@@ -30,12 +30,15 @@ measurement of the same team. See `validate_oracle_substitutions` for how
 this is enforced and verified.
 """
 
+from production.src.constants import TIME_BIN
 from production.src.ingestion.statsbomb_io import fetch_match_events, parse_360_frame
 from production.src.models.evaluation import predict_cumulative_incidence
 from production.src.pipeline.feature_extractor import extract_features
 from production.src.serving.api import _find_qualifying_frame_for_minute
 
-TIME_BIN = 3  # 15s horizon, matching every prior milestone
+# TIME_BIN (15s horizon, matching every prior milestone) now comes from
+# production.src.constants (engineering-review de-duplication -- was
+# defined locally here before; value unchanged).
 
 # Hand-picked heuristic threshold for LABELING purposes only -- NOT a
 # statistically validated significance threshold. Consistent with how

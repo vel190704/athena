@@ -111,10 +111,10 @@ import websocket
 
 from production.src.reporting.player_report import generate_player_report
 from production.src.reporting.player_visualizer import render_player_dashboard
-from production.src.reporting.team_report import generate_team_report
-from production.src.reporting.team_visualizer import render_team_dashboard
-from production.src.reporting.team_trend_data import generate_team_trend_report
 from production.src.reporting.team_comparison import compare_team_seasons
+from production.src.reporting.team_report import generate_team_report
+from production.src.reporting.team_trend_data import generate_team_trend_report
+from production.src.reporting.team_visualizer import render_team_dashboard
 
 DEFAULT_REST_BASE_URL = "http://127.0.0.1:8000"
 DEFAULT_WS_URL = "ws://127.0.0.1:8000/ws/tactical-stream"

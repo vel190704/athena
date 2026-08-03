@@ -16,17 +16,21 @@ performance-sensitive pixel-buffer pipeline (that's what `production/src/
 cv/tactical_map_renderer.py` is, and why THAT module uses OpenCV instead).
 """
 
-import numpy as np
 import matplotlib
+import numpy as np
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
 from scipy.ndimage import gaussian_filter
 
-from production.src.reporting.pitch_diagram import draw_pitch_outline
 from production.src.pipeline.feature_extractor import PITCH_LENGTH, PITCH_WIDTH
-from production.src.pipeline.habit_memory import GRID_COLS, GRID_ROWS, MIN_HISTORICAL_EVENTS
+from production.src.pipeline.habit_memory import (
+    GRID_COLS,
+    GRID_ROWS,
+    MIN_HISTORICAL_EVENTS,
+)
+from production.src.reporting.pitch_diagram import draw_pitch_outline
 
 # Reuses habit_memory's own cold-start threshold (not a separately-invented
 # number) as the "too few events to be a confident distribution" cutoff for

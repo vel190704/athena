@@ -17,7 +17,6 @@ of the synthetic setup (e.g. back to a flat scale) would itself be caught.
 import math
 
 import numpy as np
-import pytest
 
 from production.src.cv.calibration import compute_homography, transform_points
 
@@ -135,7 +134,7 @@ def test_homography_recovers_holdout_points_under_perspective_distortion():
     H_true = _build_synthetic_broadcast_camera_homography()
 
     calibration_pixels = [_project_with_homography(H_true, pt) for pt in PITCH_CORNERS_METERS]
-    print(f"\nCalibration correspondences (4 corners only):")
+    print("\nCalibration correspondences (4 corners only):")
     for meters, pixels in zip(PITCH_CORNERS_METERS, calibration_pixels):
         print(f"  meters={meters} -> pixels=({pixels[0]:.1f}, {pixels[1]:.1f})")
 

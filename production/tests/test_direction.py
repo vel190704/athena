@@ -7,7 +7,10 @@ across teams IS the evidence for that conclusion, not a bug to fix).
 """
 
 from production.src.ingestion.statsbomb_io import fetch_match_events
-from production.src.pipeline.direction import build_direction_lookup, infer_attacking_direction
+from production.src.pipeline.direction import (
+    build_direction_lookup,
+    infer_attacking_direction,
+)
 
 MATCH_ID = 3857276  # cached real StatsBomb open-data match
 

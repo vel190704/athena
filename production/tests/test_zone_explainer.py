@@ -17,7 +17,10 @@ import mlflow
 import numpy as np
 import pytest
 
-from production.src.models.explainer import generate_explanation, select_deterministic_mlp_run_id
+from production.src.models.explainer import (
+    generate_explanation,
+    select_deterministic_mlp_run_id,
+)
 from production.src.reporting.team_report import generate_team_report
 from production.src.reporting.zone_explainer import (
     aggregate_zone_attributions,

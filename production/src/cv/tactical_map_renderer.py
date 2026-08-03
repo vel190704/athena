@@ -43,7 +43,11 @@ from production.src.cv.pitch_keypoint_detector import (
     detect_pitch_keypoints,
     solve_homography_from_keypoints,
 )
-from production.src.cv.pixel_overlay_renderer import TEAM_COLORS_BGR, BALL_COLOR_BGR, player_feet_position
+from production.src.cv.pixel_overlay_renderer import (
+    BALL_COLOR_BGR,
+    TEAM_COLORS_BGR,
+    player_feet_position,
+)
 from production.src.pipeline.feature_extractor import PITCH_LENGTH, PITCH_WIDTH
 
 ACCURACY_CAVEAT_TEXT = (
@@ -205,7 +209,7 @@ def _to_canvas_xy(x_m: float, y_m: float, canvas_size: tuple[int, int]) -> tuple
     scale = min(avail_w / PITCH_LENGTH, avail_h / PITCH_WIDTH)
     offset_x = CANVAS_MARGIN_PX + (avail_w - PITCH_LENGTH * scale) / 2.0
     offset_y = CANVAS_MARGIN_PX + (avail_h - PITCH_WIDTH * scale) / 2.0
-    return int(round(offset_x + x_m * scale)), int(round(offset_y + y_m * scale))
+    return round(offset_x + x_m * scale), round(offset_y + y_m * scale)
 
 
 def _draw_pitch_outline(canvas: np.ndarray, canvas_size: tuple[int, int]) -> None:

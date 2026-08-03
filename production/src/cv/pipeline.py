@@ -25,9 +25,7 @@ computes the TRUE elapsed frame gap, and passes a per-track `dt_seconds`
 into the adapter accordingly -- see `CVPipeline.process_video` Step (d).
 """
 
-import time
 from collections.abc import Generator
-from pathlib import Path
 
 import cv2
 import numpy as np
@@ -35,7 +33,10 @@ import torch
 from ultralytics import YOLO
 
 from production.src.cv.adapter import convert_frame_to_tensors
-from production.src.cv.ball_detector import DEFAULT_BALL_CONFIDENCE_THRESHOLD, detect_ball
+from production.src.cv.ball_detector import (
+    DEFAULT_BALL_CONFIDENCE_THRESHOLD,
+    detect_ball,
+)
 from production.src.cv.detector import COCO_PERSON_CLASS_ID
 from production.src.cv.shot_classifier import compute_shot_features, is_tactical_view
 from production.src.cv.team_classifier import classify_teams, extract_jersey_color

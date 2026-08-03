@@ -31,6 +31,7 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import types as genai_types
 
+from production.src.constants import BIN_SIZE_SECONDS, MLFLOW_EXPERIMENT_NAME
 from production.src.pipeline.survival_dataset import FEATURE_KEYS
 
 # Loads GEMINI_API_KEY (and anything else) from a git-ignored .env file if
@@ -48,8 +49,11 @@ load_dotenv()
 # comment establishes).
 logger = logging.getLogger(__name__)
 
-MLFLOW_EXPERIMENT_NAME = "project-athena-deephit"
-BIN_SIZE_SECONDS = 5.0  # Milestone 6A convention, kept local to avoid a training-pipeline import
+# MLFLOW_EXPERIMENT_NAME and BIN_SIZE_SECONDS now come from
+# production.src.constants (engineering-review de-duplication -- both were
+# previously redefined locally here; BIN_SIZE_SECONDS specifically to
+# "avoid a training-pipeline import," a concern the new dependency-free
+# constants module makes moot). Values unchanged.
 
 # Verified against the real, current Gemini API docs and the google-genai
 # PyPI/GitHub pages immediately before this was written (not recalled from

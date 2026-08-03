@@ -17,7 +17,7 @@ REFERENCE ONLY, not calibration geometry -- nothing here feeds into any
 computed report value.
 """
 
-import matplotlib.patches as patches
+from matplotlib import patches
 
 from production.src.pipeline.feature_extractor import PITCH_LENGTH, PITCH_WIDTH
 

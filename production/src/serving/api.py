@@ -31,6 +31,7 @@ import torch
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from ultralytics import YOLO
 
+from production.src.constants import TIME_BIN
 from production.src.cv.pipeline import CVPipeline
 from production.src.ingestion.statsbomb_io import (
     fetch_match_360,
@@ -50,7 +51,9 @@ from production.src.pipeline.survival_dataset import FEATURE_KEYS
 from production.src.serving.simulator import live_match_stream
 
 DEFAULT_MATCH_ID = 3857276
-TIME_BIN = 3  # 15s horizon, matching Milestones 8/13/14/15
+# TIME_BIN (15s horizon, matching Milestones 8/13/14/15) now comes from
+# production.src.constants (engineering-review de-duplication -- was
+# defined locally here before; value unchanged).
 
 # Milestone 33: the CV video-source path. Only paths that resolve INSIDE
 # this directory are ever opened -- a raw `video_path` query parameter is

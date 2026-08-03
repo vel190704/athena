@@ -53,11 +53,11 @@ happen with or without a change in their tagged ROLE, and the two
 questions should not be blurred into one number).
 """
 
+from production.src.ingestion.statsbomb_io import fetch_competitions_index
 from production.src.pipeline.habit_memory import MIN_HISTORICAL_EVENTS
 from production.src.reporting.data_fallback import find_or_fetch_player_matches
 from production.src.reporting.player_report import generate_player_report
 from production.src.reporting.team_comparison import _season_start_year, _zone_shares
-from production.src.ingestion.statsbomb_io import fetch_competitions_index
 from production.src.reporting.team_trend_data import _season_label
 
 # Reused directly from habit_memory -- the SAME threshold player_report.py/

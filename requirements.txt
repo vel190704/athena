@@ -9,6 +9,15 @@ tqdm
 
 # --- Testing ---
 pytest
+pytest-cov         # coverage reporting -- engineering-review action item
+
+# --- Lint / type checking (engineering-review action item) -- ruff and mypy
+# are DEV tooling, not runtime dependencies of any production code path;
+# grouped here rather than a separate dev-requirements.txt for now, since
+# this project has always kept a single flat requirements.txt/-lock.txt
+# pair rather than splitting dev/prod. ---
+ruff
+mypy
 
 # --- StatsBomb / physics-ML track (Milestones 1-24, empirically validated) ---
 torch

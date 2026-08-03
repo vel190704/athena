@@ -14,7 +14,10 @@ dependency -- entirely independent of ADR-013 through ADR-016.
 from collections import Counter
 
 from production.src.ingestion.statsbomb_io import fetch_match_events
-from production.src.pipeline.habit_memory import MIN_HISTORICAL_EVENTS, generate_player_heatmap
+from production.src.pipeline.habit_memory import (
+    MIN_HISTORICAL_EVENTS,
+    generate_player_heatmap,
+)
 
 
 def _match_time_minutes(event: dict) -> float:

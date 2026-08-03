@@ -136,7 +136,7 @@ def test_iterative_refit_meaningfully_changes_centroids_vs_naive_fit():
     naive_labels = naive_kmeans.labels_
     naive_distances = np.linalg.norm(features - naive_centroids[naive_labels], axis=1)
 
-    num_candidates = max(1, int(round(0.2 * len(players_data))))
+    num_candidates = max(1, round(0.2 * len(players_data)))
     candidate_indices = set(np.argsort(naive_distances)[-num_candidates:].tolist())
     candidate_track_ids = [players_data[i]["track_id"] for i in candidate_indices]
 
@@ -156,7 +156,7 @@ def test_iterative_refit_meaningfully_changes_centroids_vs_naive_fit():
         for i, j in enumerate(row_ind)
     )
 
-    print(f"\n=== Naive vs. refined centroid comparison ===")
+    print("\n=== Naive vs. refined centroid comparison ===")
     print(f"Candidate outliers removed before refit: track_ids={candidate_track_ids}")
     print(f"Naive centroids:\n{naive_centroids}")
     print(f"Refined centroids:\n{refined_centroids}")
@@ -201,7 +201,7 @@ def test_circular_hue_averaging_within_a_single_crop():
     full_hsv = cv2.cvtColor(bgr_crop, cv2.COLOR_BGR2HSV)
     naive_linear_mean_hue = float(full_hsv[:, :, 0].astype(np.float64).mean())
 
-    print(f"\n=== Circular hue averaging: wraparound crop (half hue=2, half hue=177) ===")
+    print("\n=== Circular hue averaging: wraparound crop (half hue=2, half hue=177) ===")
     print(f"Circular mean hue (extract_jersey_color): {circular_hue:.2f}")
     print(f"Naive linear mean hue (independent computation): {naive_linear_mean_hue:.2f}")
 
@@ -257,7 +257,7 @@ def test_circular_hue_wraparound_colors_are_close_in_clustering_feature_space():
     circular_distance_high = np.linalg.norm(red_features - high_hue_features)
     naive_raw_hue_distance = abs(2.0 - 177.0)
 
-    print(f"\n=== Circular feature-space distance (hue~2 / hue~177 vs. pure red hue=0) ===")
+    print("\n=== Circular feature-space distance (hue~2 / hue~177 vs. pure red hue=0) ===")
     print(f"Circular feature distance, hue=2 vs hue=0:   {circular_distance_low:.4f}")
     print(f"Circular feature distance, hue=177 vs hue=0: {circular_distance_high:.4f}")
     print(f"Naive raw-hue-scalar distance, hue=2 vs hue=177: {naive_raw_hue_distance:.1f}")

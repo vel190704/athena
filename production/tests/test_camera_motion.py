@@ -23,19 +23,15 @@ import math
 
 import cv2
 import numpy as np
-import pytest
 
 from production.src.cv.calibration import transform_points
 from production.src.cv.camera_motion import (
     BASE_MASK_CONFIDENCE_THRESHOLD,
     BBOX_MASK_PADDING_FRACTION,
     HYSTERESIS_CONFIDENCE_MIN,
-    _reference_point_displacement_px,
-    HYSTERESIS_IOU_THRESHOLD,
-    MIN_BACKGROUND_FEATURE_POINTS,
     CameraMotionTracker,
-    _bbox_iou,
     _pad_bbox,
+    _reference_point_displacement_px,
     _select_boxes_to_mask,
     estimate_camera_motion,
 )

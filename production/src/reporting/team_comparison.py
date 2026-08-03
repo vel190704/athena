@@ -42,12 +42,17 @@ whenever one side is thin.
 from production.src.ingestion.statsbomb_io import (
     X_SCALE,
     Y_SCALE,
-    fetch_competitions_index,
     fetch_competition_matches,
+    fetch_competitions_index,
     fetch_match_events,
 )
 from production.src.pipeline.feature_extractor import FINAL_THIRD_X, PITCH_WIDTH
-from production.src.pipeline.habit_memory import GRID_COLS, GRID_ROWS, CELL_WIDTH_METERS, CELL_HEIGHT_METERS
+from production.src.pipeline.habit_memory import (
+    CELL_HEIGHT_METERS,
+    CELL_WIDTH_METERS,
+    GRID_COLS,
+    GRID_ROWS,
+)
 from production.src.reporting.team_report import DEFENSIVE_THIRD_X, generate_team_report
 
 # Named and stated openly, mirroring habit_memory.MIN_HISTORICAL_EVENTS's

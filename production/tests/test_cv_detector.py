@@ -15,7 +15,6 @@ Three layers, deliberately kept separate:
      bug in this milestone's implementation.
 """
 
-import os
 
 import pytest
 

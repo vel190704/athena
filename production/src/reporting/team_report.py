@@ -15,19 +15,27 @@ through ADR-016.
 
 import torch
 
-from production.src.ingestion.statsbomb_io import fetch_match_events, fetch_match_360
-from production.src.pipeline.chain_builder import build_possession_chains
-from production.src.pipeline.feature_extractor import (
-    PITCH_LENGTH,
-    PITCH_WIDTH,
-    FINAL_THIRD_X,
-    extract_features,
+from production.src.ingestion.statsbomb_io import (
+    fetch_match_360,
+    fetch_match_events,
+    parse_360_frame,
 )
-from production.src.pipeline.habit_memory import GRID_COLS, GRID_ROWS, CELL_WIDTH_METERS, CELL_HEIGHT_METERS
-from production.src.ingestion.statsbomb_io import parse_360_frame
-from production.src.spatial.control import BiomechanicalPitchControl
 from production.src.models.evaluation import predict_cumulative_incidence
 from production.src.models.explainer import load_deterministic_mlp
+from production.src.pipeline.chain_builder import build_possession_chains
+from production.src.pipeline.feature_extractor import (
+    FINAL_THIRD_X,
+    PITCH_LENGTH,
+    PITCH_WIDTH,
+    extract_features,
+)
+from production.src.pipeline.habit_memory import (
+    CELL_HEIGHT_METERS,
+    CELL_WIDTH_METERS,
+    GRID_COLS,
+    GRID_ROWS,
+)
+from production.src.spatial.control import BiomechanicalPitchControl
 
 # Mirrors feature_extractor.FINAL_THIRD_X (66.0, an established, hand-tuned
 # asymmetric threshold -- NOT exactly PITCH_LENGTH/3) for the defensive

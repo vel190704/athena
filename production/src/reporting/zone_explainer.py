@@ -38,8 +38,18 @@ import torch
 from captum.attr import IntegratedGradients
 from scipy.ndimage import label
 
-from production.src.pipeline.feature_extractor import NEAR_BALL_RADIUS, FINAL_THIRD_X, PITCH_LENGTH, PITCH_WIDTH
-from production.src.pipeline.habit_memory import GRID_COLS, GRID_ROWS, CELL_WIDTH_METERS, CELL_HEIGHT_METERS
+from production.src.pipeline.feature_extractor import (
+    FINAL_THIRD_X,
+    NEAR_BALL_RADIUS,
+    PITCH_LENGTH,
+    PITCH_WIDTH,
+)
+from production.src.pipeline.habit_memory import (
+    CELL_HEIGHT_METERS,
+    CELL_WIDTH_METERS,
+    GRID_COLS,
+    GRID_ROWS,
+)
 from production.src.spatial.control import BiomechanicalPitchControl
 
 
@@ -253,8 +263,11 @@ def aggregate_zone_attributions(team_name: str, match_ids: list[int], time_bin: 
     once (`explainer.load_deterministic_mlp`), lazily, only if at least one
     qualifying frame is found.
     """
-    from production.src.reporting.team_report import _match_representative_chain_frames, _teams_in_match
     from production.src.models.explainer import load_deterministic_mlp
+    from production.src.reporting.team_report import (
+        _match_representative_chain_frames,
+        _teams_in_match,
+    )
 
     engine = BiomechanicalPitchControl()
     grid_x, grid_y = torch.meshgrid(
@@ -483,13 +496,13 @@ def identify_notable_zones(
             values = grid[component_mask]
             centroid_col = float(cells[:, 0].mean())
             centroid_row = float(cells[:, 1].mean())
-            zone_name = _zone_name(int(round(centroid_col)), int(round(centroid_row)))
+            zone_name = _zone_name(round(centroid_col), round(centroid_row))
             zones.append(
                 {
                     "name": zone_name,
                     "sign": sign,
                     "aggregate_attribution": float(values.sum()),
-                    "cell_count": int(len(cells)),
+                    "cell_count": len(cells),
                     "centroid_xy_m": (
                         (centroid_col + 0.5) * CELL_WIDTH_METERS,
                         (centroid_row + 0.5) * CELL_HEIGHT_METERS,

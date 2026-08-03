@@ -12,6 +12,7 @@ import queue
 import threading
 import time
 from pathlib import Path
+from typing import ClassVar
 
 os.environ.setdefault("MLFLOW_ALLOW_FILE_STORE", "true")
 
@@ -21,7 +22,9 @@ from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 import production.src.serving.api as api_module
-from production.src.models.explainer import generate_explanation as _mock_generate_explanation
+from production.src.models.explainer import (
+    generate_explanation as _mock_generate_explanation,
+)
 from production.src.serving.api import app
 
 MATCH_ID = 3857276
@@ -207,7 +210,7 @@ class _FakeCVPipelineForIsolationTest:
     JSON they receive -- proving no cross-connection state leakage.
     """
 
-    instances: list["_FakeCVPipelineForIsolationTest"] = []
+    instances: ClassVar[list["_FakeCVPipelineForIsolationTest"]] = []
 
     def __init__(self, homography_matrix=None, model_checkpoint="yolov8m.pt", **kwargs):
         self.video_path_seen = None

@@ -25,7 +25,7 @@ live WebSocket API (Milestone 16) under real latency constraints.
 """
 
 import torch
-import torch.nn as nn
+from torch import nn
 
 from production.src.models.deephit import DeepHitSurvivalModel
 from production.src.models.deephit_loss import DeepHitLoss
