@@ -11,12 +11,74 @@ Real, already-cached StatsBomb/football-data.co.uk data throughout (no
 mocked report output) -- these tests exercise the ACTUAL reporting
 functions via the dashboard's real cached wrappers, the same discipline
 `test_reporting.py`/`test_team_comparison.py`/etc. already use.
+
+ADR-018 UPDATE: Player Reports, Team Reports, and Team Comparison now call
+`api.py` over REAL HTTP (`requests.get`), not an in-process function call
+-- `AppTest` actually executes `dashboard.py`'s real code, including these
+real `requests.get()` calls over an actual socket, so unlike every other
+test in this suite (which use FastAPI's in-process `TestClient`), these
+three tabs' tests need a REAL, listening backend to hit. The
+`live_api_server` fixture below starts one (a real `uvicorn.Server`,
+full lifespan -- genuine MLflow model load, genuine YOLO checkpoint warm,
+exactly what every `with TestClient(app) as client:` block elsewhere in
+this project's test suite already triggers, just over an actual bound
+socket instead of an in-process ASGI transport) on an OS-assigned free
+port, and each affected test points the dashboard's "REST API Base URL"
+sidebar field at it before clicking its tab's Generate/Compare button.
+The Team Trends tab needs no such fixture: `team_trend_data.py` is a
+deliberate, named exception to ADR-018 (see that ADR) and is still called
+in-process, unchanged.
 """
 
+import threading
+import time
+
+import pytest
+import requests
+import uvicorn
 from streamlit.testing.v1 import AppTest
+
+from production.src.serving.api import app as _fastapi_app
 
 DASHBOARD_PATH = "production/frontend/dashboard.py"
 APP_TIMEOUT_SECONDS = 180
+
+
+@pytest.fixture(scope="module")
+def live_api_server():
+    config = uvicorn.Config(_fastapi_app, host="127.0.0.1", port=0, log_level="warning")
+    server = uvicorn.Server(config)
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+
+    deadline = time.monotonic() + 120
+    while not server.started and time.monotonic() < deadline:
+        time.sleep(0.05)
+    if not server.started:
+        raise RuntimeError("live_api_server did not start in time")
+
+    port = server.servers[0].sockets[0].getsockname()[1]
+    base_url = f"http://127.0.0.1:{port}"
+
+    # Belt-and-suspenders: `server.started` flips only after the ASGI
+    # lifespan's own startup (real MLflow load + YOLO warm) has already
+    # completed, since Starlette blocks request handling until lifespan
+    # startup finishes -- but confirm the app actually answers before
+    # handing the URL to a test, rather than trusting a flag alone.
+    while time.monotonic() < deadline:
+        try:
+            if requests.get(f"{base_url}/openapi.json", timeout=2).status_code == 200:
+                break
+        except requests.exceptions.ConnectionError:
+            pass
+        time.sleep(0.5)
+    else:
+        raise RuntimeError("live_api_server did not become ready in time")
+
+    yield base_url
+
+    server.should_exit = True
+    thread.join(timeout=10)
 
 
 def test_dashboard_loads_all_five_tabs_no_exception():
@@ -32,12 +94,16 @@ def test_dashboard_loads_all_five_tabs_no_exception():
     assert "Team-Season Style Comparison" in headers
 
 
-def test_player_reports_tab_low_sample_warning_renders_real_data():
+def test_player_reports_tab_low_sample_warning_renders_real_data(live_api_server):
     """Yu-Min Cho (1 real tagged event): the LOW SAMPLE warning must
     render as a real, visible st.warning element -- the exact regression
-    this tab exists to guard against (Milestone 44's original finding)."""
+    this tab exists to guard against (Milestone 44's original finding).
+    ADR-018: this tab's report data now comes over real HTTP, so it needs
+    `live_api_server`; the sidebar's REST API Base URL must be pointed at
+    it before the Generate button is clicked."""
     at = AppTest.from_file(DASHBOARD_PATH)
     at.run(timeout=APP_TIMEOUT_SECONDS)
+    at.sidebar.text_input[0].set_value(live_api_server)
 
     player_tab = at.tabs[1]
     player_tab.selectbox[0].set_value("Yu-Min Cho (99479) -- LOW SAMPLE, 1 event")
@@ -53,11 +119,12 @@ def test_player_reports_tab_low_sample_warning_renders_real_data():
     assert len(player_tab.image) == 1
 
 
-def test_player_reports_tab_well_supported_no_false_positive_warning_real_data():
+def test_player_reports_tab_well_supported_no_false_positive_warning_real_data(live_api_server):
     """Messi (well-supported): no warning should fire -- the mirror case,
     confirming the check above isn't just always-on."""
     at = AppTest.from_file(DASHBOARD_PATH)
     at.run(timeout=APP_TIMEOUT_SECONDS)
+    at.sidebar.text_input[0].set_value(live_api_server)
 
     player_tab = at.tabs[1]
     player_tab.button[0].click()  # default selectbox value is the Messi preset
@@ -69,12 +136,36 @@ def test_player_reports_tab_well_supported_no_false_positive_warning_real_data()
     assert len(player_tab.image) == 1
 
 
-def test_team_comparison_tab_reliability_caveat_renders_as_error_real_data():
+def test_team_reports_tab_renders_real_data(live_api_server):
+    """Argentina (well-supported, >=2 matches): confirms the Team Reports
+    tab -- newly HTTP-based per ADR-018 -- still renders its sample-size
+    info banner and image with no low-sample warning, end to end through
+    the new endpoint."""
+    at = AppTest.from_file(DASHBOARD_PATH)
+    at.run(timeout=APP_TIMEOUT_SECONDS)
+    at.sidebar.text_input[0].set_value(live_api_server)
+
+    team_tab = at.tabs[2]
+    team_tab.selectbox[0].set_value("Argentina")
+    at.run(timeout=APP_TIMEOUT_SECONDS)
+    team_tab = at.tabs[2]
+    team_tab.button[0].click()
+    at.run(timeout=APP_TIMEOUT_SECONDS)
+    team_tab = at.tabs[2]
+
+    assert not at.exception
+    assert len(team_tab.image) == 1
+    assert any("Built from" in i.value for i in team_tab.info)
+    assert len(team_tab.warning) == 0
+
+
+def test_team_comparison_tab_reliability_caveat_renders_as_error_real_data(live_api_server):
     """Real Madrid 2016 vs. Barcelona 2008: the reliability caveat must
     render as a prominent st.error, not a quiet footnote -- Step 5's
     explicit requirement, now persisted as a regression test."""
     at = AppTest.from_file(DASHBOARD_PATH)
     at.run(timeout=APP_TIMEOUT_SECONDS)
+    at.sidebar.text_input[0].set_value(live_api_server)
 
     compare_tab = at.tabs[4]
     compare_tab.text_input[0].set_value("Real Madrid")

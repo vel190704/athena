@@ -13,11 +13,32 @@ The four new tabs ("Player Reports", "Team Reports", "Team Trends",
 "Team Comparison") are a pure UI WIRING layer over the existing reporting
 modules (`player_report.py`, `team_report.py`, `team_trend_data.py`,
 `team_comparison.py`, and their visualizers) -- none of that
-report-generation logic is modified, reimplemented, or duplicated here;
-this file only imports and calls those existing public functions, wrapped
-in `st.cache_data` so Streamlit's rerun-the-whole-script-on-any-widget-
-interaction model doesn't silently re-trigger expensive report generation
-on every tab switch or unrelated click.
+report-generation logic is modified, reimplemented, or duplicated here.
+
+ADR-018 (read before modifying the reporting tabs): Player Reports, Team
+Reports, and Team Comparison no longer import their report-generation
+functions directly -- they call the new `/reports/player/{player_id}`,
+`/reports/team/{team_name}`, and `/reports/team-comparison` endpoints on
+`api.py` over HTTP instead, reusing the same `rest_base_url` sidebar
+config the What-If Simulator already uses. This closes a real
+dual-entrypoint gap: previously this Streamlit process talked to MLflow
+and `data/raw/` independently of `api.py`, which only worked because both
+processes happened to run on the same machine. See ADR-018 for the full
+reasoning, including why `team_trend_data.py` is a deliberate, NAMED
+EXCEPTION to this: that module's own docstring already states it must
+never be served over a network endpoint (an unresolved football-data.co.uk
+licensing scope, the same conservative stance ADR-014 applies to the CV
+track's AGPL-derived model) -- so the Team Trends tab below still imports
+and calls `generate_team_trend_report` directly, unchanged, and still
+needs `data/raw/` write access and network access to football-data.co.uk
+from wherever this dashboard process itself runs. Full multi-machine
+separation therefore holds for three of the four reporting tabs, not all
+four -- stated plainly, not implied to be complete.
+
+All four tabs' results are still wrapped in `st.cache_data` so Streamlit's
+rerun-the-whole-script-on-any-widget-interaction model doesn't silently
+re-trigger expensive report generation (now an HTTP round-trip for three
+of the four tabs) on every tab switch or unrelated click.
 
 ARCHITECTURAL DECISION -- read before modifying this file:
 
@@ -70,7 +91,6 @@ stop failure mode described above.
 """
 
 import json
-import os
 import sys
 import tempfile
 import time
@@ -91,28 +111,12 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
-# Must be set before any import that transitively touches MLflow (the
-# Team Reports tab's generate_team_report -> load_deterministic_mlp ->
-# mlflow.tracking.MlflowClient() chain) -- this project's mlflow version
-# treats the file-store backend as read-only "maintenance mode"
-# otherwise. `production/src/serving/api.py` sets this itself at its own
-# module top level for the exact same reason (the standalone-launch fix
-# from Milestone 17); this dashboard is ALSO a standalone entrypoint
-# (`streamlit run production/frontend/dashboard.py`) that never imports
-# api.py, so nothing else in this process would set it otherwise -- found
-# via this file's own Step 6 validation (a real crash, not a
-# hypothetical), not assumed in advance.
-os.environ.setdefault("MLFLOW_ALLOW_FILE_STORE", "true")
-
 import pandas as pd
 import requests
 import streamlit as st
 import websocket
 
-from production.src.reporting.player_report import generate_player_report
 from production.src.reporting.player_visualizer import render_player_dashboard
-from production.src.reporting.team_comparison import compare_team_seasons
-from production.src.reporting.team_report import generate_team_report
 from production.src.reporting.team_trend_data import generate_team_trend_report
 from production.src.reporting.team_visualizer import render_team_dashboard
 
@@ -134,6 +138,11 @@ MAX_ALERT_BUFFER_LEN = 20
 RECV_TIMEOUT_SECONDS = 60.0  # how long to wait for a single message before treating the stream as stalled
 SIMULATE_REQUEST_TIMEOUT_SECONDS = 5.0  # mandatory -- see What-If section below
 TACTICAL_ACTIONS = ["high_press", "drop_deep", "force_wide", "no_change"]
+# ADR-018: report endpoints do real network fetches (StatsBomb), MLflow
+# artifact loads, and pitch-control physics across potentially many chains --
+# a single /simulate-style 5s budget is too tight for these. 60s matches this
+# file's own RECV_TIMEOUT_SECONDS as a "generous but bounded" convention.
+REPORT_REQUEST_TIMEOUT_SECONDS = 60.0
 
 # --- Reporting-tab UI presets -------------------------------------------
 # Cheaply enumerable, already-validated (player/team, match_ids) pairs
@@ -157,16 +166,32 @@ KNOWN_TEAM_PRESETS = {
 }
 
 
-# --- Cached wrappers over the EXISTING, UNMODIFIED reporting functions --
+# --- Cached wrappers ------------------------------------------------------
 # Streamlit reruns this entire script on almost any widget interaction;
 # without these, switching tabs or touching an unrelated widget would
-# silently re-trigger real report generation (event fetching, pitch-
-# control aggregation, live football-data.co.uk/StatsBomb network calls)
-# every single time. Keyed on tuples (not lists) for a cleanly hashable
-# cache key.
+# silently re-trigger a real report generation (now an HTTP round-trip to
+# api.py for three of the four tabs -- see ADR-018) every single time.
+# Keyed on tuples (not lists) for a cleanly hashable cache key.
+#
+# `rest_base_url` is deliberately an explicit PARAMETER of each of these
+# functions (not read from an outer/global variable inside the function
+# body) so it correctly participates in `st.cache_data`'s cache key: if the
+# user edits the "REST API Base URL" sidebar field, that must invalidate any
+# previously-cached report fetched from a DIFFERENT backend, not silently
+# keep serving a stale response from whichever URL happened to be active the
+# first time a given (player_id, match_ids) combination was requested.
+# Without this, a base-URL change would go unnoticed by the cache -- a real,
+# subtle bug this file's own original (pre-ADR-018) cache signature
+# (player_id, match_ids only) would have reintroduced.
 @st.cache_data(show_spinner=False)
-def _cached_player_report(player_id: int, match_ids: tuple[int, ...]) -> dict:
-    return generate_player_report(player_id, list(match_ids))
+def _cached_player_report(rest_base_url: str, player_id: int, match_ids: tuple[int, ...]) -> dict:
+    response = requests.get(
+        f"{rest_base_url}/reports/player/{player_id}",
+        params={"match_ids": list(match_ids)},
+        timeout=REPORT_REQUEST_TIMEOUT_SECONDS,
+    )
+    response.raise_for_status()
+    return response.json()
 
 
 @st.cache_data(show_spinner=False)
@@ -181,8 +206,14 @@ def _cached_player_png(report: dict) -> bytes:
 
 
 @st.cache_data(show_spinner=False)
-def _cached_team_report(team_name: str, match_ids: tuple[int, ...]) -> dict:
-    return generate_team_report(team_name, list(match_ids))
+def _cached_team_report(rest_base_url: str, team_name: str, match_ids: tuple[int, ...]) -> dict:
+    response = requests.get(
+        f"{rest_base_url}/reports/team/{requests.utils.quote(team_name, safe='')}",
+        params={"match_ids": list(match_ids)},
+        timeout=REPORT_REQUEST_TIMEOUT_SECONDS,
+    )
+    response.raise_for_status()
+    return response.json()
 
 
 @st.cache_data(show_spinner=False)
@@ -196,14 +227,54 @@ def _cached_team_png(report: dict) -> bytes:
         Path(tmp_path).unlink(missing_ok=True)
 
 
+# team_trend_data.py is a deliberate, NAMED EXCEPTION to ADR-018's
+# consolidation -- see this file's module docstring and ADR-018 itself.
+# That module's own docstring already states it must never be wired into
+# api.py's served layer (unresolved football-data.co.uk licensing scope),
+# so this tab keeps calling generate_team_trend_report directly, unlike the
+# other three reporting tabs.
 @st.cache_data(show_spinner=False)
 def _cached_team_trend_report(team_name: str, start_season: int, end_season: int) -> dict:
     return generate_team_trend_report(team_name, start_season, end_season)
 
 
 @st.cache_data(show_spinner=False)
-def _cached_team_comparison(team_a: str, season_a: int, team_b: str, season_b: int) -> dict:
-    return compare_team_seasons(team_a, season_a, team_b, season_b)
+def _cached_team_comparison(
+    rest_base_url: str, team_a: str, season_a: int, team_b: str, season_b: int
+) -> dict:
+    response = requests.get(
+        f"{rest_base_url}/reports/team-comparison",
+        params={"team_a": team_a, "season_a": season_a, "team_b": team_b, "season_b": season_b},
+        timeout=REPORT_REQUEST_TIMEOUT_SECONDS,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def _fetch_report_safely(fetch_fn, rest_base_url: str) -> dict | None:
+    """Calls `fetch_fn()` (a zero-arg closure around one of the `_cached_*`
+    HTTP wrappers above) and returns its parsed JSON, or `None` if the
+    request failed -- rendering a clean `st.error` in the same style this
+    file's original What-If Simulator panel already uses, rather than
+    letting an unhandled `requests` exception crash this tab's script
+    execution (ADR-018: these three tabs now make a real network call,
+    where before they were in-process function calls that could not fail
+    this way)."""
+    try:
+        return fetch_fn()
+    except requests.exceptions.Timeout:
+        st.error(
+            f"Report request timed out after {REPORT_REQUEST_TIMEOUT_SECONDS:.0f}s -- the backend "
+            f"at {rest_base_url} did not respond in time."
+        )
+    except requests.exceptions.ConnectionError:
+        st.error(
+            f"Backend unreachable at {rest_base_url} -- confirm the FastAPI server is running "
+            "(uvicorn production.src.serving.api:app)."
+        )
+    except requests.exceptions.HTTPError as exc:
+        st.error(f"Report request failed: {exc}")
+    return None
 
 
 st.set_page_config(page_title="Project Athena Dashboard", layout="wide")
@@ -465,8 +536,12 @@ with tab_cv:
                 )
 
 # ============================================================================
-# TAB: Player Reports -- UI wiring over player_report.py/player_visualizer.py,
-# unmodified. See module docstring for the caching rationale.
+# TAB: Player Reports -- report DATA now fetched over HTTP from api.py's
+# /reports/player/{player_id} (ADR-018); PNG rendering still calls
+# player_visualizer.py directly (pure client-side rendering of an
+# already-fetched dict, no MLflow/data/raw access of its own). Neither
+# player_report.py nor player_visualizer.py is modified. See module
+# docstring for the caching rationale.
 # ============================================================================
 with tab_player:
     st.header("Player Report")
@@ -490,37 +565,48 @@ with tab_player:
             st.error("Provide a player_id and at least one match_id.")
         else:
             with st.spinner("Generating report..."):
-                report = _cached_player_report(player_id, match_ids)
+                report = _fetch_report_safely(
+                    lambda: _cached_player_report(rest_base_url, player_id, match_ids), rest_base_url
+                )
+
+            if report is not None:
                 png_bytes = _cached_player_png(report)
 
-            # Milestone 44's validation sweep found a real gap: a 1-event
-            # player's positional_distribution/heatmap look just as
-            # "confident" as a well-supported player's. That fix must
-            # survive into THIS UI as a real, visible Streamlit element --
-            # not just as banners baked into the PNG image, which a user
-            # could plausibly skim past.
-            if report.get("heatmap_used_uniform_fallback"):
-                st.warning(
-                    f"LOW SAMPLE: only {report.get('heatmap_event_count', 0)} qualifying event(s) "
-                    "for this player -- the heatmap below is a UNIFORM FALLBACK (habit_memory's "
-                    "own cold-start threshold, MIN_HISTORICAL_EVENTS), not a real learned pattern. "
-                    "Treat this report as illustrative, not a confident finding."
-                )
-            elif report.get("positional_distribution_event_count", 0) < 20:
-                st.warning(
-                    f"LOW SAMPLE: positional distribution is based on only "
-                    f"{report.get('positional_distribution_event_count', 0)} tagged event(s) -- "
-                    "not a confident distribution."
-                )
+                # Milestone 44's validation sweep found a real gap: a
+                # 1-event player's positional_distribution/heatmap look just
+                # as "confident" as a well-supported player's. That fix must
+                # survive into THIS UI as a real, visible Streamlit element
+                # -- not just as banners baked into the PNG image, which a
+                # user could plausibly skim past. These fields are passed
+                # through the /reports/player/{player_id} endpoint's JSON
+                # response completely unchanged (ADR-018), so this check
+                # works identically whether report came from a direct call
+                # or, as now, over HTTP.
+                if report.get("heatmap_used_uniform_fallback"):
+                    st.warning(
+                        f"LOW SAMPLE: only {report.get('heatmap_event_count', 0)} qualifying event(s) "
+                        "for this player -- the heatmap below is a UNIFORM FALLBACK (habit_memory's "
+                        "own cold-start threshold, MIN_HISTORICAL_EVENTS), not a real learned pattern. "
+                        "Treat this report as illustrative, not a confident finding."
+                    )
+                elif report.get("positional_distribution_event_count", 0) < 20:
+                    st.warning(
+                        f"LOW SAMPLE: positional distribution is based on only "
+                        f"{report.get('positional_distribution_event_count', 0)} tagged event(s) -- "
+                        "not a confident distribution."
+                    )
 
-            st.image(png_bytes, caption=f"Player Report -- player_id={player_id}", width="stretch")
+                st.image(png_bytes, caption=f"Player Report -- player_id={player_id}", width="stretch")
 
-            with st.expander("Raw report data"):
-                st.json(report)
+                with st.expander("Raw report data"):
+                    st.json(report)
 
 # ============================================================================
-# TAB: Team Reports -- UI wiring over team_report.py/team_visualizer.py,
-# unmodified.
+# TAB: Team Reports -- report DATA now fetched over HTTP from api.py's
+# /reports/team/{team_name} (ADR-018); PNG rendering still calls
+# team_visualizer.py directly (pure client-side rendering, no MLflow/
+# data/raw access of its own). Neither team_report.py nor
+# team_visualizer.py is modified.
 # ============================================================================
 with tab_team:
     st.header("Team Report")
@@ -547,35 +633,48 @@ with tab_team:
             st.error("Provide a team name and at least one match_id.")
         else:
             with st.spinner("Generating report..."):
-                team_report_dict = _cached_team_report(team_name, team_match_ids)
-                team_png_bytes = _cached_team_png(team_report_dict)
-
-            # team_report.py/team_visualizer.py's existing sample-size
-            # caption (matches_used/matches_requested) is baked into the
-            # rendered PNG already -- surfaced HERE too as a real Streamlit
-            # element, per this tab's explicit requirement, not just left
-            # embedded in the image.
-            st.info(
-                f"Built from {team_report_dict['matches_used']} matches "
-                f"(of {team_report_dict['matches_requested']} requested). "
-                "Per-frame count is not exposed by generate_team_report's current return "
-                "contract -- match-level count shown for transparency about sample size, "
-                "not a frame-level one (see team_visualizer.py's own caption)."
-            )
-            if team_report_dict["matches_used"] < 2:
-                st.warning(
-                    f"LOW SAMPLE: only {team_report_dict['matches_used']} match used -- treat "
-                    "this team's pitch-control/threat pattern as illustrative, not a confident "
-                    "season-level finding."
+                team_report_dict = _fetch_report_safely(
+                    lambda: _cached_team_report(rest_base_url, team_name, team_match_ids), rest_base_url
                 )
 
-            st.image(team_png_bytes, caption=f"Team Report -- {team_name}", width="stretch")
+            if team_report_dict is not None:
+                team_png_bytes = _cached_team_png(team_report_dict)
 
-            with st.expander("Raw report data"):
-                st.json(team_report_dict)
+                # team_report.py/team_visualizer.py's existing sample-size
+                # caption (matches_used/matches_requested) is baked into the
+                # rendered PNG already -- surfaced HERE too as a real
+                # Streamlit element, per this tab's explicit requirement,
+                # not just left embedded in the image. Passed through the
+                # /reports/team/{team_name} endpoint's JSON response
+                # unchanged (ADR-018).
+                st.info(
+                    f"Built from {team_report_dict['matches_used']} matches "
+                    f"(of {team_report_dict['matches_requested']} requested). "
+                    "Per-frame count is not exposed by generate_team_report's current return "
+                    "contract -- match-level count shown for transparency about sample size, "
+                    "not a frame-level one (see team_visualizer.py's own caption)."
+                )
+                if team_report_dict["matches_used"] < 2:
+                    st.warning(
+                        f"LOW SAMPLE: only {team_report_dict['matches_used']} match used -- treat "
+                        "this team's pitch-control/threat pattern as illustrative, not a confident "
+                        "season-level finding."
+                    )
+
+                st.image(team_png_bytes, caption=f"Team Report -- {team_name}", width="stretch")
+
+                with st.expander("Raw report data"):
+                    st.json(team_report_dict)
 
 # ============================================================================
-# TAB: Team Trends -- UI wiring over team_trend_data.py, unmodified.
+# TAB: Team Trends -- UI wiring over team_trend_data.py, unmodified. A
+# DELIBERATE, NAMED EXCEPTION to ADR-018 (see module docstring): this tab
+# still calls generate_team_trend_report directly, in-process, because
+# that module's own docstring forbids wiring it into api.py's served layer
+# pending resolution of its data source's licensing scope. This is the one
+# reporting tab that still requires dashboard.py to run with its own
+# data/raw/ and football-data.co.uk network access -- not fully separated
+# from the backend the way the other three tabs now are.
 # ============================================================================
 with tab_trends:
     st.header("Team Trend Report (football-data.co.uk)")
@@ -647,7 +746,9 @@ with tab_trends:
                 st.json(trend_report)
 
 # ============================================================================
-# TAB: Team Comparison -- UI wiring over team_comparison.py, unmodified.
+# TAB: Team Comparison -- report DATA now fetched over HTTP from api.py's
+# /reports/team-comparison (ADR-018). team_comparison.py itself is not
+# modified.
 # ============================================================================
 with tab_compare:
     st.header("Team-Season Style Comparison")
@@ -666,41 +767,49 @@ with tab_compare:
 
     if generate_comparison_clicked:
         with st.spinner("Fetching match data and computing comparison..."):
-            comparison = _cached_team_comparison(
-                compare_team_a.strip(), int(compare_season_a), compare_team_b.strip(), int(compare_season_b)
+            comparison = _fetch_report_safely(
+                lambda: _cached_team_comparison(
+                    rest_base_url,
+                    compare_team_a.strip(), int(compare_season_a),
+                    compare_team_b.strip(), int(compare_season_b),
+                ),
+                rest_base_url,
             )
 
-        st.subheader(f"Analysis mode: `{comparison['analysis_mode']}`")
-        st.caption(comparison["mode_reason"])
+        if comparison is not None:
+            st.subheader(f"Analysis mode: `{comparison['analysis_mode']}`")
+            st.caption(comparison["mode_reason"])
 
-        richness_col_a, richness_col_b = st.columns(2)
-        with richness_col_a:
-            ra = comparison["data_richness"]["team_a"]
-            st.metric(f"{ra['team']} {ra['season']} matches", ra["matches"])
-            st.caption(ra["flag"])
-        with richness_col_b:
-            rb = comparison["data_richness"]["team_b"]
-            st.metric(f"{rb['team']} {rb['season']} matches", rb["matches"])
-            st.caption(rb["flag"])
+            richness_col_a, richness_col_b = st.columns(2)
+            with richness_col_a:
+                ra = comparison["data_richness"]["team_a"]
+                st.metric(f"{ra['team']} {ra['season']} matches", ra["matches"])
+                st.caption(ra["flag"])
+            with richness_col_b:
+                rb = comparison["data_richness"]["team_b"]
+                st.metric(f"{rb['team']} {rb['season']} matches", rb["matches"])
+                st.caption(rb["flag"])
 
-        # THE critical requirement for this tab: a low-sample side's
-        # reliability caveat must be a prominent, impossible-to-miss
-        # element -- never a quiet footnote a user could scroll past.
-        if comparison["reliability_caveat"]:
-            st.error(comparison["reliability_caveat"])
+            # THE critical requirement for this tab: a low-sample side's
+            # reliability caveat must be a prominent, impossible-to-miss
+            # element -- never a quiet footnote a user could scroll past.
+            # Passed through the /reports/team-comparison endpoint's JSON
+            # response unchanged (ADR-018).
+            if comparison["reliability_caveat"]:
+                st.error(comparison["reliability_caveat"])
 
-        st.subheader("Summary")
-        st.write(comparison["summary"])
+            st.subheader("Summary")
+            st.write(comparison["summary"])
 
-        if comparison["analysis_mode"] == "event_location_activity_map":
-            st.subheader("Zone shares (share of located events)")
-            zone_df = pd.DataFrame(comparison["zone_shares"])
-            st.dataframe(zone_df)
-            st.subheader("Zone diff (A - B)")
-            st.json(comparison["zone_diff_a_minus_b"])
-        else:
-            st.subheader("Threat-by-pitch-zone diff (A - B)")
-            st.json(comparison["threat_by_pitch_zone_diff_a_minus_b"])
+            if comparison["analysis_mode"] == "event_location_activity_map":
+                st.subheader("Zone shares (share of located events)")
+                zone_df = pd.DataFrame(comparison["zone_shares"])
+                st.dataframe(zone_df)
+                st.subheader("Zone diff (A - B)")
+                st.json(comparison["zone_diff_a_minus_b"])
+            else:
+                st.subheader("Threat-by-pitch-zone diff (A - B)")
+                st.json(comparison["threat_by_pitch_zone_diff_a_minus_b"])
 
-        with st.expander("Raw comparison data"):
-            st.json(comparison)
+            with st.expander("Raw comparison data"):
+                st.json(comparison)

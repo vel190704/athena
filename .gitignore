@@ -9,3 +9,4 @@ data/raw/
 *.pt
 .env
 reports_output/
+.coverage

@@ -411,3 +411,80 @@ def test_cv_source_unreadable_file_closes_cleanly_not_a_crash():
                 ws.receive_json()
         print(f"\nUnreadable-video close code: {exc_info.value.code}, reason: {exc_info.value.reason}")
         assert exc_info.value.code == 1011
+
+
+# ============================================================================
+# ADR-018 reporting endpoints: thin wrappers over player_report.py/
+# team_report.py/team_comparison.py's existing, unmodified functions. Same
+# real-cached-data discipline as test_reporting.py/test_team_comparison.py
+# (MESSI_PLAYER_ID/ARGENTINA_MATCH_IDS/Real Madrid-Barcelona are the exact
+# same values those files already use, so no new network fetch is needed
+# here) -- these tests exist to confirm the HTTP boundary itself (status
+# code, JSON shape, and that every caveat/reliability field survives the
+# move to a JSON response unchanged), not to re-validate the underlying
+# report-generation logic a second time.
+# ============================================================================
+
+MESSI_PLAYER_ID = 5503
+ARGENTINA_MATCH_IDS = [3857264, 3857289, 3857300, 3869151]
+
+
+def test_reports_player_endpoint_returns_real_report_with_caveat_fields():
+    with TestClient(app) as client:
+        response = client.get(
+            f"/reports/player/{MESSI_PLAYER_ID}",
+            params={"match_ids": ARGENTINA_MATCH_IDS},
+        )
+    assert response.status_code == 200
+    report = response.json()
+
+    assert report["player_id"] == MESSI_PLAYER_ID
+    assert report["matches_requested"] == len(ARGENTINA_MATCH_IDS)
+    # Caveat/transparency fields (Milestone 44) must survive the HTTP
+    # boundary exactly, not get silently dropped by JSON serialization.
+    assert "heatmap_used_uniform_fallback" in report
+    assert "heatmap_event_count" in report
+    assert "positional_distribution_event_count" in report
+    assert report["heatmap_used_uniform_fallback"] is False  # Messi is well-supported
+
+
+def test_reports_player_endpoint_low_sample_caveat_survives_http_real_data():
+    """Yu-Min Cho (1 real tagged event) -- the exact low-sample case
+    dashboard.py's own Player Reports tab test guards -- must still report
+    itself as a uniform fallback after going through the HTTP boundary."""
+    with TestClient(app) as client:
+        response = client.get("/reports/player/99479", params={"match_ids": [3857262]})
+    assert response.status_code == 200
+    report = response.json()
+    assert report["heatmap_used_uniform_fallback"] is True
+
+
+def test_reports_team_endpoint_returns_real_report_with_shape():
+    with TestClient(app) as client:
+        response = client.get("/reports/team/Argentina", params={"match_ids": ARGENTINA_MATCH_IDS})
+    assert response.status_code == 200
+    report = response.json()
+
+    assert report["team_name"] == "Argentina"
+    assert report["matches_used"] == len(ARGENTINA_MATCH_IDS)
+    assert "control_heatmap_grid" in report
+    assert "threat_by_pitch_zone" in report
+    assert "weakest_control_zones" in report
+
+
+def test_reports_team_comparison_endpoint_reliability_caveat_survives_http_real_data():
+    """Real Madrid 2016 vs. Barcelona 2008 -- the exact reliability-caveat
+    case dashboard.py's own Team Comparison tab test guards -- must still
+    render as a populated, non-null field after going through the HTTP
+    boundary, not silently dropped."""
+    with TestClient(app) as client:
+        response = client.get(
+            "/reports/team-comparison",
+            params={"team_a": "Real Madrid", "season_a": 2016, "team_b": "Barcelona", "season_b": 2008},
+        )
+    assert response.status_code == 200
+    comparison = response.json()
+
+    assert comparison["reliability_caveat"] is not None
+    assert "Real Madrid 2016" in comparison["reliability_caveat"]
+    assert "NOT equally reliable" in comparison["reliability_caveat"]

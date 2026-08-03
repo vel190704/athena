@@ -28,7 +28,7 @@ from typing import Literal
 os.environ.setdefault("MLFLOW_ALLOW_FILE_STORE", "true")
 
 import torch
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from ultralytics import YOLO
 
 from production.src.constants import TIME_BIN
@@ -48,6 +48,9 @@ from production.src.models.explainer import (
 from production.src.pipeline.feature_extractor import extract_features
 from production.src.pipeline.simulator import perturb_features
 from production.src.pipeline.survival_dataset import FEATURE_KEYS
+from production.src.reporting.player_report import generate_player_report
+from production.src.reporting.team_comparison import compare_team_seasons
+from production.src.reporting.team_report import generate_team_report
 from production.src.serving.simulator import live_match_stream
 
 DEFAULT_MATCH_ID = 3857276
@@ -573,3 +576,49 @@ async def simulate(
         "simulated_threat_15s": simulated_threat_15s,
         "delta": simulated_threat_15s - baseline_threat_15s,
     }
+
+
+# ============================================================================
+# Reporting endpoints (ADR-018): the ONLY code path that should call
+# load_deterministic_mlp() or touch data/raw/ for reporting purposes going
+# forward. `dashboard.py`'s Player Reports / Team Reports / Team Comparison
+# tabs call these over HTTP instead of importing player_report.py/
+# team_report.py/team_comparison.py directly -- see ADR-018 for the full
+# dual-entrypoint problem this closes. Each endpoint is a THIN wrapper: the
+# report-generation functions themselves are unmodified, imported and called
+# exactly as they already were, and their full return dicts (including every
+# caveat/reliability field -- low-sample flags, heatmap_used_uniform_fallback,
+# reliability_caveat, etc.) are passed straight through as the JSON response,
+# not trimmed or reshaped.
+#
+# `team_trend_data.py` deliberately has NO endpoint here -- that module's own
+# docstring states it must never be wired into this served layer pending
+# resolution of its data source's licensing scope (the same conservative
+# stance ADR-014 applies to the AGPL-derived CV model). See ADR-018.
+#
+# Each wrapped function does real, potentially slow, blocking work (network
+# fetches to StatsBomb, MLflow artifact loads, pitch-control physics) -- run
+# via asyncio.to_thread, the same pattern already used for /simulate's
+# _predict_cumulative_incidence_sync calls, so a slow report never blocks the
+# event loop (and therefore never blocks other connections' WebSocket
+# streams) while it runs.
+# ============================================================================
+
+
+@app.get("/reports/player/{player_id}")
+async def get_player_report(player_id: int, match_ids: list[int] = Query(...)):
+    """Wraps player_report.generate_player_report, unmodified. `match_ids`
+    is a repeated query parameter, e.g. `?match_ids=1&match_ids=2`."""
+    return await asyncio.to_thread(generate_player_report, player_id, match_ids)
+
+
+@app.get("/reports/team/{team_name}")
+async def get_team_report(team_name: str, match_ids: list[int] = Query(...)):
+    """Wraps team_report.generate_team_report, unmodified."""
+    return await asyncio.to_thread(generate_team_report, team_name, match_ids)
+
+
+@app.get("/reports/team-comparison")
+async def get_team_comparison(team_a: str, season_a: int, team_b: str, season_b: int):
+    """Wraps team_comparison.compare_team_seasons, unmodified."""
+    return await asyncio.to_thread(compare_team_seasons, team_a, season_a, team_b, season_b)
