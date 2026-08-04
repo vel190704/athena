@@ -42,15 +42,20 @@ from production.src.models.explainer import (
     _cumulative_incidence_forward,
     build_tactical_prompt,
     compute_attributions,
-    generate_tactical_explanation,
+    generate_tactical_explanation_with_source,
     load_deterministic_mlp,
 )
 from production.src.pipeline.feature_extractor import extract_features
 from production.src.pipeline.simulator import perturb_features
 from production.src.pipeline.survival_dataset import FEATURE_KEYS
-from production.src.reporting.player_report import generate_player_report
+from production.src.reporting.player_report import (
+    generate_player_report,
+    generate_player_shot_map,
+)
 from production.src.reporting.team_comparison import compare_team_seasons
 from production.src.reporting.team_report import generate_team_report
+from production.src.serving.alert_store import DB_PATH as ALERT_DB_PATH
+from production.src.serving.alert_store import fetch_alerts, init_db, log_alert
 from production.src.serving.simulator import live_match_stream
 
 DEFAULT_MATCH_ID = 3857276
@@ -111,6 +116,15 @@ async def lifespan(app: FastAPI):
     YOLO(CV_MODEL_CHECKPOINT)
     print("[api] CV model checkpoint ready.")
 
+    # ADR-019 (Stage 2 persistence): ensure the alert-history schema exists
+    # before any connection could fire an alert. `init_db()` is also called
+    # defensively inside `log_alert`/`fetch_alerts` themselves (so direct/
+    # test callers that bypass this lifespan still work), but doing it here
+    # too means the schema is ready before the server ever accepts a
+    # connection, not lazily on the first alert.
+    init_db()
+    print(f"[api] Alert-history store ready at {ALERT_DB_PATH.resolve()}")
+
     yield
 
 
@@ -168,20 +182,45 @@ async def _run_alert_pipeline(
     features_dict: dict,
     normalized_input: torch.Tensor,
     cumulative_incidence: float,
+    alert_context: dict,
 ) -> None:
     """Background task (Step 3.7/3.8): computes attributions, builds the
     prompt, runs the explanation executor (Milestone 15's mock, or a real
     Gemini Flash-Lite call if GEMINI_API_KEY is set -- see ADR-006's Update
-    section; the choice is entirely internal to `generate_tactical_explanation`,
-    this call site does not know or need to know which one actually ran),
-    then sends the alert -- guarded by the SAME connection-scoped lock the
-    main loop uses for `threat` messages, so this send can never interleave
-    with (and corrupt) a concurrent `threat` send on the same connection.
+    section), then sends the alert -- guarded by the SAME connection-scoped
+    lock the main loop uses for `threat` messages, so this send can never
+    interleave with (and corrupt) a concurrent `threat` send on the same
+    connection.
+
+    ADR-019 (Stage 2 persistence): `alert_context` carries the
+    source/match_id/video_path/minute/previous_threat_15s needed to log
+    this alert to `alert_store.py`'s SQLite history table.
+    `generate_tactical_explanation_with_source` (rather than the plain
+    `generate_tactical_explanation` every other call site still uses)
+    additionally reports which executor actually produced the text, so
+    `explanation_source` is accurate rather than guessed. The persistence
+    write is fired via `asyncio.create_task` and NEVER awaited here -- it
+    must never block or delay the WebSocket send below, which is byte-for-
+    byte identical to before this change.
     """
     prompt = await asyncio.to_thread(
         _build_alert_prompt_sync, features_dict, normalized_input, cumulative_incidence
     )
-    explanation = await generate_tactical_explanation(prompt)
+    explanation, explanation_source = await generate_tactical_explanation_with_source(prompt)
+
+    asyncio.create_task(
+        asyncio.to_thread(
+            log_alert,
+            source=alert_context["source"],
+            match_id=alert_context["match_id"],
+            video_path=alert_context["video_path"],
+            minute=alert_context["minute"],
+            threat_before=alert_context["previous_threat_15s"],
+            threat_after=cumulative_incidence,
+            explanation_text=explanation,
+            explanation_source=explanation_source,
+        )
+    )
 
     async with connection_lock:
         await websocket.send_json({"type": "alert", "explanation": explanation})
@@ -195,11 +234,19 @@ def _maybe_trigger_spike_alert(
     spike_threshold: float,
     features_dict: dict,
     normalized_input: torch.Tensor,
+    alert_context: dict,
 ) -> None:
     """Shared spike-detection trigger (Milestone 16), reused IDENTICALLY by
     both the StatsBomb-replay and Milestone 33 CV-video sources below --
     the detection rule and alert pipeline must not silently diverge
     between sources depending on where the `threat_15s` number came from.
+
+    `alert_context`: `{"source", "match_id", "video_path", "minute"}` --
+    everything ADR-019's alert-history log needs beyond what was already
+    being computed here. `previous_threat_15s` is added to it below before
+    being forwarded, since `_run_alert_pipeline` needs `threat_before` and
+    this function is where that value is still in scope; it is guaranteed
+    non-None here (spike_fired already required it).
     """
     spike_fired = (
         previous_threat_15s is not None
@@ -208,7 +255,12 @@ def _maybe_trigger_spike_alert(
     if spike_fired:
         asyncio.create_task(
             _run_alert_pipeline(
-                websocket, connection_lock, features_dict, normalized_input, cumulative_incidence
+                websocket,
+                connection_lock,
+                features_dict,
+                normalized_input,
+                cumulative_incidence,
+                {**alert_context, "previous_threat_15s": previous_threat_15s},
             )
         )
 
@@ -369,6 +421,12 @@ async def _stream_cv_source(
             spike_threshold,
             features_dict,
             normalized_input,
+            {
+                "source": "cv",
+                "match_id": None,
+                "video_path": video_path,
+                "minute": int(target_timestamp_seconds // 60),
+            },
         )
         previous_threat_15s = cumulative_incidence
 
@@ -445,6 +503,12 @@ async def tactical_stream(
                 spike_threshold,
                 features_dict,
                 normalized_input,
+                {
+                    "source": "statsbomb",
+                    "match_id": match_id,
+                    "video_path": None,
+                    "minute": event.get("minute"),
+                },
             )
 
             # Updated regardless of whether a spike fired (Step 3.7).
@@ -612,6 +676,21 @@ async def get_player_report(player_id: int, match_ids: list[int] = Query(...)):
     return await asyncio.to_thread(generate_player_report, player_id, match_ids)
 
 
+@app.get("/reports/player/{player_id}/shot-map")
+async def get_player_shot_map(player_id: int, match_ids: list[int] = Query(...)):
+    """Wraps player_report.generate_player_shot_map, unmodified. A
+    DEDICATED endpoint, not a field added to /reports/player/{player_id}'s
+    response, deliberately: extending that endpoint's response would mean
+    EVERY existing caller pays the shot-map computation's cost (measured
+    ~11s for a full 596-match career) on every call, whether or not they
+    want shot-map data -- a real, if secondary, violation of "additive
+    only" (performance, not just response shape) that a separate endpoint
+    avoids entirely. Existing /reports/player/{player_id} callers and
+    response shape are completely unaffected by this endpoint's existence.
+    """
+    return await asyncio.to_thread(generate_player_shot_map, player_id, match_ids)
+
+
 @app.get("/reports/team/{team_name}")
 async def get_team_report(team_name: str, match_ids: list[int] = Query(...)):
     """Wraps team_report.generate_team_report, unmodified."""
@@ -622,3 +701,31 @@ async def get_team_report(team_name: str, match_ids: list[int] = Query(...)):
 async def get_team_comparison(team_a: str, season_a: int, team_b: str, season_b: int):
     """Wraps team_comparison.compare_team_seasons, unmodified."""
     return await asyncio.to_thread(compare_team_seasons, team_a, season_a, team_b, season_b)
+
+
+# ============================================================================
+# ADR-019 (Stage 2 persistence): the read side of the alert-history store.
+# Every filter is optional; `start_utc`/`end_utc` are ISO-8601 UTC strings
+# (matching what `log_alert` writes) and AND-combined with any other
+# filters given. This is the endpoint that makes persisting alerts actually
+# useful -- "so I can review a match's alert history afterward" -- rather
+# than write-only data nobody can query back.
+# ============================================================================
+
+
+@app.get("/alerts/history")
+async def get_alerts_history(
+    match_id: int | None = None,
+    source: Literal["statsbomb", "cv"] | None = None,
+    start_utc: str | None = None,
+    end_utc: str | None = None,
+    limit: int = 500,
+):
+    return await asyncio.to_thread(
+        fetch_alerts,
+        match_id=match_id,
+        source=source,
+        start_utc=start_utc,
+        end_utc=end_utc,
+        limit=limit,
+    )

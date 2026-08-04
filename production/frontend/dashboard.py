@@ -116,7 +116,12 @@ import requests
 import streamlit as st
 import websocket
 
-from production.src.reporting.player_visualizer import render_player_dashboard
+import production.src.reporting.candidate_index as candidate_index_module
+from production.src.reporting.candidate_index import enumerate_cached_candidates
+from production.src.reporting.player_visualizer import (
+    render_player_dashboard,
+    render_shot_map,
+)
 from production.src.reporting.team_trend_data import generate_team_trend_report
 from production.src.reporting.team_visualizer import render_team_dashboard
 
@@ -144,26 +149,62 @@ TACTICAL_ACTIONS = ["high_press", "drop_deep", "force_wide", "no_change"]
 # file's own RECV_TIMEOUT_SECONDS as a "generous but bounded" convention.
 REPORT_REQUEST_TIMEOUT_SECONDS = 60.0
 
-# --- Reporting-tab UI presets -------------------------------------------
-# Cheaply enumerable, already-validated (player/team, match_ids) pairs
-# from this project's own history (Milestone 44's validation sweep /
-# build_index.py's `render_validation_dashboards`) -- reused here purely
-# as convenient UI dropdown entries, NOT a re-implementation of anything
-# in player_report.py/team_report.py. "Custom" is always available
-# alongside these for any other cached (or fetchable) player/team.
-_LEVERKUSEN_MATCH_IDS = (3895052, 3895060, 3895067, 3895074, 3895086, 3895095, 3895107, 3895113)
-KNOWN_PLAYER_PRESETS = {
-    "Lionel Messi (5503) -- well-supported": (5503, (3773386, 3857264, 3857289, 3857300, 3869151, 3869321, 3869519, 3869685)),
-    "Kristijan Jakić (32602) -- LOW SAMPLE, 0 events": (32602, (3869684,)),
-    "Yu-Min Cho (99479) -- LOW SAMPLE, 1 event": (99479, (3857262,)),
-    "Amine Adli (33401) -- multi-position": (33401, _LEVERKUSEN_MATCH_IDS),
-    "Lukáš Hrádecký (8667) -- goalkeeper": (8667, _LEVERKUSEN_MATCH_IDS),
-}
-KNOWN_TEAM_PRESETS = {
-    "Argentina": (3857264, 3857289, 3857300, 3869151),
-    "Barcelona -- LOW SAMPLE, 1 match": (3773386,),
-    "Bayer Leverkusen": _LEVERKUSEN_MATCH_IDS,
-}
+# Timeout-incident fix, MEASURED (not guessed) directly against this
+# project's own real cached data before being chosen -- see the task that
+# added this constant for the full breakdown. Real Madrid's 68-match
+# request (2 of them 360-covered) timed out at 61.90s; pre-filtering to
+# just the 2 360-covered matches dropped that to 4.82s -- confirming most
+# of the original cost was wasted network round-trips checking coverage
+# generate_team_report has no cheap way to know in advance, which
+# candidate_index.py's own 360-scan already does. But pre-filtering ALONE
+# is not sufficient: PSG's full, genuinely well-supported, ALREADY
+# pre-filtered 51-match case (every one of them real, no waste) still took
+# 100.27s -- real BiomechanicalPitchControl/DeepHit compute. Two real
+# calibration points: Bayer Leverkusen's 31 matches took 36.77s and
+# 47.55s across two separate runs (~1.2-1.5s/match); PSG's 51 took 100.27s
+# (~2.0s/match) -- genuine run-to-run variance, not just scale. 25 is
+# chosen to stay under REPORT_REQUEST_TIMEOUT_SECONDS even at the WORSE
+# observed rate (25 * 2.0s = 50s, ~10s margin for model-loading/fixed
+# overhead) while trimming as little as possible off the single largest
+# genuinely well-supported real case in this cache (Bayer Leverkusen's 31
+# -- 6 matches short of the cap, a disclosed, minor, deliberate
+# trade-off, not an oversight).
+TEAM_REPORT_MAX_360_MATCHES_PER_REQUEST = 25
+
+# --- Reporting-tab candidate lists (dynamic, from what's actually cached) -
+# Previously a small, hand-picked preset dict (Milestone 44's original
+# validation-sweep cases only) -- replaced with a REAL scan of data/raw/
+# via candidate_index.py, so the dropdown reflects everything actually
+# cached, including whatever data_fallback.py's own runs have pulled in
+# since (e.g. Ronaldo, Real Madrid, PSG, Bayern Munich, Messi's full
+# tracked career) -- not just the original 5 players / 3 teams. See
+# candidate_index.py's own module docstring for exactly what this scan
+# reads (cached event/match-list JSON only) versus skips (no
+# positional-distribution/heatmap aggregation, no pitch-control physics,
+# no MLflow/model access -- a pure enumeration, not a report).
+#
+# ARCHITECTURAL NOTE (disclosed, not silently glossed over): this scan
+# reads `data/raw/` DIRECTLY from the Streamlit process, same as this
+# dashboard did for reporting DATA before ADR-018 -- meaning populating
+# these dropdowns still assumes `dashboard.py` runs with its own
+# `data/raw/` access, even though the actual report GENERATION for a
+# selected candidate correctly goes through api.py's HTTP boundary
+# (unchanged). This is a real, narrower re-introduction of a co-location
+# assumption, scoped to dropdown population only -- not something ADR-018
+# claimed to solve for this not-yet-existing feature, and not something
+# this task asked to extend api.py to cover (a `/candidates/...` endpoint
+# would remove it; out of this task's stated scope, which is a
+# dashboard/enumeration-layer change only).
+REFRESH_CACHE_LIST_TTL_SECONDS = 3600  # 1 hour -- generous; paired with a manual refresh button below for on-demand invalidation
+
+
+@st.cache_data(show_spinner="Scanning data/raw/ for cached players/teams (one-time, ~15-20s at current cache size)...", ttl=REFRESH_CACHE_LIST_TTL_SECONDS)
+def _cached_candidate_index(_cache_bust: int) -> tuple[list[dict], list[dict]]:
+    """`_cache_bust` is never read -- its only job is to participate in
+    `st.cache_data`'s cache key, so the "Refresh cache list" button
+    (which increments it in `st.session_state`) can force a fresh scan on
+    demand, on top of the TTL above."""
+    return enumerate_cached_candidates()
 
 
 # --- Cached wrappers ------------------------------------------------------
@@ -200,6 +241,33 @@ def _cached_player_png(report: dict) -> bytes:
         tmp_path = tmp.name
     try:
         render_player_dashboard(report, tmp_path)
+        return Path(tmp_path).read_bytes()
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
+
+
+# Shot map (additive new feature): a dedicated pair of cached wrappers,
+# mirroring _cached_player_report/_cached_player_png's own pattern exactly
+# -- calls the NEW, separate /reports/player/{player_id}/shot-map endpoint
+# (see api.py's own comment for why this is a dedicated endpoint, not a
+# field added to the existing player-report response).
+@st.cache_data(show_spinner=False)
+def _cached_player_shot_map(rest_base_url: str, player_id: int, match_ids: tuple[int, ...]) -> dict:
+    response = requests.get(
+        f"{rest_base_url}/reports/player/{player_id}/shot-map",
+        params={"match_ids": list(match_ids)},
+        timeout=REPORT_REQUEST_TIMEOUT_SECONDS,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+@st.cache_data(show_spinner=False)
+def _cached_player_shot_map_png(shot_map: dict) -> bytes:
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+        tmp_path = tmp.name
+    try:
+        render_shot_map(shot_map, tmp_path)
         return Path(tmp_path).read_bytes()
     finally:
         Path(tmp_path).unlink(missing_ok=True)
@@ -307,6 +375,18 @@ with tab_cv:
         rest_base_url = st.text_input("REST API Base URL", value=DEFAULT_REST_BASE_URL)
         ws_url = st.text_input("WebSocket URL", value=DEFAULT_WS_URL)
         match_id = st.text_input("Match ID", value=DEFAULT_MATCH_ID)
+
+        st.divider()
+        st.header("Player/Team Report Candidates")
+        st.caption(
+            "The Player Reports / Team Reports dropdowns are built from a scan of "
+            "data/raw/ (cached ~1 hour). Click to force a fresh scan if you've just "
+            "fetched new data (e.g. via data_fallback.py)."
+        )
+        if "candidate_cache_bust" not in st.session_state:
+            st.session_state.candidate_cache_bust = 0
+        if st.button("Refresh cache list"):
+            st.session_state.candidate_cache_bust += 1
 
         st.divider()
         st.header("Live Stream Settings")
@@ -546,7 +626,24 @@ with tab_cv:
 with tab_player:
     st.header("Player Report")
 
-    preset_label = st.selectbox("Player", list(KNOWN_PLAYER_PRESETS.keys()) + ["Custom"])
+    _, _cached_players = _cached_candidate_index(st.session_state.candidate_cache_bust)
+
+    # Label format matches this tab's own pre-existing preset convention
+    # ("Name (id) -- LOW SAMPLE, N events" / "-- well-supported") --
+    # LOW_SAMPLE_EVENT_THRESHOLD (candidate_index.py, = habit_memory.
+    # MIN_HISTORICAL_EVENTS = 20) is the SAME cutoff `generate_player_report`
+    # itself effectively uses for `heatmap_used_uniform_fallback`, so this
+    # label is a real signal, not an arbitrary one. `total_events` here is
+    # a cheap, raw tagged-event count -- see candidate_index.py's own
+    # docstring for exactly how it differs from the real report's own
+    # (narrower) `positional_distribution_event_count`.
+    _player_labels: dict[str, dict] = {}
+    for _p in _cached_players:
+        _tag = f"LOW SAMPLE, {_p['total_events']} event(s)" if _p["low_sample"] else "well-supported"
+        _label = f"{_p['name']} ({_p['player_id']}) -- {_tag}, {len(_p['seasons'])} season(s) cached"
+        _player_labels[_label] = _p
+
+    preset_label = st.selectbox("Player", list(_player_labels.keys()) + ["Custom"])
     if preset_label == "Custom":
         player_id_input = st.text_input("Player ID (StatsBomb player_id)", value="")
         match_ids_input = st.text_input("Match IDs (comma-separated StatsBomb match_id list)", value="")
@@ -556,7 +653,32 @@ with tab_player:
             if match_ids_input.strip() else ()
         )
     else:
-        player_id, match_ids = KNOWN_PLAYER_PRESETS[preset_label]
+        _candidate = _player_labels[preset_label]
+        player_id = _candidate["player_id"]
+
+        # Season sub-selector (Step 2.2): a player with cached data across
+        # multiple competition-seasons (Messi: 25, not the single flat
+        # entry a hardcoded preset would have offered) gets ONE dropdown
+        # entry here, plus this multiselect -- letting a user combine any
+        # subset of their cached seasons (a single season for "early
+        # Messi", the two Ligue 1 seasons for "PSG Messi", or everything
+        # for a full-career aggregate) rather than only ever an all-time
+        # aggregate. Defaults to ALL cached seasons selected, matching
+        # what a flat preset would have shown by default.
+        _season_labels: dict[str, dict] = {}
+        for _s in _candidate["seasons"]:
+            _slabel = f"{_s['competition_name']} {_s['season_name']} ({_s['event_count']} events, {len(_s['match_ids'])} match(es))"
+            _season_labels[_slabel] = _s
+        if len(_season_labels) > 1:
+            _selected_season_labels = st.multiselect(
+                "Season(s)", options=list(_season_labels.keys()), default=list(_season_labels.keys())
+            )
+        else:
+            _selected_season_labels = list(_season_labels.keys())
+
+        match_ids = tuple(
+            sorted({mid for lbl in _selected_season_labels for mid in _season_labels[lbl]["match_ids"]})
+        )
 
     generate_clicked = st.button("Generate Player Report")
 
@@ -601,6 +723,39 @@ with tab_player:
                 with st.expander("Raw report data"):
                     st.json(report)
 
+                # --- Shot Map (additive new feature) ------------------------
+                # A SEPARATE section, alongside (not replacing or
+                # reorganizing) the positional-distribution/heatmap panels
+                # above -- fetched from the NEW, dedicated
+                # /reports/player/{player_id}/shot-map endpoint (see
+                # api.py's own comment for why this is a separate endpoint
+                # rather than a field added to the existing player-report
+                # response). xG values shown here are StatsBomb's own real
+                # statsbomb_xg per shot -- NOT this project's DeepHit
+                # threat model, a different quantity (see
+                # generate_player_shot_map's docstring).
+                st.divider()
+                st.subheader("Shot Map")
+                with st.spinner("Generating shot map..."):
+                    shot_map = _fetch_report_safely(
+                        lambda: _cached_player_shot_map(rest_base_url, player_id, match_ids), rest_base_url
+                    )
+                if shot_map is not None:
+                    shot_map_png = _cached_player_shot_map_png(shot_map)
+
+                    # Same low-sample visual convention as the positional/
+                    # heatmap warnings above -- reused, not reinvented.
+                    if shot_map.get("shot_map_used_low_sample_flag"):
+                        st.warning(
+                            f"LOW SAMPLE: only {shot_map.get('total_shots', 0)} shot(s) for this player -- "
+                            "treat the shot map below as illustrative, not a confident pattern."
+                        )
+
+                    st.image(shot_map_png, caption=f"Shot Map -- player_id={player_id}", width="stretch")
+
+                    with st.expander("Raw shot map data"):
+                        st.json(shot_map)
+
 # ============================================================================
 # TAB: Team Reports -- report DATA now fetched over HTTP from api.py's
 # /reports/team/{team_name} (ADR-018); PNG rendering still calls
@@ -611,30 +766,197 @@ with tab_player:
 with tab_team:
     st.header("Team Report")
 
-    team_preset_label = st.selectbox("Team", list(KNOWN_TEAM_PRESETS.keys()) + ["Custom"])
+    _cached_teams, _ = _cached_candidate_index(st.session_state.candidate_cache_bust)
+
+    # Post-audit correction: label now reflects `total_matches_360` (the
+    # SAME 360-covered-chain count team_report.py's own `matches_used`
+    # measures -- candidate_index.py independently reimplements that
+    # chain-building step, cheaply, without running physics/ML), not raw
+    # cached match count. An earlier verification audit found the two have
+    # essentially no relationship (Real Madrid: 68 cached matches, only 2
+    # with usable 360 coverage) -- this label would have silently called
+    # Real Madrid "well-supported" under the old metric. See
+    # candidate_index.py's own module docstring for the full reasoning.
+    _team_labels: dict[str, dict] = {}
+    for _t in _cached_teams:
+        _tag = f"LOW SAMPLE, {_t['total_matches_360']} 360-covered match(es)" if _t["low_sample"] else "well-supported"
+        _label = f"{_t['team_name']} -- {_tag} (of {_t['total_matches_cached']} cached), {len(_t['seasons'])} season(s)"
+        _team_labels[_label] = _t
+
+    team_preset_label = st.selectbox("Team", list(_team_labels.keys()) + ["Custom"])
     if team_preset_label == "Custom":
         team_name_input = st.text_input("Team name (StatsBomb team name)", value="", key="team_report_name")
         team_match_ids_input = st.text_input(
             "Match IDs (comma-separated StatsBomb match_id list)", value="", key="team_report_match_ids"
         )
         team_name = team_name_input.strip()
-        team_match_ids = (
-            tuple(int(m.strip()) for m in team_match_ids_input.split(",") if m.strip())
-            if team_match_ids_input.strip() else ()
+        # Custom mode: exactly one caller-provided name/match_ids pair,
+        # same as before -- the multi-variant handling below only applies
+        # to candidates resolved through candidate_index.py's own
+        # TEAM_NAME_MERGES, since a manually-typed name is unambiguous.
+        # No 360-based pre-filtering/cap here either -- candidate_index.py
+        # has no coverage data for arbitrary caller-provided match_ids, and
+        # a user typing exact match_ids in has already opted out of the
+        # dropdown's guardrails deliberately.
+        _variant_to_match_ids: dict[str, tuple[int, ...]] = (
+            {team_name: tuple(int(m.strip()) for m in team_match_ids_input.split(",") if m.strip())}
+            if team_name_input.strip() and team_match_ids_input.strip() else {}
         )
+        _variant_to_match_ids_360 = _variant_to_match_ids
     else:
-        team_name = team_preset_label.split(" -- ")[0]
-        team_match_ids = KNOWN_TEAM_PRESETS[team_preset_label]
+        _team_candidate = _team_labels[team_preset_label]
+        team_name = _team_candidate["team_name"]
+
+        # Season sub-selector, same pattern as the Player Reports tab --
+        # Barcelona (24 cached seasons) gets one dropdown entry plus this
+        # multiselect, not 24 flat entries.
+        #
+        # DEFAULT (post-timeout-incident fix): the MOST RECENT season only,
+        # not "all seasons" -- a real request (Real Madrid, 19 seasons +
+        # cups, 68 raw matches, only 2 with usable 360 coverage) timed out
+        # at 60s because "select all" silently handed team_report.py a
+        # scope no case in this project's history had been tested against.
+        # Chose "most recent season only" over "no default" (the other
+        # option Step 1 allowed): an empty default means clicking Generate
+        # with no changes always just shows the existing "provide a
+        # team/match_ids" error, for every team, even ones with only 1-2
+        # cached seasons -- worse first-run UX than a small, safe, WORKING
+        # default the user can deliberately widen via the multiselect
+        # below. A single season is bounded by construction (this cache's
+        # largest single season is ~38 raw matches, not 68+), so it can't
+        # reproduce the incident's request shape even by accident.
+        _team_season_labels: dict[str, dict] = {}
+        for _s in _team_candidate["seasons"]:
+            _n_360 = len(_s["match_ids_360"])
+            _slabel = f"{_s['competition_name']} {_s['season_name']} ({_n_360} of {len(_s['match_ids'])} 360-covered)"
+            _team_season_labels[_slabel] = _s
+
+        def _season_recency_key(label: str) -> tuple[int, int]:
+            season_name = _team_season_labels[label]["season_name"]
+            start_year_str = season_name.split("/")[0]
+            start_year = int(start_year_str) if start_year_str.isdigit() else -1
+            return (start_year, len(_team_season_labels[label]["match_ids"]))
+
+        _most_recent_season_label = max(_team_season_labels, key=_season_recency_key) if _team_season_labels else None
+        _default_season_labels = [_most_recent_season_label] if _most_recent_season_label else []
+
+        if len(_team_season_labels) > 1:
+            _selected_team_season_labels = st.multiselect(
+                "Season(s)", options=list(_team_season_labels.keys()), default=_default_season_labels,
+                help=(
+                    "Defaults to the most recent cached season only, not all of them -- selecting every "
+                    "season for a team with many of them can request far more matches than have usable "
+                    "360 coverage, which is slow for no benefit. Widen this deliberately if you want more."
+                ),
+            )
+        else:
+            _selected_team_season_labels = list(_team_season_labels.keys())
+
+        # Post-audit correction (Caen/Marseille class of bug):
+        # `_team_candidate` may merge MULTIPLE StatsBomb name variants of
+        # the same real club (e.g. "Marseille"/"Olympique de Marseille"),
+        # and -- confirmed directly during the audit -- a single season
+        # can contain matches tagged under BOTH variants. Since
+        # `generate_team_report(team_name, match_ids)` matches on exactly
+        # one name (unchanged, unmodified logic), a selection spanning
+        # multiple variants is grouped here into one call PER variant,
+        # so every real match is actually captured by SOME call -- never
+        # silently dropped the way picking a single name string would.
+        #
+        # Timeout-incident fix: ALSO computed here, per variant, using
+        # ONLY information candidate_index.py already has cheaply (no new
+        # expensive check) -- `_variant_to_match_ids` (every raw cached
+        # match in the selection) and `_variant_to_match_ids_360`
+        # (the subset ALSO known to be 360-covered). The latter, capped at
+        # TEAM_REPORT_MAX_360_MATCHES_PER_REQUEST, is what's actually sent
+        # to generate_team_report below -- never the raw list.
+        _variant_to_match_ids_raw: dict[str, set[int]] = {}
+        _variant_to_match_ids_360_raw: dict[str, set[int]] = {}
+        for _lbl in _selected_team_season_labels:
+            _season = _team_season_labels[_lbl]
+            _season_360_set = set(_season["match_ids_360"])
+            for _variant, _ids in _season["match_ids_by_variant"].items():
+                _variant_to_match_ids_raw.setdefault(_variant, set()).update(_ids)
+                _variant_to_match_ids_360_raw.setdefault(_variant, set()).update(set(_ids) & _season_360_set)
+        _variant_to_match_ids = {v: tuple(sorted(ids)) for v, ids in _variant_to_match_ids_raw.items()}
+        _variant_to_match_ids_360 = {v: tuple(sorted(ids)) for v, ids in _variant_to_match_ids_360_raw.items()}
+
+        _total_raw_selected = sum(len(ids) for ids in _variant_to_match_ids.values())
+        _total_360_selected = sum(len(ids) for ids in _variant_to_match_ids_360.values())
+
+        # Step 2: warn BEFORE the button is clicked, not after a timeout --
+        # both conditions use only the cheap data above, already fetched
+        # for the labels/multiselect.
+        if _total_raw_selected > 0 and _total_360_selected < _total_raw_selected:
+            st.warning(
+                f"This selection includes {_total_raw_selected} cached match(es) for {team_name}, but "
+                f"only {_total_360_selected} have the 360 freeze-frame coverage a real team report needs "
+                f"-- the other {_total_raw_selected - _total_360_selected} would contribute nothing. Only "
+                "the 360-covered matches will actually be sent when you click Generate."
+            )
+        if _total_360_selected > TEAM_REPORT_MAX_360_MATCHES_PER_REQUEST:
+            st.warning(
+                f"{_total_360_selected} 360-covered matches in this selection -- capped to "
+                f"{TEAM_REPORT_MAX_360_MATCHES_PER_REQUEST} per request (measured: real pitch-control/"
+                "threat computation runs at roughly 1.2-2.0s per match, so a request this size risked "
+                "taking 60s+ on genuine computation alone, not wasted work -- confirmed directly: a "
+                "51-match well-supported request took just over 100s). Narrow the season selection above "
+                "for a specific sub-range instead of relying on this cap, if you need a different subset."
+            )
+
+        def _capped(match_ids: tuple[int, ...]) -> tuple[int, ...]:
+            """Most-recent-N by match_id, a simple, deterministic (if
+            imperfect -- StatsBomb match_ids are not strictly globally
+            chronological across competitions) recency proxy; exact
+            precision doesn't matter for a safety cap the way it would for
+            a real feature."""
+            return tuple(sorted(sorted(match_ids, reverse=True)[:TEAM_REPORT_MAX_360_MATCHES_PER_REQUEST]))
+
+        _variant_to_match_ids_360 = {v: _capped(ids) for v, ids in _variant_to_match_ids_360.items()}
 
     generate_team_clicked = st.button("Generate Team Report")
 
     if generate_team_clicked:
-        if not team_name or not team_match_ids:
-            st.error("Provide a team name and at least one match_id.")
+        if not team_name or not _variant_to_match_ids_360:
+            st.error(
+                "Provide a team name and at least one match_id."
+                if team_preset_label == "Custom"
+                else "No 360-covered matches in this selection -- widen the season selection above."
+            )
+        elif len(_variant_to_match_ids_360) > 1:
+            st.info(
+                f"This selection spans {len(_variant_to_match_ids_360)} different StatsBomb name variants "
+                f"for {team_name} ({', '.join(f'{v!r} ({len(ids)} match(es))' for v, ids in _variant_to_match_ids_360.items())}). "
+                "generate_team_report's own pitch-control aggregation can't be safely combined after the "
+                "fact (its return contract doesn't expose the per-cell counts a correct re-average would "
+                "need) without modifying that function -- so each variant is reported separately below, "
+                "rather than silently reporting only one and dropping the other's real coverage."
+            )
+            for _variant, _ids in _variant_to_match_ids_360.items():
+                st.subheader(f"Variant: {_variant!r} ({len(_ids)} match(es))")
+                with st.spinner(f"Generating report for {_variant!r}..."):
+                    _variant_report = _fetch_report_safely(
+                        lambda _v=_variant, _i=_ids: _cached_team_report(rest_base_url, _v, _i), rest_base_url
+                    )
+                if _variant_report is not None:
+                    _variant_png = _cached_team_png(_variant_report)
+                    st.info(
+                        f"Built from {_variant_report['matches_used']} matches (of {_variant_report['matches_requested']} requested)."
+                    )
+                    if _variant_report["matches_used"] < candidate_index_module.LOW_SAMPLE_MATCH_THRESHOLD:
+                        st.warning(
+                            f"LOW SAMPLE: only {_variant_report['matches_used']} 360-covered match(es) used -- "
+                            "treat this variant's pitch-control/threat pattern as illustrative, not a "
+                            "confident finding."
+                        )
+                    st.image(_variant_png, caption=f"Team Report -- {_variant}", width="stretch")
+                    with st.expander(f"Raw report data ({_variant!r})"):
+                        st.json(_variant_report)
         else:
+            ((_single_variant, _single_match_ids),) = _variant_to_match_ids_360.items()
             with st.spinner("Generating report..."):
                 team_report_dict = _fetch_report_safely(
-                    lambda: _cached_team_report(rest_base_url, team_name, team_match_ids), rest_base_url
+                    lambda: _cached_team_report(rest_base_url, _single_variant, _single_match_ids), rest_base_url
                 )
 
             if team_report_dict is not None:
@@ -654,11 +976,21 @@ with tab_team:
                     "contract -- match-level count shown for transparency about sample size, "
                     "not a frame-level one (see team_visualizer.py's own caption)."
                 )
-                if team_report_dict["matches_used"] < 2:
+                # Post-audit correction: this used to be dashboard.py's OWN
+                # separate `matches_used < 2` check -- a third, disagreeing
+                # "is this usable" threshold alongside candidate_index.py's
+                # (10, cache-count-based at the time) and team_report.py's
+                # own internal 360-based matches_used. Now there is exactly
+                # ONE authoritative threshold constant
+                # (candidate_index.LOW_SAMPLE_MATCH_THRESHOLD, still 10),
+                # applied here to the REAL, live matches_used this exact
+                # selection actually produced -- not a separately
+                # pre-computed estimate.
+                if team_report_dict["matches_used"] < candidate_index_module.LOW_SAMPLE_MATCH_THRESHOLD:
                     st.warning(
-                        f"LOW SAMPLE: only {team_report_dict['matches_used']} match used -- treat "
-                        "this team's pitch-control/threat pattern as illustrative, not a confident "
-                        "season-level finding."
+                        f"LOW SAMPLE: only {team_report_dict['matches_used']} 360-covered match(es) used "
+                        f"(threshold: {candidate_index_module.LOW_SAMPLE_MATCH_THRESHOLD}) -- treat this "
+                        "team's pitch-control/threat pattern as illustrative, not a confident finding."
                     )
 
                 st.image(team_png_bytes, caption=f"Team Report -- {team_name}", width="stretch")

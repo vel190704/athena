@@ -10,3 +10,4 @@ data/raw/
 .env
 reports_output/
 .coverage
+data/app_state/

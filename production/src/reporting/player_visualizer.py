@@ -24,7 +24,11 @@ import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
 from scipy.ndimage import gaussian_filter
 
-from production.src.pipeline.feature_extractor import PITCH_LENGTH, PITCH_WIDTH
+from production.src.pipeline.feature_extractor import (
+    FINAL_THIRD_X,
+    PITCH_LENGTH,
+    PITCH_WIDTH,
+)
 from production.src.pipeline.habit_memory import (
     GRID_COLS,
     GRID_ROWS,
@@ -89,6 +93,41 @@ _PITCH_Y_AXIS_MIN = -2.0
 # label placed va='top' at (label_y - this) still lands inside the axis
 # limits rather than being clipped by them.
 _LABEL_HEIGHT_ESTIMATE_M = 6.0
+
+# --- Shot map (additive new feature) -- constants -------------------------
+# Reuses the SAME low-sample threshold value player_report.py's
+# generate_player_shot_map computes shot_map_used_low_sample_flag from
+# (MIN_HISTORICAL_EVENTS=20) -- imported from that function's own return
+# value at render time, not re-derived here, so this file never needs its
+# own copy of the threshold number.
+#
+# Sizing constants deliberately separate from MIN_DOT_RADIUS_M/
+# MAX_DOT_RADIUS_M above (the positional-distribution panel's own dots) --
+# a shot map typically plots far more markers at once (Messi: 2,646 real
+# shots for a full career) than the positional panel ever does (at most
+# ~15-20 distinct position labels), so shot markers are sized smaller to
+# stay legible when many overlap.
+MIN_SHOT_DOT_RADIUS_M = 1.2
+MAX_SHOT_DOT_RADIUS_M = 4.5
+
+# Reference-image convention (goal = filled/red, no-goal = hollow) --
+# StatsBomb's own real `shot.outcome.name == "Goal"` value drives which of
+# these two styles a given shot gets; nothing else about the outcome
+# (Saved/Blocked/Off T/etc.) is separately styled, matching the
+# reference's own two-state (scored/not-scored) legend, not the shot's
+# full outcome taxonomy.
+GOAL_SHOT_COLOR = "#e63946"
+NO_GOAL_SHOT_EDGE_COLOR = "#f1faee"
+
+# Crop the shot-map pitch to the attacking third only (reference-image
+# framing), rather than reusing the full 100m pitch every other panel in
+# this file uses -- shots overwhelmingly cluster near the box, so a full-
+# pitch view would compress virtually all real markers into a small
+# corner of the canvas. Reuses FINAL_THIRD_X (=66.0) directly from
+# feature_extractor.py -- the SAME attacking-third boundary
+# `team_report.py`'s own zone bucketing already established -- rather
+# than inventing a new, separate cropping threshold.
+SHOT_MAP_X_MIN = FINAL_THIRD_X
 
 
 def _draw_positional_distribution(ax, positional_distribution: dict[str, float], event_count: int) -> None:
@@ -241,6 +280,132 @@ def render_player_dashboard(player_report: dict, output_path: str) -> None:
         player_report.get("heatmap_event_count", 0),
         player_report.get("heatmap_used_uniform_fallback", False),
     )
+
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
+    fig.savefig(output_path, dpi=130, facecolor="white")
+    plt.close(fig)
+
+
+# ============================================================================
+# Shot map (additive new feature): pure RENDERING layer over
+# `player_report.generate_player_shot_map`'s output, exactly like
+# `render_player_dashboard` above is over `generate_player_report`'s --
+# does not recompute, adjust, or otherwise touch any shot-map value.
+# Nothing above this line (render_player_dashboard and everything it
+# calls) is modified.
+# ============================================================================
+
+
+def _draw_shot_scatter(ax, shots: list[dict], low_sample: bool) -> None:
+    draw_pitch_outline(ax)
+    ax.set_xlim(SHOT_MAP_X_MIN, PITCH_LENGTH + 2)  # attacking-third crop -- see module-level comment
+    ax.set_title(f"Shot map ({len(shots)} shots)", color="white", fontsize=11)
+
+    if not shots:
+        ax.text(
+            (SHOT_MAP_X_MIN + PITCH_LENGTH) / 2, PITCH_WIDTH / 2, "No shot data",
+            color="white", ha="center", va="center",
+        )
+        return
+
+    # Milestone 44's validation-sweep convention, reused verbatim (same
+    # banner style `_draw_positional_distribution`'s LOW SAMPLE text and
+    # `_draw_heatmap`'s UNIFORM FALLBACK text already use) -- not a new,
+    # separately-invented low-sample visual.
+    if low_sample:
+        ax.text(
+            (SHOT_MAP_X_MIN + PITCH_LENGTH) / 2, PITCH_WIDTH + 5,
+            f"LOW SAMPLE ({len(shots)} shot{'s' if len(shots) != 1 else ''}) -- not a confident shot pattern",
+            color="#ff4444", ha="center", va="bottom", fontsize=8, fontweight="bold", zorder=5,
+        )
+
+    xg_values = [s["statsbomb_xg"] for s in shots]
+    max_xg = max(xg_values)
+    for s in shots:
+        x, y = s["location"][0], s["location"][1]
+        xg = s["statsbomb_xg"]
+        # Same min/max-radius interpolation pattern
+        # `_draw_positional_distribution` already uses for share -> radius,
+        # applied here to xg -> radius (0 xg -> MIN, max observed xg ->
+        # MAX -- relative to THIS shot set, not a fixed absolute scale,
+        # since a single low-xG-heavy player's shots would otherwise all
+        # render at the same tiny size).
+        radius = MIN_SHOT_DOT_RADIUS_M + (MAX_SHOT_DOT_RADIUS_M - MIN_SHOT_DOT_RADIUS_M) * (
+            xg / max_xg if max_xg > 0 else 0.0
+        )
+        if s["is_goal"]:
+            ax.scatter(
+                [x], [y], s=radius**2 * 12, color=GOAL_SHOT_COLOR, edgecolors="black",
+                linewidths=0.8, alpha=0.9, zorder=4,
+            )
+        else:
+            ax.scatter(
+                [x], [y], s=radius**2 * 12, facecolors="none", edgecolors=NO_GOAL_SHOT_EDGE_COLOR,
+                linewidths=1.1, alpha=0.85, zorder=3,
+            )
+
+    # Reference-image-style legend: two representative markers (goal /
+    # no-goal), not one per real shot -- explains the fill convention
+    # without cluttering the plot with a full xG size legend (the sidebar
+    # stats panel already states xg_per_shot numerically).
+    ax.scatter([], [], color=GOAL_SHOT_COLOR, edgecolors="black", linewidths=0.8, label="Goal")
+    ax.scatter([], [], facecolors="none", edgecolors=NO_GOAL_SHOT_EDGE_COLOR, linewidths=1.1, label="No goal")
+    ax.legend(loc="lower left", fontsize=7, facecolor="#2e8b3d", labelcolor="white", framealpha=0.6)
+
+
+def _draw_shot_map_stats(ax, shot_map: dict) -> None:
+    ax.axis("off")
+    total_shots = shot_map["total_shots"]
+    xg_per_shot = shot_map["xg_per_shot"]
+    lines = [
+        f"Player ID: {shot_map['player_id']}",
+        "",
+        f"Total shots: {total_shots}",
+        f"Goals: {shot_map['goals']}",
+        f"Sum statsbomb_xg: {shot_map['sum_statsbomb_xg']:.2f}",
+        f"xG per shot: {xg_per_shot:.3f}" if xg_per_shot is not None else "xG per shot: n/a",
+        "",
+        "Shots by body part:",
+    ]
+    body_part_counts = shot_map.get("shots_by_body_part") or {}
+    if body_part_counts:
+        for body_part, count in sorted(body_part_counts.items(), key=lambda kv: -kv[1]):
+            lines.append(f"  {body_part}: {count}")
+    else:
+        lines.append("  n/a")
+
+    lines.append("")
+    lines.append(
+        "xG = StatsBomb's own real statsbomb_xg per shot -- NOT this"
+    )
+    lines.append(
+        "project's DeepHit threat model (a different quantity)."
+    )
+
+    ax.text(
+        0.02, 0.98, "\n".join(lines), transform=ax.transAxes, va="top", ha="left",
+        fontsize=10, color="black", family="monospace",
+    )
+
+
+def render_shot_map(shot_map_data: dict, output_path: str) -> None:
+    """Renders `player_report.generate_player_shot_map`'s output as a
+    single static PNG: an attacking-third pitch diagram with shot markers
+    sized by `statsbomb_xg` and colored/filled by outcome (left), and a
+    stats sidebar -- total shots, body-part breakdown, goals, total xG,
+    xG per shot (right). A NEW, STANDALONE function alongside
+    `render_player_dashboard`, not a modification of it.
+    """
+    fig = plt.figure(figsize=(12, 7))
+    fig.suptitle(f"Shot Map -- player_id={shot_map_data['player_id']}", fontsize=15, y=0.98)
+
+    grid = GridSpec(1, 2, width_ratios=[1.5, 1.0], figure=fig)
+
+    ax_shots = fig.add_subplot(grid[0, 0])
+    _draw_shot_scatter(ax_shots, shot_map_data.get("shots", []), shot_map_data.get("shot_map_used_low_sample_flag", False))
+
+    ax_stats = fig.add_subplot(grid[0, 1])
+    _draw_shot_map_stats(ax_stats, shot_map_data)
 
     fig.tight_layout(rect=[0, 0, 1, 0.95])
     fig.savefig(output_path, dpi=130, facecolor="white")

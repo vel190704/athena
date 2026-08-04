@@ -25,6 +25,7 @@ import production.src.serving.api as api_module
 from production.src.models.explainer import (
     generate_explanation as _mock_generate_explanation,
 )
+from production.src.serving import alert_store
 from production.src.serving.api import app
 
 MATCH_ID = 3857276
@@ -41,14 +42,18 @@ def _force_mock_explanation_executor(monkeypatch):
     real, rate-limited API quota as a side effect of `api.py`'s own
     real-vs-mock gating.
 
-    Patches the CALLABLE `api_module.generate_tactical_explanation` refers
-    to, not the `GEMINI_API_KEY` environment variable -- an earlier version
-    of this fixture used `monkeypatch.delenv`, which has a real race: the
-    spike-alert pipeline runs via `asyncio.create_task` (fire-and-forget),
-    so its own `os.environ.get(...)` check can execute after this
-    function-scoped fixture has already torn down and restored the key.
-    Patching the module-level name directly is synchronous and immediate,
-    with no such window.
+    Patches the CALLABLE `api_module.generate_tactical_explanation_with_source`
+    refers to (ADR-019: `_run_alert_pipeline` switched to this from the
+    plain `generate_tactical_explanation` so it can also learn/log which
+    executor ran -- this fixture patches whichever name `api.py` actually
+    calls today, kept in sync with that switch), not the `GEMINI_API_KEY`
+    environment variable -- an earlier version of this fixture used
+    `monkeypatch.delenv`, which has a real race: the spike-alert pipeline
+    runs via `asyncio.create_task` (fire-and-forget), so its own
+    `os.environ.get(...)` check can execute after this function-scoped
+    fixture has already torn down and restored the key. Patching the
+    module-level name directly is synchronous and immediate, with no such
+    window.
 
     Found the hard way, not preemptively: this file's own spike-alert
     tests were making real Gemini calls whenever a key was present (an
@@ -60,7 +65,30 @@ def _force_mock_explanation_executor(monkeypatch):
     attempt, even with backoff. Retrying harder in the other test was
     treating the symptom; this is the actual fix.
     """
-    monkeypatch.setattr(api_module, "generate_tactical_explanation", _mock_generate_explanation)
+
+    async def _mock_generate_explanation_with_source(prompt: str) -> tuple[str, str]:
+        return await _mock_generate_explanation(prompt), "mock"
+
+    monkeypatch.setattr(
+        api_module,
+        "generate_tactical_explanation_with_source",
+        _mock_generate_explanation_with_source,
+    )
+
+
+@pytest.fixture
+def isolated_alert_db(tmp_path, monkeypatch):
+    """ADR-019: isolates the alert-history SQLite file into pytest's
+    `tmp_path` for tests that need to inspect real persisted rows, so they
+    never touch the real `data/app_state/alerts.db` a running server would
+    use. `api_module.log_alert`/`api_module.fetch_alerts` are the SAME
+    function objects `alert_store.py` defines (imported via `from ...
+    import log_alert`), and those functions resolve `DB_DIR`/`DB_PATH` via
+    their own module's globals at call time -- so patching
+    `alert_store.DB_DIR`/`DB_PATH` here correctly redirects them regardless
+    of which module's name is used to invoke them."""
+    monkeypatch.setattr(alert_store, "DB_DIR", tmp_path / "app_state")
+    monkeypatch.setattr(alert_store, "DB_PATH", tmp_path / "app_state" / "alerts.db")
 
 
 def _try_receive_json(websocket, timeout: float = 2.0):
@@ -488,3 +516,108 @@ def test_reports_team_comparison_endpoint_reliability_caveat_survives_http_real_
     assert comparison["reliability_caveat"] is not None
     assert "Real Madrid 2016" in comparison["reliability_caveat"]
     assert "NOT equally reliable" in comparison["reliability_caveat"]
+
+
+# ============================================================================
+# ADR-019 (Stage 2 persistence): the alert-history store, exercised through
+# the REAL WebSocket alert flow (not alert_store.py directly -- that's
+# test_alert_store.py's job). These tests confirm the two things ADR-019
+# actually promises at the api.py integration level: persistence never
+# delays/blocks the real-time alert, and a real alert that fires is
+# actually recorded and retrievable via /alerts/history.
+# ============================================================================
+
+
+def test_real_alert_is_persisted_and_retrievable_via_history_endpoint(isolated_alert_db):
+    """Forces spike_threshold=0.0 (any strict frame-to-frame increase in
+    threat_15s fires an alert -- same technique
+    test_per_connection_spike_state_is_isolated already uses) over enough
+    real messages to reliably get at least one alert, then confirms it
+    shows up, with correct field values, via GET /alerts/history."""
+    with TestClient(app) as client:
+        with client.websocket_connect(
+            f"/ws/tactical-stream?match_id={MATCH_ID}&delay=0.0&spike_threshold=0.0"
+        ) as websocket:
+            messages = [websocket.receive_json() for _ in range(30)]
+
+        # Let the fire-and-forget logging task(s) finish before checking --
+        # they run via asyncio.create_task, not awaited by the send path.
+        time.sleep(1.0)
+
+        alert_messages = [m for m in messages if m["type"] == "alert"]
+        assert alert_messages, "expected at least one alert across 30 messages at spike_threshold=0.0"
+
+        response = client.get(f"/alerts/history?match_id={MATCH_ID}&source=statsbomb")
+        assert response.status_code == 200
+        rows = response.json()
+
+    assert len(rows) == len(alert_messages), (
+        "every alert message actually sent to the client must have exactly one matching persisted row"
+    )
+    persisted_texts = {row["explanation_text"] for row in rows}
+    sent_texts = {m["explanation"] for m in alert_messages}
+    assert persisted_texts == sent_texts, "every persisted alert's text must match one actually sent to the client"
+
+    row = rows[0]
+    assert row["source"] == "statsbomb"
+    assert row["match_id"] == MATCH_ID
+    assert row["video_path"] is None
+    assert row["explanation_source"] == "mock"  # _force_mock_explanation_executor forces this
+    assert row["delta"] == pytest.approx(row["threat_after"] - row["threat_before"])
+
+
+def test_persistence_failure_does_not_block_or_delay_real_alert(monkeypatch):
+    """ADR-019's central safety guarantee, proven directly: even if
+    log_alert() fails on every call (simulated here by monkeypatching
+    api_module.log_alert to raise), the real-time WebSocket alert must
+    still reach the client, unaffected. log_alert itself already never
+    raises in real use (it catches everything internally -- see
+    test_alert_store.py) -- this test goes one step further and proves
+    that even if something upstream of that guarantee somehow broke, the
+    alert pipeline's own asyncio.create_task-based fire-and-forget call
+    still isolates the real send from it, since the task is never awaited
+    on that path.
+    """
+
+    def _raising_log_alert(**kwargs):
+        raise RuntimeError("simulated persistence failure")
+
+    monkeypatch.setattr(api_module, "log_alert", _raising_log_alert)
+
+    with TestClient(app) as client:
+        with client.websocket_connect(
+            f"/ws/tactical-stream?match_id={MATCH_ID}&delay=0.0&spike_threshold=0.0"
+        ) as websocket:
+            messages = [websocket.receive_json() for _ in range(30)]
+            for message in messages:
+                _assert_valid_message(message)
+
+    alert_messages = [m for m in messages if m["type"] == "alert"]
+    assert alert_messages, (
+        "expected at least one alert -- and, critically, it must have arrived "
+        "successfully despite log_alert raising on every call"
+    )
+
+
+def test_alerts_history_endpoint_filters_by_source_and_match_id(isolated_alert_db):
+    """Directly exercises GET /alerts/history's filters against real
+    persisted rows (via alert_store.log_alert, not the full WebSocket
+    flow -- test_real_alert_is_persisted_... above already covers that
+    end-to-end path; this test isolates the endpoint's own filter logic)."""
+    alert_store.log_alert(
+        source="statsbomb", match_id=MATCH_ID, video_path=None, minute=10.0,
+        threat_before=0.05, threat_after=0.11, explanation_text="stats alert", explanation_source="mock",
+    )
+    alert_store.log_alert(
+        source="cv", match_id=None, video_path="data/raw/some_clip.mp4", minute=3.0,
+        threat_before=0.05, threat_after=0.12, explanation_text="cv alert", explanation_source="gemini",
+    )
+
+    with TestClient(app) as client:
+        by_match = client.get(f"/alerts/history?match_id={MATCH_ID}").json()
+        by_source = client.get("/alerts/history?source=cv").json()
+        all_rows = client.get("/alerts/history").json()
+
+    assert [r["explanation_text"] for r in by_match] == ["stats alert"]
+    assert [r["explanation_text"] for r in by_source] == ["cv alert"]
+    assert len(all_rows) == 2

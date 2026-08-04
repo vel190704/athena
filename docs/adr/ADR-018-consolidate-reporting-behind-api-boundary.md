@@ -150,3 +150,55 @@ consolidated, not the storage layer replaced.
   point of this ADR is that "only works on one machine" is not an
   acceptable steady state for three of the four tabs when fixing it is a
   thin wrapper away, not a redesign.
+
+## Update: `candidate_index.py` Is a Second, Narrower Exception to Full Separability
+
+A later change added dynamic Player/Team Reports dropdowns
+(`production/src/reporting/candidate_index.py`), replacing a small,
+hand-picked preset list with a real scan of what's actually cached. A
+subsequent independent verification audit checked this ADR's own claim —
+*"The Player Reports, Team Reports, and Team Comparison tabs can now
+genuinely run with `dashboard.py` and `api.py` on separate machines"* —
+against what `candidate_index.py` actually does, and found the claim no
+longer fully holds, in a way this ADR had not been updated to say.
+
+**What's actually true, stated plainly (the same way this ADR already
+names `team_trend_data.py` as a named exception above, not implied to be
+covered by the "fully separable" claim)**: `candidate_index.py` reads
+`data/raw/` **directly from the Streamlit process** to populate the
+Player Reports and Team Reports dropdowns — team/player names, season
+groupings, and (post-audit) 360-coverage-based sample-size labels are all
+computed by scanning cached JSON on disk, not by calling `api.py`. This
+means:
+
+- **Report *generation* remains exactly as this ADR originally described**:
+  once a candidate and season(s) are selected, `dashboard.py` still calls
+  `api.py`'s `/reports/player/{id}` / `/reports/team/{name}` endpoints
+  over HTTP, unchanged. Nothing about the actual reporting round-trip
+  regressed.
+- **Dropdown *population* for those same two tabs did not go through this
+  ADR's consolidation** — it is a second, narrower re-introduction of the
+  co-location assumption this ADR otherwise removed, scoped specifically
+  to "what candidates can I browse," not to the reports themselves.
+- Team Comparison's own tab has no such dependency (it never had a
+  candidate-browsing dropdown to begin with — both team names are always
+  free-text `st.text_input` fields), so it is unaffected by this
+  exception.
+
+**Why this wasn't fixed by adding a `/candidates/...` endpoint instead**:
+that would be the fully-correct fix (matching this ADR's own original
+`/reports/...` pattern exactly), and remains the natural next step if full
+separability for these two tabs is ever required — but the task that
+introduced `candidate_index.py` was explicitly scoped as a
+dashboard/enumeration-layer change only, not an `api.py` change, so this
+Update records the resulting gap rather than silently closing it via
+scope creep.
+
+**Consequence, restated precisely**: full multi-machine separability now
+holds for report *generation* on all four reporting tabs (Team Trends
+excepted, per the original decision above), but **not** for Player
+Reports/Team Reports dropdown *population* specifically — that still
+requires `dashboard.py` to run with its own `data/raw/` access, exactly
+like the `team_trend_data.py` exception already documented, just for a
+different reason (a dropdown convenience feature, not a licensing
+restriction).

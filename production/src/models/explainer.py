@@ -394,29 +394,29 @@ async def generate_explanation_real(prompt: str) -> str:
     return text.strip()
 
 
-async def generate_tactical_explanation(prompt: str) -> str:
-    """Public entrypoint call sites (the WebSocket spike-alert pipeline in
-    `api.py`, the zone-level reporting flow in `zone_explainer.py`) should
-    use going forward -- internally decides real-vs-mock so no call site
-    needs to know or care which executor is active. `generate_explanation`
-    (the mock) is never removed and stays directly callable on its own.
+async def generate_tactical_explanation_with_source(prompt: str) -> tuple[str, str]:
+    """Same executor-selection logic as `generate_tactical_explanation`
+    (below, now a thin wrapper around this), but also returns WHICH
+    executor actually produced the text -- `"gemini"` or `"mock"`.
 
-    Real Gemini is attempted ONLY if `GEMINI_API_KEY` is set (checked here,
-    not inside `generate_explanation_real`, so the absent-key case never
-    constructs a client or makes a network call at all). On ANY failure --
-    timeout, rate limit, invalid key, malformed response, or anything else
-    -- this logs a single clear WARNING (via `logging`, never the key
-    itself or anything that could contain it -- see `_safe_error_text`) and
-    falls back to the mock. This function itself never raises for a
-    Gemini-side failure; the live WebSocket alert flow and reporting-tool
-    calls that depend on it must never crash because an external API had a
-    bad moment.
+    ADR-019: added for the alert-history store's `explanation_source`
+    column. A caller cannot correctly infer this from `GEMINI_API_KEY`
+    being set alone -- the key being present does not mean the real call
+    SUCCEEDED, since any failure here falls back to the mock (see below).
+    Reporting "gemini" whenever the key happens to be set, without
+    checking whether the fallback actually fired, would silently persist a
+    wrong `explanation_source` on every fallback -- worse than not
+    recording the field at all, given this project's own honesty
+    discipline elsewhere (`_HONESTY_SYSTEM_INSTRUCTION`,
+    `_UNSUPPORTED_CLAIM_PATTERN` in `test_zone_explainer.py`). This
+    function is therefore the only accurate source of that value; nothing
+    reimplements or guesses it independently.
     """
     if not os.environ.get("GEMINI_API_KEY"):
-        return await generate_explanation(prompt)
+        return await generate_explanation(prompt), "mock"
 
     try:
-        return await generate_explanation_real(prompt)
+        return await generate_explanation_real(prompt), "gemini"
     except Exception as exc:  # noqa: BLE001 -- deliberately broad: ANY real-API
         # failure mode (timeout, rate limit, auth, malformed response, a
         # transient SDK/network error not yet seen) must fall back, not
@@ -427,4 +427,20 @@ async def generate_tactical_explanation(prompt: str) -> str:
             f"[explainer] Real Gemini call failed ({type(exc).__name__}) -- falling back to "
             f"the mock executor for this call. Error: {_safe_error_text(exc)}"
         )
-        return await generate_explanation(prompt)
+        return await generate_explanation(prompt), "mock"
+
+
+async def generate_tactical_explanation(prompt: str) -> str:
+    """Public entrypoint call sites (the WebSocket spike-alert pipeline in
+    `api.py`, the zone-level reporting flow in `zone_explainer.py`) should
+    use going forward -- internally decides real-vs-mock so no call site
+    needs to know or care which executor is active. `generate_explanation`
+    (the mock) is never removed and stays directly callable on its own.
+
+    Thin wrapper around `generate_tactical_explanation_with_source` that
+    discards the source -- kept as its own function, with its EXACT prior
+    signature and behavior, so every existing call site (`zone_explainer.py`,
+    tests) is unaffected by ADR-019's addition above.
+    """
+    text, _source = await generate_tactical_explanation_with_source(prompt)
+    return text
