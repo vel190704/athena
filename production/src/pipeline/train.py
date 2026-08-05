@@ -41,7 +41,7 @@ os.environ.setdefault("MLFLOW_ALLOW_FILE_STORE", "true")
 import mlflow
 import mlflow.pytorch
 import torch
-from torch.utils.data import Subset
+from torch.utils.data import Dataset, Subset
 from torch_geometric.loader import DataLoader
 
 from production.src.constants import MLFLOW_EXPERIMENT_NAME
@@ -67,6 +67,10 @@ from production.src.models.graph_builder import (
 from production.src.pipeline.chain_builder import build_possession_chains
 from production.src.pipeline.data_split import match_level_split
 from production.src.pipeline.feature_extractor import extract_features
+from production.src.pipeline.naive_baseline_features import (
+    BASELINE_FEATURE_KEYS,
+    extract_naive_baseline_features,
+)
 from production.src.pipeline.habit_memory import (
     MIN_HISTORICAL_EVENTS,
     build_player_match_buckets,
@@ -2968,6 +2972,531 @@ def run_gnn_horizon_per_bin_investigation(seed_split_pairs: list[tuple[int, int]
     return all_bin_results
 
 
+def run_rq1_non_physics_baseline_ablation() -> dict:
+    """RQ1 ablation: the missing non-physics-baseline comparison.
+
+    RQ1's stated success criterion (README: "Brier Score improvement >= X%")
+    implies a comparison against a non-physics-informed baseline, but per
+    RESEARCH_FINDINGS.md's RQ1 "Caveats" section, no such ablation (DeepHit
+    trained on non-physics-derived features) had ever been run in this
+    project's history. This function builds and trains that missing side of
+    the comparison.
+
+    Additive only -- does NOT modify feature_extractor.py,
+    BiomechanicalPitchControl, or any existing model architecture. Reuses
+    `_load_and_split_dataset`, `_compute_normalization_stats`,
+    `_train_and_log_model`, and `_evaluate_mlp_health` completely
+    unmodified -- the SAME already-validated sub-functions
+    `run_match_level_rq2_rq4_full_revalidation` uses for its own match-level
+    MLP run -- so this ablation goes through the identical ADR-011
+    match-level-split and ADR-010 four-signal health-gate machinery every
+    other current-generation result in this project used. The non-physics
+    feature values themselves come from
+    `naive_baseline_features.extract_naive_baseline_features` (a new,
+    separate module -- see its docstring for exactly what raw signal it
+    uses and why).
+
+    Isolates exactly one variable: `_load_and_split_dataset()` is called
+    once and its `frames`/`chains`/`match_ids`/`sample_match_ids` (and
+    therefore its match-level train/val split) are reused BYTE-FOR-BYTE --
+    same matches, same chains, same split -- only the scalar feature VALUES
+    fed to the model are swapped from the physics-derived ones to the
+    non-physics baseline's. Model architecture (DeepHitSurvivalModel),
+    hyperparameters (MLP_STABILIZED_LR/WEIGHT_DECAY, gradient clipping,
+    NUM_EPOCHS), and the training/health-gate/logging loop
+    (`_train_and_log_model`) are identical to the current match-level
+    physics-informed MLP reference.
+
+    Returns a result dict; never silently drops the result even if the
+    health gate fails.
+    """
+    torch.manual_seed(RANDOM_SEED)
+
+    logger.info("\n" + "=" * 80)
+    logger.info("RQ1 ABLATION STEP 1: reuse the SAME dataset + match-level split (ADR-011) as the physics-informed reference run")
+    logger.info("=" * 80)
+    loaded = _load_and_split_dataset()
+    dataset = loaded["dataset"]
+    frames = loaded["frames"]
+    match_ids = loaded["match_ids"]
+    sample_match_ids = loaded["sample_match_ids"]
+    dataset_size = loaded["dataset_size"]
+    competition_season_summary = loaded["competition_season_summary"]
+
+    # Explicit confirmation, per this task's own instruction: do not assume
+    # the split function is inherited correctly just because this is "one
+    # new run." Independently re-invoke match_level_split (ADR-011) with
+    # the SAME sample_match_ids/seed/val_fraction _load_and_split_dataset
+    # used internally, and assert the resulting indices are IDENTICAL to
+    # what it returned, rather than trusting that by construction alone.
+    confirm_train_indices, confirm_val_indices = match_level_split(
+        sample_match_ids, val_fraction=1.0 - TRAIN_FRACTION, seed=RANDOM_SEED
+    )
+    assert confirm_train_indices == loaded["train_set"].indices, (
+        "match_level_split (ADR-011) did NOT reproduce the same train indices as "
+        "_load_and_split_dataset() -- aborting rather than silently training on a mismatched split."
+    )
+    assert confirm_val_indices == loaded["val_set"].indices, (
+        "match_level_split (ADR-011) did NOT reproduce the same val indices as "
+        "_load_and_split_dataset() -- aborting rather than silently training on a mismatched split."
+    )
+    logger.info(
+        "[RQ1 ablation] CONFIRMED: match_level_split (ADR-011, production.src.pipeline.data_split) "
+        f"is the split function actually in effect for this run -- independently re-invoked with "
+        f"the same sample_match_ids, seed={RANDOM_SEED}, val_fraction={1.0 - TRAIN_FRACTION}, "
+        f"producing indices identical to _load_and_split_dataset()'s. {loaded['n_train']} train / "
+        f"{loaded['n_val']} val samples, {len(match_ids)} matches."
+    )
+
+    logger.info("\n" + "=" * 80)
+    logger.info("RQ1 ABLATION STEP 2: build the non-physics baseline feature set (raw pre-physics signal only)")
+    logger.info("=" * 80)
+    logger.info(
+        f"[RQ1 ablation] Baseline feature set (naive_baseline_features.extract_naive_baseline_features): "
+        f"{BASELINE_FEATURE_KEYS} -- simple counts/distances over RAW player_pos/ball_pos/is_teammate, "
+        "computed with NO BiomechanicalPitchControl call, no ODE, no pitch-grid integration. "
+        "player_vel and fatigue_mod are deliberately excluded: statsbomb_io.parse_360_frame sets "
+        "them to an all-zero tensor and a constant 1.0 respectively for EVERY sample project-wide "
+        "(StatsBomb's public 360 data has no velocity field) -- they carry no information to "
+        "aggregate, project-wide, not just here."
+    )
+    baseline_features = [extract_naive_baseline_features(frame) for frame in frames]
+
+    class _ScalarFeatureOverrideDataset(Dataset):
+        """Wraps the ALREADY-BUILT physics-informed TacticalSurvivalDataset,
+        replacing ONLY the scalar feature tensor (index 0 of each item)
+        with this ablation's non-physics baseline features. Graph data,
+        duration bins, and event flags (indices 1-3) are untouched --
+        byte-for-byte identical to the physics-informed reference run,
+        since both come from the exact same underlying frames/chains.
+        """
+
+        def __init__(self, base_dataset, override_feature_dicts, feature_key_order):
+            self.base_dataset = base_dataset
+            self.override_feature_dicts = override_feature_dicts
+            self.feature_key_order = feature_key_order
+
+        def __len__(self):
+            return len(self.base_dataset)
+
+        def __getitem__(self, idx):
+            _, graph_data, duration_bin_tensor, event_tensor = self.base_dataset[idx]
+            feature_dict = self.override_feature_dicts[idx]
+            features_tensor = torch.tensor(
+                [feature_dict[key] for key in self.feature_key_order], dtype=torch.float32
+            )
+            return features_tensor, graph_data, duration_bin_tensor, event_tensor
+
+    baseline_dataset = _ScalarFeatureOverrideDataset(dataset, baseline_features, BASELINE_FEATURE_KEYS)
+    train_set = Subset(baseline_dataset, confirm_train_indices)
+    val_set = Subset(baseline_dataset, confirm_val_indices)
+    n_train, n_val = len(train_set), len(val_set)
+
+    feature_mean, feature_std, _graph_feature_mean, _graph_feature_std = _compute_normalization_stats(
+        baseline_dataset, train_set
+    )
+
+    train_loader = DataLoader(
+        train_set,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        generator=torch.Generator().manual_seed(RANDOM_SEED),
+    )
+    val_batch = next(iter(DataLoader(val_set, batch_size=len(val_set))))
+
+    mlflow.set_tracking_uri("file:./mlruns")
+    mlflow.set_experiment(MLFLOW_EXPERIMENT_NAME)
+
+    logger.info("\n" + "=" * 80)
+    logger.info(
+        "RQ1 ABLATION STEP 2 (cont.): train DeepHitSurvivalModel MLP, SAME architecture + "
+        "hyperparameters as the match-level physics-informed reference run"
+    )
+    logger.info("=" * 80)
+    torch.manual_seed(RANDOM_SEED)
+    baseline_model = DeepHitSurvivalModel(num_features=len(BASELINE_FEATURE_KEYS), num_bins=NUM_BINS)
+    baseline_optimizer = torch.optim.Adam(
+        baseline_model.parameters(), lr=MLP_STABILIZED_LR, weight_decay=MLP_STABILIZED_WEIGHT_DECAY
+    )
+    baseline_results = _train_and_log_model(
+        model_type="MLP",
+        model=baseline_model,
+        optimizer=baseline_optimizer,
+        lr=MLP_STABILIZED_LR,
+        weight_decay=MLP_STABILIZED_WEIGHT_DECAY,
+        clip_grad_norm=True,
+        input_fn=_normalize_scalar_batch,
+        normalize_args=(feature_mean, feature_std),
+        train_loader=train_loader,
+        val_batch=val_batch,
+        n_train=n_train,
+        n_val=n_val,
+        match_ids=match_ids,
+        dataset_size=dataset_size,
+        extra_params={
+            "dataset_scale": "multi_competition",
+            "competition_season_pairs": competition_season_summary,
+            "split_type": "match_level",  # Milestone 35 / ADR-011, independently confirmed above
+            "ablation": "rq1_non_physics_baseline",
+            # `_train_and_log_model` unconditionally logs a GLOBAL
+            # "feature_key_order" param (the physics FEATURE_KEYS names) --
+            # pre-existing, unmodified behavior of that shared function,
+            # left as-is rather than editing it for this one ablation call.
+            # That logged value does NOT describe this run; the true
+            # feature names actually used are recorded here instead, under
+            # a distinct key.
+            "true_feature_key_order": ",".join(BASELINE_FEATURE_KEYS),
+        },
+        run_tags={
+            "ablation_purpose": (
+                "RQ1 non-physics baseline: raw player/ball positions + is_teammate only, "
+                "no BiomechanicalPitchControl"
+            ),
+        },
+        normalization_artifact={
+            "feature_key_order": list(BASELINE_FEATURE_KEYS),
+            "mean": feature_mean.tolist(),
+            "std": feature_std.tolist(),
+        },
+    )
+
+    baseline_healthy = _evaluate_mlp_health(baseline_results)
+
+    logger.info("\n" + "=" * 80)
+    logger.info("RQ1 ABLATION -- HEALTH GATE (ADR-010, full four-signal check)")
+    logger.info("=" * 80)
+    if baseline_results is not None:
+        logger.info(
+            f"Non-physics baseline MLP four-signal detector: spike={baseline_results['spike_fired']}, "
+            f"cumulative_drift={baseline_results['cumulative_drift_fired']}, "
+            f"saturation={baseline_results['saturation_fired']} (entropy/variance-based -- ADR-010's "
+            f"primary trusted signal for ambiguous cases), "
+            f"frozen_val_loss={baseline_results['frozen_val_loss_fired']} -> "
+            f"baseline_healthy={baseline_healthy}"
+        )
+    else:
+        logger.warning(
+            "Non-physics baseline MLP: training ABORTED (NaN/Inf loss) -> baseline_healthy=False"
+        )
+
+    # Milestone 35 (ADR-011) match-level physics-informed MLP reference,
+    # from RESEARCH_FINDINGS.md's RQ4 "Update -- Stage 3" table
+    # (run_match_level_rq2_rq4_full_revalidation's own Step 2 MLP result --
+    # not re-run here, since re-running it would not change the recorded
+    # number and this ablation must not retrain the existing baseline).
+    physics_match_level_brier_15s = 0.1009
+    physics_match_level_brier_30s = 0.1873
+
+    logger.info("\n" + "=" * 80)
+    logger.info(
+        "RQ1 ABLATION STEP 3: non-physics baseline vs. the current physics-informed match-level "
+        "reference (both match_level split, ADR-011)"
+    )
+    logger.info("=" * 80)
+    logger.info(f"{'Model':<58} {'split_type':>13} {'Brier@15s':>10} {'Brier@30s':>10}")
+    logger.info(
+        f"{'MLP, physics-informed (match_level, RESEARCH_FINDINGS.md RQ4)':<58} {'match_level':>13} "
+        f"{physics_match_level_brier_15s:>10.4f} {physics_match_level_brier_30s:>10.4f}"
+    )
+    if baseline_results is not None:
+        logger.info(
+            f"{'MLP, non-physics baseline (this run, NEW)':<58} {'match_level':>13} "
+            f"{baseline_results['brier_15s']:>10.4f} {baseline_results['brier_30s']:>10.4f}"
+        )
+    else:
+        logger.info(f"{'MLP, non-physics baseline (this run, NEW)':<58} {'match_level':>13} {'ABORTED':>10} {'ABORTED':>10}")
+
+    return {
+        "dataset_size": dataset_size,
+        "n_train": n_train,
+        "n_val": n_val,
+        "match_count": len(match_ids),
+        "baseline_results": baseline_results,
+        "baseline_healthy": baseline_healthy,
+        "physics_match_level_brier_15s": physics_match_level_brier_15s,
+        "physics_match_level_brier_30s": physics_match_level_brier_30s,
+        "baseline_feature_keys": BASELINE_FEATURE_KEYS,
+    }
+
+
+# Repeated-measurement investigation of the RQ1 non-physics-baseline gap
+# (run_rq1_non_physics_baseline_ablation's single-seed, single-split result:
+# physics-informed MLP 0.1009/0.1873 vs. non-physics baseline MLP
+# 0.0940/0.1840, match_level split seed=42) -- is that ~0.007/0.003 gap real
+# and repeatable, or a single-run artifact? Same methodology as the GNN
+# horizon-degradation investigation (`run_gnn_horizon_seed_split_sensitivity_check`
+# above): (1) model-init-seed variation at the SAME match-level split, (2)
+# split-seed variation (genuinely different match partitions). The
+# physics-informed MLP side of every (init_seed, split_seed) combination this
+# check needs is ALREADY on record from that exact investigation (same
+# architecture, same hyperparameters, same match_level_split call) --
+# reused directly rather than retrained, per that investigation's own
+# established "don't retrain what's already on record" convention. Only the
+# non-physics baseline (genuinely new to this ablation) is trained fresh at
+# each combination. No model architecture, split function, or hyperparameter
+# is modified anywhere in this section; feature_extractor.py and
+# naive_baseline_features.py's core extraction logic are untouched.
+RQ1_BASELINE_INVESTIGATION_TAG = "rq1_non_physics_baseline_seed_split_check"
+RQ1_PHYSICS_MLP_SEED_SPLIT_RUNS = {
+    (42, 42): "b77fdf76b79b4fc3a19035914a098091",
+    (43, 42): "50fe80da239e4213bba5909cd72cdc5c",
+    (44, 42): "cbef43bed56f4970a10724d99f86796d",
+    (42, 43): "fe9fcf4722d6499eba6bf5b844c2cd12",
+    (42, 44): "4b4170c94b014f95861de4a5adf32530",
+}
+# The non-physics baseline's own seed=42/split=42 run
+# (run_rq1_non_physics_baseline_ablation's result) -- reused, not retrained.
+RQ1_BASELINE_SEED42_SPLIT42_RUN_ID = "5ea3b1868c3a4f6ebb951ff3583c132d"
+
+
+def _train_rq1_baseline_at_seed_and_split(
+    init_seed: int, split_seed: int, loaded_full: dict, baseline_features: list[dict]
+) -> dict:
+    """Same shape as `_train_at_seed_and_split`, for the RQ1 non-physics
+    baseline instead of the physics-informed MLP/GNN. `baseline_features` is
+    precomputed ONCE by the caller and passed in -- `extract_naive_baseline_features`
+    is a pure function of `frames` alone, independent of seed/split, so
+    recomputing it per combination would be wasted, identical work.
+    """
+    frames = loaded_full["frames"]
+    chains = loaded_full["chains"]
+    sample_match_ids = loaded_full["sample_match_ids"]
+    match_ids = loaded_full["match_ids"]
+    dataset_size = loaded_full["dataset_size"]
+    competition_season_summary = loaded_full["competition_season_summary"]
+
+    # A fresh TacticalSurvivalDataset (its physics-derived `features` are
+    # built but then immediately overridden below, never consumed) -- the
+    # SAME pattern `run_rq1_non_physics_baseline_ablation` uses, just redone
+    # per combination since the graph_data it wraps is independent of
+    # init_seed/split_seed and cheap to rebuild from already-in-memory frames.
+    dataset = TacticalSurvivalDataset(loaded_full["features"], frames, chains)
+
+    class _ScalarFeatureOverrideDataset(Dataset):
+        def __init__(self, base_dataset, override_feature_dicts, feature_key_order):
+            self.base_dataset = base_dataset
+            self.override_feature_dicts = override_feature_dicts
+            self.feature_key_order = feature_key_order
+
+        def __len__(self):
+            return len(self.base_dataset)
+
+        def __getitem__(self, idx):
+            _, graph_data, duration_bin_tensor, event_tensor = self.base_dataset[idx]
+            feature_dict = self.override_feature_dicts[idx]
+            features_tensor = torch.tensor(
+                [feature_dict[key] for key in self.feature_key_order], dtype=torch.float32
+            )
+            return features_tensor, graph_data, duration_bin_tensor, event_tensor
+
+    baseline_dataset = _ScalarFeatureOverrideDataset(dataset, baseline_features, BASELINE_FEATURE_KEYS)
+
+    train_indices, val_indices = match_level_split(
+        sample_match_ids, val_fraction=1.0 - TRAIN_FRACTION, seed=split_seed
+    )
+    train_set = Subset(baseline_dataset, train_indices)
+    val_set = Subset(baseline_dataset, val_indices)
+    n_train, n_val = len(train_set), len(val_set)
+
+    feature_mean, feature_std, _graph_mean, _graph_std = _compute_normalization_stats(
+        baseline_dataset, train_set
+    )
+
+    torch.manual_seed(init_seed)
+    train_loader = DataLoader(
+        train_set, batch_size=BATCH_SIZE, shuffle=True,
+        generator=torch.Generator().manual_seed(init_seed),
+    )
+    val_batch = next(iter(DataLoader(val_set, batch_size=len(val_set))))
+
+    torch.manual_seed(init_seed)
+    model = DeepHitSurvivalModel(num_features=len(BASELINE_FEATURE_KEYS), num_bins=NUM_BINS)
+    optimizer = torch.optim.Adam(model.parameters(), lr=MLP_STABILIZED_LR, weight_decay=MLP_STABILIZED_WEIGHT_DECAY)
+
+    results = _train_and_log_model(
+        model_type="MLP",
+        model=model,
+        optimizer=optimizer,
+        lr=MLP_STABILIZED_LR,
+        weight_decay=MLP_STABILIZED_WEIGHT_DECAY,
+        clip_grad_norm=True,
+        input_fn=_normalize_scalar_batch,
+        normalize_args=(feature_mean, feature_std),
+        train_loader=train_loader,
+        val_batch=val_batch,
+        n_train=n_train,
+        n_val=n_val,
+        match_ids=match_ids,
+        dataset_size=dataset_size,
+        extra_params={
+            "dataset_scale": "multi_competition",
+            "competition_season_pairs": competition_season_summary,
+            "split_type": "match_level",
+            "init_seed": init_seed,
+            "split_seed": split_seed,
+            "ablation": "rq1_non_physics_baseline",
+            "true_feature_key_order": ",".join(BASELINE_FEATURE_KEYS),
+        },
+        run_tags={
+            "investigation": RQ1_BASELINE_INVESTIGATION_TAG,
+            "init_seed": str(init_seed),
+            "split_seed": str(split_seed),
+            "ablation_purpose": "RQ1 non-physics baseline seed/split robustness check",
+        },
+        normalization_artifact={
+            "feature_key_order": list(BASELINE_FEATURE_KEYS),
+            "mean": feature_mean.tolist(),
+            "std": feature_std.tolist(),
+        },
+    )
+    healthy = _evaluate_mlp_health(results)
+    return {
+        "init_seed": init_seed,
+        "split_seed": split_seed,
+        "results": results,
+        "run_id": results["run_id"] if results is not None else None,
+        "healthy": healthy,
+    }
+
+
+def _reconstruct_mlp_health_from_run(client, run_id: str) -> tuple[float | None, float | None, bool]:
+    """Re-derive (brier_15s, brier_30s, healthy) for an ALREADY-LOGGED MLflow
+    run without re-running `_evaluate_mlp_health` (which needs the full
+    in-process results dict, not just what MLflow persisted) -- same
+    reconstruction `run_gnn_horizon_seed_split_sensitivity_check` performs
+    for its own reused runs, applied here to this check's reused runs.
+    """
+    run = client.get_run(run_id)
+    p, m = run.data.params, run.data.metrics
+    brier_15s = m.get("val_brier_15s")
+    brier_30s = m.get("val_brier_30s")
+    instability = p.get("instability_warning_fired") == "True"
+    brier_in_range = (
+        brier_15s is not None and brier_30s is not None
+        and brier_15s <= MLP_SANITY_BRIER_15S_CEILING
+        and brier_30s <= MLP_SANITY_BRIER_30S_CEILING
+    )
+    healthy = (not instability) and brier_in_range
+    return brier_15s, brier_30s, healthy
+
+
+def run_rq1_baseline_seed_split_check() -> dict:
+    """Steps 1+2 of the RQ1 non-physics-baseline repeated-measurement check:
+    does the single-run 0.0069 @15s / 0.0033 @30s gap (physics-informed
+    MINUS non-physics baseline; positive = physics worse) hold across
+    model-initialization seeds (same match-level split) and across genuinely
+    different split seeds (different match partitions)? Reuses the
+    physics-informed MLP's already-on-record runs
+    (`RQ1_PHYSICS_MLP_SEED_SPLIT_RUNS`) and the baseline's own seed=42/
+    split=42 run (`RQ1_BASELINE_SEED42_SPLIT42_RUN_ID`) directly from
+    MLflow; trains only the genuinely missing non-physics baseline
+    (init_seed, split_seed) combinations.
+    """
+    torch.manual_seed(RANDOM_SEED)
+    loaded_full = _load_and_split_dataset()
+    baseline_features = [extract_naive_baseline_features(frame) for frame in loaded_full["frames"]]
+
+    mlflow.set_tracking_uri("file:./mlruns")
+    mlflow.set_experiment(MLFLOW_EXPERIMENT_NAME)
+    client = mlflow.tracking.MlflowClient()
+
+    combinations = [
+        # Step 1: same split (42), vary init seed.
+        (42, 42), (43, 42), (44, 42),
+        # Step 2: same init seed (42), vary split seed.
+        (42, 43), (42, 44),
+    ]
+
+    baseline_results: dict[tuple[int, int], dict] = {}
+    for init_seed, split_seed in combinations:
+        if (init_seed, split_seed) == (42, 42):
+            b15, b30, healthy = _reconstruct_mlp_health_from_run(client, RQ1_BASELINE_SEED42_SPLIT42_RUN_ID)
+            logger.info(
+                f"\n[baseline init_seed={init_seed} split_seed={split_seed}] REUSING existing "
+                f"run_id={RQ1_BASELINE_SEED42_SPLIT42_RUN_ID} (not retrained)."
+            )
+            baseline_results[(init_seed, split_seed)] = {
+                "run_id": RQ1_BASELINE_SEED42_SPLIT42_RUN_ID,
+                "brier_15s": b15, "brier_30s": b30, "healthy": healthy, "reused": True,
+            }
+            continue
+
+        logger.info(f"\n[baseline init_seed={init_seed} split_seed={split_seed}] training fresh...")
+        outcome = _train_rq1_baseline_at_seed_and_split(init_seed, split_seed, loaded_full, baseline_features)
+        r = outcome["results"]
+        baseline_results[(init_seed, split_seed)] = {
+            "run_id": outcome["run_id"],
+            "brier_15s": r["brier_15s"] if r is not None else None,
+            "brier_30s": r["brier_30s"] if r is not None else None,
+            "healthy": outcome["healthy"], "reused": False,
+        }
+
+    physics_results: dict[tuple[int, int], dict] = {}
+    for key, run_id in RQ1_PHYSICS_MLP_SEED_SPLIT_RUNS.items():
+        b15, b30, healthy = _reconstruct_mlp_health_from_run(client, run_id)
+        physics_results[key] = {"run_id": run_id, "brier_15s": b15, "brier_30s": b30, "healthy": healthy}
+        logger.info(
+            f"[physics-informed init_seed={key[0]} split_seed={key[1]}] REUSING existing "
+            f"run_id={run_id} (already on record, not retrained)."
+        )
+
+    logger.info("\n" + "=" * 100)
+    logger.info("RQ1 BASELINE CHECK STEP 1: init-seed sensitivity (split_seed=42 fixed)")
+    logger.info("=" * 100)
+    logger.info(
+        f"{'init_seed':>10} {'physics@15s':>12} {'physics@30s':>12} {'baseline@15s':>13} "
+        f"{'baseline@30s':>13} {'gap@15s (phys-base)':>21} {'gap@30s (phys-base)':>21} {'both healthy':>13}"
+    )
+    for seed in (42, 43, 44):
+        phys = physics_results[(seed, 42)]
+        base = baseline_results[(seed, 42)]
+        both_healthy = phys["healthy"] and base["healthy"]
+        gap_15s = phys["brier_15s"] - base["brier_15s"] if phys["brier_15s"] is not None and base["brier_15s"] is not None else None
+        gap_30s = phys["brier_30s"] - base["brier_30s"] if phys["brier_30s"] is not None and base["brier_30s"] is not None else None
+        logger.info(
+            f"{seed:>10} {phys['brier_15s'] if phys['brier_15s'] is not None else float('nan'):>12.4f} "
+            f"{phys['brier_30s'] if phys['brier_30s'] is not None else float('nan'):>12.4f} "
+            f"{base['brier_15s'] if base['brier_15s'] is not None else float('nan'):>13.4f} "
+            f"{base['brier_30s'] if base['brier_30s'] is not None else float('nan'):>13.4f} "
+            f"{gap_15s if gap_15s is not None else float('nan'):>21.4f} "
+            f"{gap_30s if gap_30s is not None else float('nan'):>21.4f} {both_healthy!s:>13}"
+        )
+        if not both_healthy:
+            logger.warning(
+                f"  init_seed={seed}: NOT both healthy (physics healthy={phys['healthy']}, "
+                f"baseline healthy={base['healthy']}) -- excluded from any conclusion."
+            )
+
+    logger.info("\n" + "=" * 100)
+    logger.info("RQ1 BASELINE CHECK STEP 2: split-seed sensitivity (init_seed=42 fixed)")
+    logger.info("=" * 100)
+    logger.info(
+        f"{'split_seed':>10} {'physics@15s':>12} {'physics@30s':>12} {'baseline@15s':>13} "
+        f"{'baseline@30s':>13} {'gap@15s (phys-base)':>21} {'gap@30s (phys-base)':>21} {'both healthy':>13}"
+    )
+    for split_seed in (42, 43, 44):
+        phys = physics_results[(42, split_seed)]
+        base = baseline_results[(42, split_seed)]
+        both_healthy = phys["healthy"] and base["healthy"]
+        gap_15s = phys["brier_15s"] - base["brier_15s"] if phys["brier_15s"] is not None and base["brier_15s"] is not None else None
+        gap_30s = phys["brier_30s"] - base["brier_30s"] if phys["brier_30s"] is not None and base["brier_30s"] is not None else None
+        logger.info(
+            f"{split_seed:>10} {phys['brier_15s'] if phys['brier_15s'] is not None else float('nan'):>12.4f} "
+            f"{phys['brier_30s'] if phys['brier_30s'] is not None else float('nan'):>12.4f} "
+            f"{base['brier_15s'] if base['brier_15s'] is not None else float('nan'):>13.4f} "
+            f"{base['brier_30s'] if base['brier_30s'] is not None else float('nan'):>13.4f} "
+            f"{gap_15s if gap_15s is not None else float('nan'):>21.4f} "
+            f"{gap_30s if gap_30s is not None else float('nan'):>21.4f} {both_healthy!s:>13}"
+        )
+        if not both_healthy:
+            logger.warning(
+                f"  split_seed={split_seed}: NOT both healthy (physics healthy={phys['healthy']}, "
+                f"baseline healthy={base['healthy']}) -- excluded from any conclusion."
+            )
+
+    return {"physics_results": physics_results, "baseline_results": baseline_results}
+
+
 if __name__ == "__main__":
     # Only configured here, for this file's own standalone entrypoint --
     # see the module-level `logger` declaration's comment for why this must
@@ -2981,5 +3510,9 @@ if __name__ == "__main__":
         run_match_level_rq2_rq4_full_revalidation()
     elif "--gnn-horizon-check" in sys.argv:
         run_gnn_horizon_seed_split_sensitivity_check()
+    elif "--rq1-non-physics-baseline" in sys.argv:
+        run_rq1_non_physics_baseline_ablation()
+    elif "--rq1-baseline-seed-split-check" in sys.argv:
+        run_rq1_baseline_seed_split_check()
     else:
         train_and_evaluate()

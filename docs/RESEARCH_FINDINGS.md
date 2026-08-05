@@ -94,6 +94,124 @@ supports well-calibrated prediction in absolute terms, not a measured relative
 improvement over an alternative without velocity-aware pitch control. This is a real gap,
 named explicitly rather than papered over with an implied percentage.
 
+**Update — the missing non-physics baseline ablation (post-Milestone 35).** The gap named
+above has now been closed: a genuine non-physics baseline was built and trained, under
+this project's current match-level split methodology (ADR-011), specifically to fill in
+the comparison RQ1's criterion always implied but this project had never run.
+
+*Baseline feature set* (`production/src/pipeline/naive_baseline_features.py`, new,
+additive module — `feature_extractor.py` and `BiomechanicalPitchControl` were not
+touched): four scalar features (`teammates_near_ball_count`, `opponents_near_ball_count`,
+`teammates_in_final_third_count`, `raw_space_behind_defending_line`) computed as simple
+counts/distances directly over raw `player_pos`/`ball_pos`/`is_teammate` — the same
+near-ball radius and final-third line constants as the physics features, but with no
+`BiomechanicalPitchControl` call, no ODE, and no pitch-grid integration anywhere.
+`player_vel` and `fatigue_mod` were deliberately excluded: `statsbomb_io.parse_360_frame`
+sets these to an all-zero tensor and a constant `1.0`, respectively, for **every** sample
+in this project (StatsBomb's public 360 data carries no velocity field at all), so neither
+carries any information to aggregate — a limitation of the raw data itself, not of this
+baseline's design, and worth naming plainly rather than silently working around.
+
+*Split confirmed, not assumed:* this ablation reused `_load_and_split_dataset()`'s exact
+`frames`/`chains`/`match_ids` (same 55-match, 8,074-sample corpus cited in §1's Executive
+Summary), then independently re-invoked `match_level_split` (ADR-011,
+`production/src/pipeline/data_split.py`) with the same `sample_match_ids`, `seed=42`, and
+`val_fraction` `_load_and_split_dataset()` used internally, and asserted the resulting
+train/val indices were identical before training — 6,642 train / 1,432 val samples. Model
+architecture (`DeepHitSurvivalModel`) and hyperparameters (`lr=1e-4`, `weight_decay=1e-4`,
+gradient clipping, 50 epochs) are identical to the current match-level physics-informed
+MLP reference; only the scalar feature values fed to the model differ.
+
+*Health gate (ADR-010, full four-signal check):* spike=`False`, cumulative_drift=`False`,
+saturation=`False` (entropy/variance-based), frozen_val_loss=`False` →
+`instability_warning_fired=False`. Brier sanity check: 0.0940 ≤ 0.2115 (15s ceiling) and
+0.1840 ≤ 0.4300 (30s ceiling, both 2.5× the Milestone 12B reference floor) → in range.
+**Health gate PASSED** — this result is trusted.
+
+| Model | split_type | Brier@15s | Brier@30s | MLflow run_id |
+|---|---|---|---|---|
+| MLP, physics-informed (match_level, this doc's RQ4 "Update — Stage 3") | match_level | 0.1009 | 0.1873 | (see RQ4 below) |
+| MLP, non-physics baseline (this run, NEW) | match_level | 0.0940 | 0.1840 | `5ea3b1868c3a4f6ebb951ff3583c132d` |
+
+**Finding:** under match-level splitting, the non-physics baseline's Brier Scores are
+*slightly better* (lower) than the physics-informed model's — not worse. The
+physics-informed pipeline does not clear RQ1's implied bar in this data point: it is not
+even ahead of a raw-position baseline built from the same underlying signal, let alone
+ahead by some percentage.
+
+**Caveats (same hedging this project applies to every other model comparison — see RQ4's
+history below for precedent):** this is one run of each side, at one seed, with no
+seed-robustness re-check on either model under match-level splitting — the gap (0.0069
+absolute at 15s, 0.0033 absolute at 30s) is small enough that it could plausibly be
+run-to-run noise (weight initialization, data-loader shuffle order) rather than a durable
+difference in either direction. This is a real, measured, health-gated data point, not a
+permanently settled verdict, and RQ1's original criterion ("Brier Score improvement ≥
+X%") still has no concrete `X` specified anywhere in this project's history — that gap is
+not resolved by this ablation, only the previously-missing comparison itself is. Read
+together: the honest current answer to RQ1 is that velocity-aware pitch control produces
+well-calibrated absolute predictions (the original finding above, unchanged), but the
+first real measurement against a non-physics baseline does not show it winning, and
+against an unspecified numeric threshold there is nothing to "clear" in the first place.
+
+**Update — repeated-measurement check of the non-physics-baseline gap: direction holds
+under init-seed variation, does NOT hold under split-seed variation, APPENDED as a
+correction to the paragraph above, not a deletion of it.** The single-run 0.0069 @15s /
+0.0033 @30s gap (physics − baseline; positive = physics worse) above was one seed, one
+split — exactly the situation the GNN horizon-degradation investigation (RQ4 below) set a
+precedent for: check before trusting either direction. Same methodology here:
+(1) model-init-seed variation at the SAME match-level split, (2) split-seed variation
+(genuinely different match partitions). The physics-informed MLP side of every
+(init_seed, split_seed) combination needed was already on record from that exact
+investigation (same architecture, hyperparameters, and `match_level_split` call) and was
+reused directly, not retrained; only the non-physics baseline was trained fresh at each
+combination (`run_rq1_baseline_seed_split_check()` in `train.py`).
+
+*Model-init-seed check (same split_seed=42, 3 init seeds):* all 6 runs (3 physics, 3
+baseline) cleared every ADR-010 instability signal and the Brier-sanity check —
+genuinely healthy, none excluded.
+
+| init_seed | physics@15s | physics@30s | baseline@15s | baseline@30s | gap@15s (phys−base) | gap@30s (phys−base) |
+|---|---|---|---|---|---|---|
+| 42 | 0.1009 | 0.1873 | 0.0940 | 0.1840 | +0.0069 | +0.0033 |
+| 43 | 0.1002 | 0.1864 | 0.0951 | 0.1862 | +0.0051 | +0.0002 |
+| 44 | 0.1015 | 0.1894 | 0.0947 | 0.1865 | +0.0068 | +0.0029 |
+
+*Split-seed check (same init_seed=42, 3 split seeds — genuinely different match
+partitions):* all 6 runs again genuinely healthy.
+
+| split_seed | physics@15s | physics@30s | baseline@15s | baseline@30s | gap@15s (phys−base) | gap@30s (phys−base) |
+|---|---|---|---|---|---|---|
+| 42 | 0.1009 | 0.1873 | 0.0940 | 0.1840 | +0.0069 | +0.0033 |
+| 43 | 0.0934 | 0.1593 | 0.0926 | 0.1628 | +0.0008 | **−0.0035** |
+| 44 | 0.1070 | 0.1798 | 0.1109 | 0.1811 | **−0.0039** | **−0.0013** |
+
+**Honest conclusion, not forced toward either extreme:** the two sweeps disagree with
+each other, and that disagreement IS the finding. Holding the validation split fixed at
+split_seed=42 and varying only weight initialization, the baseline stays ahead of the
+physics-informed model in direction at all 3 seeds — though the margin nearly vanishes at
+30s for seed=43 (+0.0002, indistinguishable from zero). But holding init_seed=42 fixed and
+varying which matches land in validation, the direction **does not hold**: split_seed=44
+reverses it at BOTH horizons (physics-informed wins outright, gap negative both places),
+and split_seed=43 is close to a wash at 15s and mildly reversed at 30s. Unlike the GNN
+horizon-degradation check below — where the GNN's underperformance held in direction
+across every one of 5 additional combinations and only its magnitude was an outlier — this
+gap does **not** clear even that lower bar: it is not confirmed as a split-independent
+property of the two feature sets. The most defensible reading is that
+`run_rq1_non_physics_baseline_ablation()`'s original single-run result was, at least
+partly, a property of split_seed=42's own particular validation partition rather than a
+general finding that raw-position aggregates beat physics-informed pitch-control features
+under match-level splitting. **RQ1's honest current state, combining both updates above:**
+the physics-informed pipeline produces well-calibrated absolute predictions (the original
+finding, unchanged); the first real non-physics-baseline comparison did not show it
+winning on a single run; and now that the comparison has been repeated, it does not show
+it *reliably losing* either — the two models are close enough, and split-sensitive enough,
+that this specific ablation cannot currently support a directional claim in either
+direction beyond "not clearly different under match-level splitting, pending further
+investigation into why split_seed=44 behaves differently." This is reported plainly as a
+non-replication, per this project's own standard (ADR-016's rejected adaptive-rejection
+attempts and the GNN horizon check are the direct precedent) for treating a correction
+like this as a first-class, reportable outcome, not a failure to hide.
+
 ### RQ2 — Does Bayesian tactical memory improve prediction over purely live tracking?
 
 **Question (README):** *"Does Bayesian tactical memory improve prediction over purely
