@@ -31,7 +31,10 @@ directory, same convention as `mlruns/`/`data/raw/`).
 
 import html
 import json
+import logging
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 MANIFEST_FILENAME = "manifest.json"
 
@@ -103,7 +106,7 @@ def render_validation_dashboards(output_dir: str) -> None:
                 "low_sample_reason": reason,
             }
         )
-        print(f"[build_index] rendered player {display_name!r} -> {png_filename} (low_sample={low_sample})")
+        logger.info(f"rendered player {display_name!r} -> {png_filename} (low_sample={low_sample})")
 
     for team_name, match_ids in team_cases:
         report = generate_team_report(team_name, match_ids)
@@ -124,7 +127,7 @@ def render_validation_dashboards(output_dir: str) -> None:
                 "low_sample_reason": reason,
             }
         )
-        print(f"[build_index] rendered team {team_name!r} -> {png_filename} (low_sample={low_sample})")
+        logger.info(f"rendered team {team_name!r} -> {png_filename} (low_sample={low_sample})")
 
     with open(output_path / MANIFEST_FILENAME, "w") as f:
         json.dump(manifest, f, indent=2)
@@ -165,7 +168,7 @@ def generate_report_index(output_dir: str) -> str:
         with open(manifest_path) as f:
             entries = json.load(f)
     else:
-        print(f"[build_index] no {MANIFEST_FILENAME} found in {output_dir} -- every PNG will be Unlabeled.")
+        logger.warning(f"no {MANIFEST_FILENAME} found in {output_dir} -- every PNG will be Unlabeled.")
 
     known_filenames = {e["png_filename"] for e in entries}
     for png_file in sorted(output_path.glob("*.png")):

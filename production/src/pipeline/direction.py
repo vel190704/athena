@@ -37,6 +37,10 @@ coordinate space, before any ADR-002 rescaling into the project's 100x68
 grid.
 """
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 FINAL_FIFTH_X = 96.0  # 4/5 * 120: StatsBomb's raw-space final fifth boundary
 SHOT_MEAN_X_THRESHOLD = 60.0  # pitch center in raw 0-120 space
 
@@ -117,8 +121,8 @@ def infer_attacking_direction(
         return direction
 
     match_ref = f"match {match_id}" if match_id is not None else "this match"
-    print(
-        f"[direction] WARNING: no shots or final-fifth touches for {team_name} in period "
+    logger.warning(
+        f"no shots or final-fifth touches for {team_name} in period "
         f"{period} of {match_ref} -- cannot infer attacking direction; excluding this "
         f"team's chains for this period."
     )
@@ -164,8 +168,8 @@ def build_direction_lookup(events: list, match_id: int | None = None) -> dict[st
             period2_independent_estimate is not None
             and period2_independent_estimate != period2_direction
         ):
-            print(
-                f"[direction] WARNING: {team_name} in match "
+            logger.warning(
+                f"{team_name} in match "
                 f"{match_id if match_id is not None else '?'}, period 2: independently "
                 f"inferred direction ({period2_independent_estimate:+d}) disagrees with the "
                 f"guaranteed opposite-of-period-1 direction ({period2_direction:+d}). Using "

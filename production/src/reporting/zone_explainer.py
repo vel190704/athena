@@ -33,6 +33,8 @@ fixed grid comparable cell-for-cell across different frames without
 re-binning (see `zone_attributions_to_grid` for that step).
 """
 
+import logging
+
 import numpy as np
 import torch
 from captum.attr import IntegratedGradients
@@ -51,6 +53,8 @@ from production.src.pipeline.habit_memory import (
     GRID_ROWS,
 )
 from production.src.spatial.control import BiomechanicalPitchControl
+
+logger = logging.getLogger(__name__)
 
 
 def _active_grid_and_controls(
@@ -293,7 +297,7 @@ def aggregate_zone_attributions(team_name: str, match_ids: list[int], time_bin: 
                 continue
             if model is None:
                 model, normalization_mean, normalization_std, run_id = load_deterministic_mlp()
-                print(f"[zone_explainer] using deterministic MLP run_id={run_id}")
+                logger.info(f"using deterministic MLP run_id={run_id}")
 
             result = compute_zone_attributions(
                 parsed, engine, model, normalization_mean, normalization_std, pitch_grid, time_bin=time_bin

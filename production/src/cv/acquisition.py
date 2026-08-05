@@ -48,11 +48,18 @@ target for Phase 28's team/role classification -- NOT this milestone's
 `tracking` task, whose `gt.txt` genuinely has no classes to preserve.
 """
 
+import logging
 import os
 import zipfile
 from pathlib import Path
 
 from SoccerNet.Downloader import SoccerNetDownloader
+
+# Module-level logger, no handler/basicConfig configured here -- same
+# established pattern as train.py/alert_store.py: this module is a
+# library import, not an entrypoint, so it must never mutate global
+# logging config for whatever application imports it.
+logger = logging.getLogger(__name__)
 
 SOCCERNET_LOCAL_DIR = Path("data/raw/soccernet")
 TRACKING_TASK = "tracking"
@@ -106,21 +113,16 @@ def download_sample_dataset(num_games: int = 1, password: str | None = None) -> 
     resolved_password = password or os.environ.get("SOCCERNET_PASSWORD")
 
     if not resolved_password:
-        print(
-            "\n[acquisition] SoccerNet tracking data requires a real, individually-issued "
+        logger.warning(
+            "SoccerNet tracking data requires a real, individually-issued "
             "download password -- this is a signed NDA/research-use agreement with SoccerNet, "
-            "not something this script can obtain automatically.\n"
-            "\n"
-            "To proceed:\n"
-            "  1. Register at https://www.soccer-net.org and request access to the tracking "
-            "dataset.\n"
-            "  2. Sign the NDA/research-use agreement SoccerNet sends you.\n"
-            "  3. You will receive a download password.\n"
-            "  4. Re-run with that password, either:\n"
-            "       download_sample_dataset(password='<your password>')\n"
-            "     or by setting the SOCCERNET_PASSWORD environment variable before running.\n"
-            "\n"
-            "This is an expected manual step, not a bug -- no data has been downloaded.\n"
+            "not something this script can obtain automatically. To proceed: "
+            "1. Register at https://www.soccer-net.org and request access to the tracking "
+            "dataset. 2. Sign the NDA/research-use agreement SoccerNet sends you. "
+            "3. You will receive a download password. 4. Re-run with that password, either "
+            "download_sample_dataset(password='<your password>') or by setting the "
+            "SOCCERNET_PASSWORD environment variable before running. This is an expected "
+            "manual step, not a bug -- no data has been downloaded."
         )
         return None
 
@@ -130,8 +132,8 @@ def download_sample_dataset(num_games: int = 1, password: str | None = None) -> 
 
     train_zip = SOCCERNET_LOCAL_DIR / TRACKING_TASK / "train.zip"
     if not train_zip.exists():
-        print(
-            f"[acquisition] Expected archive not found at {train_zip} after download -- check "
+        logger.error(
+            f"Expected archive not found at {train_zip} after download -- check "
             "that the password is correct and that the tracking train.zip is actually "
             "available on SoccerNet's server (see SoccerNetDownloader's own console output "
             "above for the specific failure)."
@@ -140,13 +142,13 @@ def download_sample_dataset(num_games: int = 1, password: str | None = None) -> 
 
     extract_dir = SOCCERNET_LOCAL_DIR / TRACKING_TASK / "train"
     if not extract_dir.exists():
-        print(f"[acquisition] Extracting {train_zip} ...")
+        logger.info(f"Extracting {train_zip} ...")
         with zipfile.ZipFile(train_zip) as zf:
             zf.extractall(SOCCERNET_LOCAL_DIR / TRACKING_TASK)
 
     sequence_dirs = sorted(p for p in extract_dir.iterdir() if p.is_dir())
-    print(
-        f"[acquisition] {len(sequence_dirs)} sequence(s) extracted to {extract_dir}; "
+    logger.info(
+        f"{len(sequence_dirs)} sequence(s) extracted to {extract_dir}; "
         f"load_sample_frames_and_labels will use the first {num_games} per `num_games`."
     )
     return extract_dir
@@ -163,23 +165,23 @@ def inspect_annotation_format(sequence_dir: Path, num_lines: int = 5) -> None:
     gt_path = sequence_dir / "gt" / "gt.txt"
     seqinfo_path = sequence_dir / "seqinfo.ini"
 
-    print(f"\n[acquisition] Inspecting real annotation file: {gt_path}")
+    logger.info(f"Inspecting real annotation file: {gt_path}")
     if not gt_path.exists():
-        print(f"[acquisition] {gt_path} does not exist -- cannot inspect.")
+        logger.warning(f"{gt_path} does not exist -- cannot inspect.")
         return
 
     with open(gt_path) as f:
         lines = [next(f).rstrip("\n") for _ in range(num_lines)]
-    print(f"[acquisition] First {num_lines} raw line(s) of {gt_path.name}:")
+    logger.info(f"First {num_lines} raw line(s) of {gt_path.name}:")
     for line in lines:
-        print(f"  {line}")
-    print(f"[acquisition] Expected column layout (per GT_TXT_COLUMNS): {GT_TXT_COLUMNS}")
+        logger.info(f"  {line}")
+    logger.info(f"Expected column layout (per GT_TXT_COLUMNS): {GT_TXT_COLUMNS}")
 
     if seqinfo_path.exists():
-        print(f"\n[acquisition] Raw contents of {seqinfo_path.name}:")
-        print(seqinfo_path.read_text())
+        logger.info(f"Raw contents of {seqinfo_path.name}:")
+        logger.info(seqinfo_path.read_text())
     else:
-        print(f"[acquisition] {seqinfo_path} not present.")
+        logger.info(f"{seqinfo_path} not present.")
 
 
 def load_sample_frames_and_labels(game_id: int | str, extract_dir: Path | None = None) -> dict:

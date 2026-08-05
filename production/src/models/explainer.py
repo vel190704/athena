@@ -112,8 +112,8 @@ def select_deterministic_mlp_run_id() -> str:
         )
 
     selected = runs[0]
-    print(
-        f"[explainer] Selected MLP run_id={selected.info.run_id} "
+    logger.info(
+        f"Selected MLP run_id={selected.info.run_id} "
         f"(lowest val_brier_15s={selected.data.metrics.get('val_brier_15s')}, "
         f"among {len(runs)} matching run(s))"
     )

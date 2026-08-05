@@ -751,3 +751,136 @@ def test_alerts_history_endpoint_filters_by_source_and_match_id(isolated_alert_d
     assert [r["explanation_text"] for r in by_match] == ["stats alert"]
     assert [r["explanation_text"] for r in by_source] == ["cv alert"]
     assert len(all_rows) == 2
+
+
+# ============================================================================
+# ADR-022: the single, optional API-key check. `api_module.API_KEY` is
+# monkeypatched directly (the same established pattern this file already
+# uses for CVPipeline/log_alert overrides) rather than via a real env var
+# + process restart, since `API_KEY` is a plain module-level global read
+# at call time by `_require_api_key`, not cached anywhere.
+# ============================================================================
+
+
+def test_api_key_unset_by_default_protected_endpoint_works_with_no_header():
+    """The real, unmodified default this project's entire existing test
+    suite already depends on: api_module.API_KEY is never set anywhere in
+    production/tests/, so every existing test -- and any real local dev
+    session -- must keep working with zero friction, no header at all."""
+    assert api_module.API_KEY is None
+    with TestClient(app) as client:
+        response = client.get("/reports/team/Argentina", params={"match_ids": ARGENTINA_MATCH_IDS})
+    assert response.status_code == 200
+
+
+def test_api_key_set_rejects_missing_and_wrong_header_accepts_correct_one(monkeypatch):
+    monkeypatch.setattr(api_module, "API_KEY", "test-secret-key")
+
+    with TestClient(app) as client:
+        no_header = client.get("/reports/team/Argentina", params={"match_ids": ARGENTINA_MATCH_IDS})
+        wrong_header = client.get(
+            "/reports/team/Argentina",
+            params={"match_ids": ARGENTINA_MATCH_IDS},
+            headers={"X-API-Key": "wrong-key"},
+        )
+        correct_header = client.get(
+            "/reports/team/Argentina",
+            params={"match_ids": ARGENTINA_MATCH_IDS},
+            headers={"X-API-Key": "test-secret-key"},
+        )
+
+    assert no_header.status_code == 401
+    assert wrong_header.status_code == 401
+    assert correct_header.status_code == 200
+    assert "X-API-Key" in no_header.json()["detail"] or "api" in no_header.json()["detail"].lower()
+
+
+def test_api_key_set_health_endpoint_still_exempt(monkeypatch):
+    """/health is the one deliberate exception -- must remain reachable
+    with no header even once API_KEY is configured, so liveness probes
+    never need a credential."""
+    monkeypatch.setattr(api_module, "API_KEY", "test-secret-key")
+    with TestClient(app) as client:
+        response = client.get("/health")
+    assert response.status_code == 200
+
+
+def test_api_key_set_websocket_rejects_missing_key_accepts_correct_one(monkeypatch):
+    monkeypatch.setattr(api_module, "API_KEY", "test-secret-key")
+
+    with TestClient(app) as client:
+        with pytest.raises(WebSocketDisconnect):
+            with client.websocket_connect(f"/ws/tactical-stream?match_id={MATCH_ID}&delay=0.0"):
+                pass  # no X-API-Key header -- must be refused at the handshake
+
+        # Correct key: connects and receives at least one real message.
+        with client.websocket_connect(
+            f"/ws/tactical-stream?match_id={MATCH_ID}&delay=0.0",
+            headers={"X-API-Key": "test-secret-key"},
+        ) as websocket:
+            message = websocket.receive_json()
+            assert message["type"] == "threat"
+
+
+# ============================================================================
+# Fix 3: GET /health and GET /metrics.
+# ============================================================================
+
+
+def test_health_endpoint_returns_real_state():
+    with TestClient(app) as client:
+        response = client.get("/health")
+    assert response.status_code == 200
+    body = response.json()
+
+    assert body["status"] == "ok"
+    assert body["model_loaded"] is True
+    assert body["mlflow_reachable"] is True
+    # A real MLflow run_id, not a placeholder -- same format already
+    # confirmed real elsewhere in this file (e.g. the startup print line).
+    assert isinstance(body["model_run_id"], str) and len(body["model_run_id"]) > 0
+    assert isinstance(body["uptime_seconds"], (int, float)) and body["uptime_seconds"] >= 0
+
+
+def test_metrics_endpoint_reflects_real_alert_count(isolated_alert_db):
+    """The critical "not hardcoded" check: total_alerts_logged must match
+    a real, independently-queried alert_store.count_alerts() call against
+    the SAME isolated db -- not a stub value -- both before and after
+    logging two more real alerts."""
+    with TestClient(app) as client:
+        before = client.get("/metrics").json()
+    assert before["total_alerts_logged"] == alert_store.count_alerts()
+
+    alert_store.log_alert(
+        source="statsbomb", match_id=MATCH_ID, video_path=None, minute=1.0,
+        threat_before=0.05, threat_after=0.11, explanation_text="metrics test 1", explanation_source="mock",
+    )
+    alert_store.log_alert(
+        source="cv", match_id=None, video_path="data/raw/x.mp4", minute=2.0,
+        threat_before=0.05, threat_after=0.12, explanation_text="metrics test 2", explanation_source="mock",
+    )
+
+    with TestClient(app) as client:
+        after = client.get("/metrics").json()
+
+    assert after["total_alerts_logged"] == before["total_alerts_logged"] + 2
+    assert after["total_alerts_logged"] == alert_store.count_alerts()
+    assert after["active_websocket_connections"] == 0
+    assert after["total_http_requests_received"] > before["total_http_requests_received"]
+
+
+def test_metrics_endpoint_active_websocket_connections_reflects_real_open_connection():
+    """Confirms the counter is genuinely live server state, not a static
+    0 -- opens a real WebSocket connection and checks /metrics reports it
+    while still open, then confirms it drops back to 0 after close."""
+    with TestClient(app) as client:
+        idle = client.get("/metrics").json()
+        assert idle["active_websocket_connections"] == 0
+
+        with client.websocket_connect(f"/ws/tactical-stream?match_id={MATCH_ID}&delay=0.0") as websocket:
+            websocket.receive_json()  # ensure the connection is actually established/accepted
+            during = client.get("/metrics").json()
+            assert during["active_websocket_connections"] == 1
+
+        after = client.get("/metrics").json()
+        assert after["active_websocket_connections"] == 0

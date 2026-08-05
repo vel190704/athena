@@ -7,12 +7,15 @@ and risking rate-limiting.
 """
 
 import json
+import logging
 import time
 from pathlib import Path
 
 import requests
 import torch
 from tqdm import tqdm
+
+logger = logging.getLogger(__name__)
 
 EVENTS_URL_TEMPLATE = (
     "https://raw.githubusercontent.com/statsbomb/open-data/master/data/events/{match_id}.json"
@@ -185,8 +188,8 @@ def batch_extract_valid_matches(
         progress.close()
 
     if len(valid_ids) < num_matches:
-        print(
-            f"WARNING: only found {len(valid_ids)} valid matches (events + 360 data both "
+        logger.warning(
+            f"only found {len(valid_ids)} valid matches (events + 360 data both "
             f"present) across {len(competition_season_pairs)} competition/season pairs; "
             f"requested {num_matches}."
         )

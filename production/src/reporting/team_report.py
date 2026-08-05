@@ -13,6 +13,8 @@ functions. No CV/video dependency -- entirely independent of ADR-013
 through ADR-016.
 """
 
+import logging
+
 import torch
 
 from production.src.ingestion.statsbomb_io import (
@@ -36,6 +38,8 @@ from production.src.pipeline.habit_memory import (
     GRID_ROWS,
 )
 from production.src.spatial.control import BiomechanicalPitchControl
+
+logger = logging.getLogger(__name__)
 
 # Mirrors feature_extractor.FINAL_THIRD_X (66.0, an established, hand-tuned
 # asymmetric threshold -- NOT exactly PITCH_LENGTH/3) for the defensive
@@ -140,12 +144,12 @@ def generate_team_report(team_name: str, match_ids: list[int]) -> dict:
     for match_id in match_ids:
         teams = _teams_in_match(match_id)
         if team_name not in teams:
-            print(f"[team_report] match_id={match_id}: {team_name!r} did not play, skipping.")
+            logger.info(f"match_id={match_id}: {team_name!r} did not play, skipping.")
             continue
 
         triples = _match_representative_chain_frames(match_id)
         if not triples:
-            print(f"[team_report] match_id={match_id}: no 360-covered chains found, skipping.")
+            logger.info(f"match_id={match_id}: no 360-covered chains found, skipping.")
             continue
         matches_used += 1
 
@@ -180,7 +184,7 @@ def generate_team_report(team_name: str, match_ids: list[int]) -> dict:
 
             if model is None:
                 model, normalization_mean, normalization_std, run_id = load_deterministic_mlp()
-                print(f"[team_report] using deterministic MLP run_id={run_id}")
+                logger.info(f"using deterministic MLP run_id={run_id}")
 
             features = extract_features(parsed, engine)
             cumulative_incidence = predict_cumulative_incidence(

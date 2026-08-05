@@ -6,9 +6,13 @@ Uses the SAME inclusive-cumsum survival convention as DeepHitLoss:
 S(t) = 1 - cumsum(PMF up to and including bin t).
 """
 
+import logging
+
 import torch
 
 from production.src.pipeline.survival_dataset import FEATURE_KEYS
+
+logger = logging.getLogger(__name__)
 
 
 def calculate_brier_score(
@@ -72,8 +76,8 @@ def calculate_brier_score(
     excluded_mask = (~events_bool) & (censor_or_event_bin <= time_bin)
 
     num_excluded = int(excluded_mask.sum().item())
-    print(
-        f"[Brier @ time_bin={time_bin}] excluded (bucket 3, censored at/before "
+    logger.info(
+        f"Brier @ time_bin={time_bin}: excluded (bucket 3, censored at/before "
         f"this bin) samples: {num_excluded} / {predictions.shape[0]}"
     )
 

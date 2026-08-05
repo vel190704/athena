@@ -25,10 +25,14 @@ lives in the same space as `bayesian_blend_habit`'s live player position
 and can be combined with it directly.
 """
 
+import logging
+
 import numpy as np
 
 from production.src.ingestion.statsbomb_io import X_SCALE, Y_SCALE
 from production.src.pipeline.feature_extractor import PITCH_LENGTH, PITCH_WIDTH
+
+logger = logging.getLogger(__name__)
 
 # Coarse grid over the verified 100x68m pitch space -- 10 columns (10m/cell
 # in x) x 7 rows (~9.71m/cell in y).
@@ -119,8 +123,8 @@ def generate_player_heatmap(
             num_qualifying += 1
 
     if num_qualifying < MIN_HISTORICAL_EVENTS:
-        print(
-            f"[habit_memory] player_id={player_id}: only {num_qualifying} qualifying historical "
+        logger.warning(
+            f"player_id={player_id}: only {num_qualifying} qualifying historical "
             f"event(s) (< {MIN_HISTORICAL_EVENTS}) -- falling back to a uniform prior."
         )
         return _uniform_heatmap()

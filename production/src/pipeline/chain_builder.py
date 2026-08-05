@@ -37,7 +37,10 @@ period 1) that shaped the rules below:
   rather than assume a fixed type list is exhaustive.
 """
 
+import logging
 from collections import defaultdict
+
+logger = logging.getLogger(__name__)
 
 # Terminal event types (verified against real data) that, combined with a
 # team change on the following possession, indicate an open-play turnover.
@@ -199,6 +202,6 @@ def build_possession_chains(events: list, periods: tuple = (1, 2)) -> list[dict]
             )
 
     if other_count > 0:
-        print(f"[chain_builder] {other_count} of {len(chains)} chains classified as 'other'")
+        logger.info(f"{other_count} of {len(chains)} chains classified as 'other'")
 
     return chains

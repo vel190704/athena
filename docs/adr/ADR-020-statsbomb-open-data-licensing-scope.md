@@ -174,10 +174,27 @@ StatsBomb:
   sharing of findings all remain fully in scope — nothing about the
   physics-ML track's day-to-day development is restricted by this
   finding, only its eventual commercial framing.
-- **A real, currently-missing compliance gap is exposed**: this project
-  has published/discussed RQ1-RQ5 findings without the required StatsBomb
-  brand-logo attribution (clause 1.4). Any future public write-up,
-  demo, or presentation of these findings should include it.
+- **UPDATE — this specific gap is now CLOSED.** The clause 1.4
+  attribution requirement is now satisfied in both places a user
+  actually encounters this project: `production/frontend/dashboard.py`
+  (a prominent, unconditional notice at the TOP of the persistent
+  sidebar — "Data provided by StatsBomb", linked to statsbomb.com and
+  this ADR — visible on every page load, regardless of which tab is
+  open, with no click required) and `README.md` (a citation immediately
+  below the project's own opening description, before any other
+  content). Deliberately NOT gated behind `PUBLIC_DEPLOYMENT` — unlike
+  the raw-data-exposure fixes ADR-021 documents, this is a licensing
+  obligation that applies to ANY use of StatsBomb data, local or public,
+  so it is unconditional. **One honest scoping note**: both citations
+  are a clear TEXT credit ("Data provided by StatsBomb" + a link), not
+  an embedded copy of StatsBomb's actual brand-logo image file — no such
+  asset exists anywhere in this repository, and fetching/embedding their
+  copyrighted logo image without going through their own Media Pack
+  (referenced in the Agreement's own preamble) was judged out of scope
+  for this pass rather than done informally. Any future real public
+  deployment should pull the actual logo asset from that Media Pack
+  before launch, to satisfy clause 1.4's literal "brand logo" wording,
+  not just its underlying attribution intent.
 - **The CV track is not automatically a cleaner commercial fallback.**
   ADR-014 already found the CV track's own pretrained pitch-keypoint
   model carries its own unresolved AGPL-3.0 (Ultralytics YOLOv8-Pose

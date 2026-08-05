@@ -1,5 +1,7 @@
 """Milestone 35 / ADR-011: unit tests for `match_level_split`."""
 
+import logging
+
 from production.src.pipeline.data_split import match_level_split
 
 
@@ -64,7 +66,14 @@ def test_uneven_match_sizes_produce_a_sample_ratio_that_need_not_match_val_fract
     assert sample_val_fraction != 0.2
 
 
-def test_single_match_dominating_validation_triggers_imbalance_warning(capsys):
+def test_single_match_dominating_validation_triggers_imbalance_warning(caplog):
+    """Engineering-hygiene pass: data_split.py converted from print() to
+    logging (module-level logger.getLogger(__name__), no basicConfig at
+    import time -- same pattern as train.py/alert_store.py). The
+    imbalance notice now goes through logger.warning() -- observed via
+    caplog's real record level, not a hopeful "WARNING" text-prefix
+    substring search, which is a strictly more correct check than the
+    print()-based version this replaces."""
     # 10 matches: one 100-sample match, nine tiny 2-sample matches. With
     # val_fraction=0.2 (2 of 10 matches), whichever 2 matches land in val,
     # if the dominant match is among them, it will visibly exceed the 30%
@@ -73,22 +82,21 @@ def test_single_match_dominating_validation_triggers_imbalance_warning(capsys):
     # Seed chosen (by trial) so the dominant match (id=0) lands in the val
     # group, actually triggering the warning this test asserts on.
     found_triggering_seed = False
-    for seed in range(50):
-        capsys.readouterr()
-        train_indices, val_indices = match_level_split(match_ids_per_sample, val_fraction=0.2, seed=seed)
-        val_matches = {match_ids_per_sample[i] for i in val_indices}
-        if 0 in val_matches:
-            found_triggering_seed = True
-            captured = capsys.readouterr()
-            assert "WARNING" in captured.out
-            assert "match_id=0" in captured.out
-            break
+    with caplog.at_level(logging.WARNING, logger="production.src.pipeline.data_split"):
+        for seed in range(50):
+            caplog.clear()
+            train_indices, val_indices = match_level_split(match_ids_per_sample, val_fraction=0.2, seed=seed)
+            val_matches = {match_ids_per_sample[i] for i in val_indices}
+            if 0 in val_matches:
+                found_triggering_seed = True
+                assert any(r.levelname == "WARNING" for r in caplog.records)
+                assert "match_id=0" in caplog.text
+                break
     assert found_triggering_seed, "expected at least one seed in range(50) to put the dominant match in val"
 
 
-def test_balanced_split_prints_no_imbalance_warning(capsys):
+def test_balanced_split_prints_no_imbalance_warning(caplog):
     match_ids_per_sample = [i // 10 for i in range(200)]  # 20 equal-sized matches
-    capsys.readouterr()
-    match_level_split(match_ids_per_sample, val_fraction=0.2, seed=42)
-    captured = capsys.readouterr()
-    assert "WARNING" not in captured.out
+    with caplog.at_level(logging.WARNING, logger="production.src.pipeline.data_split"):
+        match_level_split(match_ids_per_sample, val_fraction=0.2, seed=42)
+    assert not any(r.levelname == "WARNING" for r in caplog.records)

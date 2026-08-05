@@ -16,6 +16,8 @@ Three layers, deliberately kept separate:
 """
 
 
+import logging
+
 import pytest
 
 from production.src.cv.acquisition import (
@@ -113,17 +115,22 @@ def test_compute_precision_recall_f1_known_scenario():
 # Layer 2: password-handling check (Step 5.1) -- runs unconditionally.
 # ============================================================================
 
-def test_download_sample_dataset_without_password_prints_instructions_and_returns_none(
-    capsys, monkeypatch
+def test_download_sample_dataset_without_password_logs_instructions_and_returns_none(
+    caplog, monkeypatch
 ):
+    """Engineering-hygiene pass: acquisition.py converted from print() to
+    logging (module-level logger.getLogger(__name__), no basicConfig at
+    import time -- same pattern as train.py/alert_store.py). This
+    instructional message now goes through logger.warning(), not stdout
+    -- observed via caplog, not capsys."""
     monkeypatch.delenv("SOCCERNET_PASSWORD", raising=False)
 
-    result = download_sample_dataset(num_games=1, password=None)
+    with caplog.at_level(logging.WARNING, logger="production.src.cv.acquisition"):
+        result = download_sample_dataset(num_games=1, password=None)
 
     assert result is None
-    captured = capsys.readouterr()
-    assert "NDA" in captured.out or "password" in captured.out.lower()
-    assert "soccer-net.org" in captured.out
+    assert "NDA" in caplog.text or "password" in caplog.text.lower()
+    assert "soccer-net.org" in caplog.text
 
 
 # ============================================================================

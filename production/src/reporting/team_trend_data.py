@@ -92,10 +92,13 @@ fouls, corners, yellow/red cards) were confirmed present, under the same
 names, in all five leagues' current-season files.
 """
 
+import logging
 from pathlib import Path
 
 import pandas as pd
 import requests
+
+logger = logging.getLogger(__name__)
 
 BASE_URL = "https://www.football-data.co.uk/mmz4281/{season_code}/{league_code}.csv"
 
@@ -154,8 +157,8 @@ def _fetch_season_csv(league_code: str, start_year: int) -> pd.DataFrame | None:
         url = BASE_URL.format(season_code=_season_code(start_year), league_code=league_code)
         response = requests.get(url, timeout=15)
         if response.status_code != 200 or not response.content:
-            print(
-                f"[team_trend_data] {league_code} {_season_label(start_year)}: "
+            logger.info(
+                f"{league_code} {_season_label(start_year)}: "
                 f"not available at {url} (status {response.status_code}) -- skipping."
             )
             return None
@@ -167,8 +170,8 @@ def _fetch_season_csv(league_code: str, start_year: int) -> pd.DataFrame | None:
 
     missing = [c for c in _REQUIRED_COLUMNS if c not in matches.columns]
     if missing:
-        print(
-            f"[team_trend_data] {league_code} {_season_label(start_year)}: "
+        logger.warning(
+            f"{league_code} {_season_label(start_year)}: "
             f"missing expected columns {missing} -- skipping season."
         )
         return None
@@ -179,8 +182,8 @@ def _fetch_season_csv(league_code: str, start_year: int) -> pd.DataFrame | None:
     before = len(matches)
     matches = matches.dropna(subset=["FTHG", "FTAG", "FTR"])
     if len(matches) < before:
-        print(
-            f"[team_trend_data] {league_code} {_season_label(start_year)}: "
+        logger.info(
+            f"{league_code} {_season_label(start_year)}: "
             f"dropped {before - len(matches)} row(s) with no final score "
             "(likely an in-progress season / postponed fixture)."
         )
@@ -495,8 +498,8 @@ def generate_team_trend_report(
                     candidates.append(hit.iloc[0].to_dict())
             if candidates:
                 if len(candidates) > 1:
-                    print(
-                        f"[team_trend_data] {name!r} matched in {len(candidates)} leagues for "
+                    logger.warning(
+                        f"{name!r} matched in {len(candidates)} leagues for "
                         f"{season_label} -- using the first found; this should not normally happen."
                     )
                 matched_row = candidates[0]

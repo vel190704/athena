@@ -15,11 +15,15 @@ features and the raw frame tensors here must come from -- see
 TacticalSurvivalDataset's docstring for why that matters.
 """
 
+import logging
+
 import torch
 from torch.utils.data import Dataset
 
 from production.src.constants import BIN_SIZE_SECONDS
 from production.src.models.graph_builder import build_graph_from_frame
+
+logger = logging.getLogger(__name__)
 
 # Fixed, documented key order for flattening a feature dict into a tensor.
 # Must match the keys produced by
@@ -109,8 +113,8 @@ class TacticalSurvivalDataset(Dataset):
             event_flags.append(event_flag)
 
         if horizon_censored_count > 0:
-            print(
-                f"[TacticalSurvivalDataset] {horizon_censored_count} of {len(chains)} chains "
+            logger.info(
+                f"{horizon_censored_count} of {len(chains)} chains "
                 f"had a real shot beyond the {MAX_DURATION_SECONDS}s horizon; event_flag "
                 "forced to 0 (horizon-censored)."
             )

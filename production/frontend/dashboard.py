@@ -415,6 +415,29 @@ st.caption(
     "for why."
 )
 
+# --- StatsBomb attribution (ADR-020 clause 1.4 compliance fix) ------------
+# "The User is required to accredit any publication of analysis formed
+# from StatsBomb Data with the StatsBomb brand logo." Placed here,
+# BEFORE the tabs are created and inside its own `st.sidebar` block, so
+# it renders at the TOP of the persistent sidebar -- visible on every
+# page load regardless of which tab is selected or clicked into, exactly
+# the "visible without requiring a click" bar ADR-020 sets. Deliberately
+# UNCONDITIONAL -- not gated behind PUBLIC_DEPLOYMENT the way the shot-map/
+# Team-Trends fixes are: those exist to avoid EXPOSING data publicly;
+# this exists to satisfy a real, currently-active licensing obligation
+# that applies to ANY use of StatsBomb data, local or public alike, so
+# gating it behind a deployment-mode flag would be wrong, not just
+# unnecessary.
+with st.sidebar:
+    st.markdown(
+        "**Data provided by [StatsBomb](https://statsbomb.com)** -- the Player Reports, "
+        "Team Reports, Team Comparison, and Shot Map features are built on StatsBomb's "
+        "open event/360 data, used under their Public Data User Agreement. See "
+        "[ADR-020](docs/adr/ADR-020-statsbomb-open-data-licensing-scope.md) for the full "
+        "licensing review."
+    )
+    st.divider()
+
 tab_cv, tab_player, tab_team, tab_trends, tab_compare = st.tabs(
     ["Live CV Monitor", "Player Reports", "Team Reports", "Team Trends", "Team Comparison"]
 )

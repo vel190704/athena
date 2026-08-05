@@ -11,6 +11,7 @@ physics`, `spatial`, `models`, `pipeline`'s training/serving code, or
 dependency -- entirely independent of ADR-013 through ADR-016.
 """
 
+import logging
 from collections import Counter
 
 from production.src.ingestion.statsbomb_io import X_SCALE, Y_SCALE, fetch_match_events
@@ -22,6 +23,8 @@ from production.src.pipeline.habit_memory import (
     MIN_HISTORICAL_EVENTS,
     generate_player_heatmap,
 )
+
+logger = logging.getLogger(__name__)
 
 # Shot-map feature (additive -- see generate_player_shot_map below).
 # Reuses the SAME real threshold value `heatmap_used_uniform_fallback`
@@ -212,7 +215,7 @@ def generate_player_report(player_id: int, match_ids: list[int]) -> dict:
     for match_id in match_ids:
         events = fetch_match_events(match_id)
         if events is None:
-            print(f"[player_report] match_id={match_id}: no events data available, skipping.")
+            logger.warning(f"match_id={match_id}: no events data available, skipping.")
             continue
         events_by_match[match_id] = events
 
@@ -357,7 +360,7 @@ def generate_player_shot_map(player_id: int, match_ids: list[int]) -> dict:
     for match_id in match_ids:
         events = fetch_match_events(match_id)
         if events is None:
-            print(f"[player_report] match_id={match_id}: no events data available, skipping.")
+            logger.warning(f"match_id={match_id}: no events data available, skipping.")
             continue
 
         for event in events:
@@ -378,8 +381,8 @@ def generate_player_shot_map(player_id: int, match_ids: list[int]) -> dict:
             # shot missing one of these is skipped rather than plotted
             # with a fabricated placeholder value.
             if location is None or statsbomb_xg is None or outcome_name is None or body_part_name is None:
-                print(
-                    f"[player_report] match_id={match_id}: shot event {event.get('id')} missing a "
+                logger.warning(
+                    f"match_id={match_id}: shot event {event.get('id')} missing a "
                     "required field (location/statsbomb_xg/outcome/body_part) -- skipping this shot."
                 )
                 continue

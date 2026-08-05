@@ -247,3 +247,20 @@ def fetch_alerts(
         return [dict(row) for row in rows]
     finally:
         conn.close()
+
+
+def count_alerts() -> int:
+    """Fix 3 (`GET /metrics`): a cheap total-row count. Deliberately
+    separate from `fetch_alerts` -- that function fetches and parses up
+    to `limit` full rows (500 by default) just to report a count would be
+    wasteful and, for a truly complete count, would require raising
+    `limit` unboundedly. `SELECT COUNT(*)` is the correct-sized query for
+    "how many alerts exist," independent of any single page/filter of
+    them.
+    """
+    init_db()
+    conn = _get_connection()
+    try:
+        return conn.execute("SELECT COUNT(*) FROM alerts").fetchone()[0]
+    finally:
+        conn.close()

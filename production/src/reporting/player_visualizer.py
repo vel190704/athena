@@ -16,6 +16,8 @@ performance-sensitive pixel-buffer pipeline (that's what `production/src/
 cv/tactical_map_renderer.py` is, and why THAT module uses OpenCV instead).
 """
 
+import logging
+
 import matplotlib
 import numpy as np
 
@@ -35,6 +37,8 @@ from production.src.pipeline.habit_memory import (
     MIN_HISTORICAL_EVENTS,
 )
 from production.src.reporting.pitch_diagram import draw_pitch_outline
+
+logger = logging.getLogger(__name__)
 
 # Reuses habit_memory's own cold-start threshold (not a separately-invented
 # number) as the "too few events to be a confident distribution" cutoff for
@@ -157,7 +161,7 @@ def _draw_positional_distribution(ax, positional_distribution: dict[str, float],
     for position_name, share in positional_distribution.items():
         location = POSITION_LOCATIONS.get(position_name)
         if location is None:
-            print(f"[player_visualizer] no plot location for position {position_name!r} -- skipping dot.")
+            logger.warning(f"no plot location for position {position_name!r} -- skipping dot.")
             continue
         x, y = location
         radius = MIN_DOT_RADIUS_M + (MAX_DOT_RADIUS_M - MIN_DOT_RADIUS_M) * (share / max_share)

@@ -30,11 +30,15 @@ measurement of the same team. See `validate_oracle_substitutions` for how
 this is enforced and verified.
 """
 
+import logging
+
 from production.src.constants import TIME_BIN
 from production.src.ingestion.statsbomb_io import fetch_match_events, parse_360_frame
 from production.src.models.evaluation import predict_cumulative_incidence
 from production.src.pipeline.feature_extractor import extract_features
 from production.src.serving.api import _find_qualifying_frame_for_minute
+
+logger = logging.getLogger(__name__)
 
 # TIME_BIN (15s horizon, matching every prior milestone) now comes from
 # production.src.constants (engineering-review de-duplication -- was
@@ -166,8 +170,8 @@ def validate_oracle_substitutions(match_id, model, normalization_mean, normaliza
         team_name = sub["team"]
 
         if minute - WINDOW_HALF_WIDTH_MINUTES < 0:
-            print(
-                f"[oracle] Skipping sub #{sub_id} ({team_name}, minute {minute}): "
+            logger.info(
+                f"Skipping sub #{sub_id} ({team_name}, minute {minute}): "
                 f"minute-{WINDOW_HALF_WIDTH_MINUTES} < 0, no valid pre-window."
             )
             continue
@@ -180,8 +184,8 @@ def validate_oracle_substitutions(match_id, model, normalization_mean, normaliza
             max_minute=minute,
         )
         if pre_result is None:
-            print(
-                f"[oracle] Skipping sub #{sub_id} ({team_name}, minute {minute}): "
+            logger.info(
+                f"Skipping sub #{sub_id} ({team_name}, minute {minute}): "
                 f"no pre-frame found for {team_name} within the search window."
             )
             continue
@@ -193,8 +197,8 @@ def validate_oracle_substitutions(match_id, model, normalization_mean, normaliza
             team_id=team_id,
         )
         if post_result is None:
-            print(
-                f"[oracle] Skipping sub #{sub_id} ({team_name}, minute {minute}): "
+            logger.info(
+                f"Skipping sub #{sub_id} ({team_name}, minute {minute}): "
                 f"no post-frame found for {team_name} within the search window."
             )
             continue

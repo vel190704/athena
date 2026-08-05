@@ -25,6 +25,7 @@ computes the TRUE elapsed frame gap, and passes a per-track `dt_seconds`
 into the adapter accordingly -- see `CVPipeline.process_video` Step (d).
 """
 
+import logging
 from collections.abc import Generator
 
 import cv2
@@ -40,6 +41,8 @@ from production.src.cv.ball_detector import (
 from production.src.cv.detector import COCO_PERSON_CLASS_ID
 from production.src.cv.shot_classifier import compute_shot_features, is_tactical_view
 from production.src.cv.team_classifier import classify_teams, extract_jersey_color
+
+logger = logging.getLogger(__name__)
 
 # Milestone 30's own default person-detection confidence (Milestone 25).
 DEFAULT_TRACKING_CONFIDENCE_THRESHOLD = 0.5
@@ -291,8 +294,8 @@ class CVPipeline:
                     # never invoked on a non-tactical frame.
                     if not is_tactical_view(frame):
                         green_ratio, edge_density = compute_shot_features(frame)
-                        print(
-                            f"[CVPipeline] frame {frame_index} skipped (non-tactical): "
+                        logger.info(
+                            f"frame {frame_index} skipped (non-tactical): "
                             f"green_ratio={green_ratio:.4f}, edge_density={edge_density:.4f}"
                         )
                         skipped_non_tactical += 1
@@ -425,7 +428,7 @@ class CVPipeline:
                 except Exception as exc:
                     # (Step 1.5) Error resilience: one bad frame must never
                     # crash the whole run.
-                    print(f"[CVPipeline] error processing frame {frame_index}: {exc!r} -- skipping frame.")
+                    logger.error(f"error processing frame {frame_index}: {exc!r} -- skipping frame.")
 
                 frame_index += 1
         finally:

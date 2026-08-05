@@ -17,7 +17,11 @@ splits again, by construction -- not by a downstream exclusion rule
 working around the fact that it still could.
 """
 
+import logging
+
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 # A single match contributing more than this fraction of its OWN group's
 # total samples is flagged explicitly as a real, reportable imbalance
@@ -86,8 +90,8 @@ def match_level_split(
 
     n_train, n_val = len(train_indices), len(val_indices)
     total = n_train + n_val
-    print(
-        f"[match_level_split] {len(train_match_ids)} train matches / {len(val_match_ids)} val "
+    logger.info(
+        f"{len(train_match_ids)} train matches / {len(val_match_ids)} val "
         f"matches (target val_fraction={val_fraction:.0%} of matches) -> {n_train} train samples "
         f"/ {n_val} val samples ({n_train / total:.1%} / {n_val / total:.1%} sample ratio -- NOT "
         "forced to match val_fraction exactly, since matches contribute different sample counts)."
@@ -121,8 +125,8 @@ def _report_dominant_match_imbalance(
     dominant_share = dominant_count / total
 
     if dominant_share > DOMINANT_MATCH_SAMPLE_SHARE_WARNING_THRESHOLD:
-        print(
-            f"[match_level_split] WARNING: match_id={dominant_match_id} alone contributes "
+        logger.warning(
+            f"match_id={dominant_match_id} alone contributes "
             f"{dominant_count}/{total} ({dominant_share:.1%}) of the {group_name} group's "
             f"samples -- exceeds the {DOMINANT_MATCH_SAMPLE_SHARE_WARNING_THRESHOLD:.0%} "
             "single-match imbalance threshold. This is a real, reportable skew (a chain-heavy "

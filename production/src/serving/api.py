@@ -13,6 +13,7 @@ main per-frame `threat` stream.
 """
 
 import asyncio
+import logging
 import os
 import time
 from contextlib import asynccontextmanager
@@ -28,7 +29,7 @@ from typing import Literal
 os.environ.setdefault("MLFLOW_ALLOW_FILE_STORE", "true")
 
 import torch
-from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, WebSocket, WebSocketDisconnect
 from ultralytics import YOLO
 
 from production.src.constants import TIME_BIN
@@ -56,8 +57,10 @@ from production.src.reporting.player_report import (
 from production.src.reporting.team_comparison import compare_team_seasons
 from production.src.reporting.team_report import generate_team_report
 from production.src.serving.alert_store import DB_PATH as ALERT_DB_PATH
-from production.src.serving.alert_store import fetch_alerts, init_db, log_alert
+from production.src.serving.alert_store import count_alerts, fetch_alerts, init_db, log_alert
 from production.src.serving.simulator import live_match_stream
+
+logger = logging.getLogger(__name__)
 
 # ADR-021 condition-2 compliance fix: an explicit, visible config switch --
 # checked ONCE here at import time, not re-read per-request -- gating which
@@ -74,6 +77,14 @@ from production.src.serving.simulator import live_match_stream
 # project's established os.environ.get(...)-flag convention exactly
 # (MLFLOW_ALLOW_FILE_STORE above, GEMINI_API_KEY in explainer.py).
 PUBLIC_DEPLOYMENT = os.environ.get("PUBLIC_DEPLOYMENT", "false").strip().lower() == "true"
+
+# ADR-022: a single, optional shared-secret header check -- OFF by default
+# (API_KEY unset/empty), so local development and this project's own test
+# suite continue to work with zero friction, exactly as before this fix.
+# Set the API_KEY environment variable to require every protected request
+# to carry a matching `X-API-Key` header. Same established
+# os.environ.get(...)-flag convention as PUBLIC_DEPLOYMENT above.
+API_KEY = os.environ.get("API_KEY") or None
 
 DEFAULT_MATCH_ID = 3857276
 # TIME_BIN (15s horizon, matching Milestones 8/13/14/15) now comes from
@@ -109,16 +120,46 @@ _normalization_mean: torch.Tensor | None = None
 _normalization_std: torch.Tensor | None = None
 _model_run_id: str | None = None
 
+# Fix 3 (/health, /metrics): plain in-process counters -- no external
+# metrics backend/dependency, matching this project's own "smallest real
+# step up" discipline (ADR-019 makes the identical call for SQLite over
+# Postgres). Reset on every process restart, which is the correct
+# semantics for "active connections" and matches "uptime" resetting too;
+# `total_http_requests_received` is a lifetime-of-this-process counter,
+# not a persisted historical total.
+_startup_monotonic: float | None = None
+_total_http_requests_received = 0
+_active_websocket_connections = 0
+
+
+async def _require_api_key(x_api_key: str | None = Header(default=None)) -> None:
+    """ADR-022: the single, optional API-key check. A no-op (always
+    passes) whenever `API_KEY` is unset -- this is what keeps local
+    development and this project's own test suite working with zero
+    friction by default. Once `API_KEY` is set, every request to a
+    protected endpoint must carry a matching `X-API-Key` header or gets a
+    401 -- no partial-match, no case-insensitive comparison, a plain
+    exact string check (a single shared secret, not a multi-key/scope
+    system -- see ADR-022 for why that's the deliberately-chosen scope).
+    """
+    if API_KEY is None:
+        return
+    if x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Missing or invalid X-API-Key header")
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _model, _normalization_mean, _normalization_std, _model_run_id
+    global _model, _normalization_mean, _normalization_std, _model_run_id, _startup_monotonic
     _model, _normalization_mean, _normalization_std, _model_run_id = load_deterministic_mlp()
-    print(f"[api] Live inference server ready. Loaded MLP run_id={_model_run_id}")
-    print(
-        f"[api] PUBLIC_DEPLOYMENT={PUBLIC_DEPLOYMENT} -- shot-map endpoint will serve "
+    logger.info(f"Live inference server ready. Loaded MLP run_id={_model_run_id}")
+    logger.info(
+        f"PUBLIC_DEPLOYMENT={PUBLIC_DEPLOYMENT} -- shot-map endpoint will serve "
         + ("the AGGREGATED (ADR-021 condition-2-compliant) variant only." if PUBLIC_DEPLOYMENT
            else "raw per-shot data (local/private mode -- unchanged default behavior).")
+    )
+    logger.info(
+        f"API_KEY {'is set -- protected endpoints now require a matching X-API-Key header.' if API_KEY else 'is unset -- no auth check, local/private default behavior (see ADR-022).'}"
     )
 
     # Milestone 33 Step 1.1: warm the CV YOLO checkpoint ONCE at startup --
@@ -134,9 +175,9 @@ async def lifespan(app: FastAPI):
     # DOES buy: the checkpoint FILE is downloaded/deserialized once here,
     # so every later per-connection `CVPipeline()` construction is fast
     # (loading already-local weights), not a fresh cold-start each time.
-    print(f"[api] Warming CV model checkpoint {CV_MODEL_CHECKPOINT} ...")
+    logger.info(f"Warming CV model checkpoint {CV_MODEL_CHECKPOINT} ...")
     YOLO(CV_MODEL_CHECKPOINT)
-    print("[api] CV model checkpoint ready.")
+    logger.info("CV model checkpoint ready.")
 
     # ADR-019 (Stage 2 persistence): ensure the alert-history schema exists
     # before any connection could fire an alert. `init_db()` is also called
@@ -145,12 +186,32 @@ async def lifespan(app: FastAPI):
     # too means the schema is ready before the server ever accepts a
     # connection, not lazily on the first alert.
     init_db()
-    print(f"[api] Alert-history store ready at {ALERT_DB_PATH.resolve()}")
+    logger.info(f"Alert-history store ready at {ALERT_DB_PATH.resolve()}")
+
+    # Fix 3: uptime measured from HERE -- when the server actually becomes
+    # ready to serve traffic (model loaded, CV checkpoint warm, alert
+    # store ready) -- not from process-import time, which would include
+    # variable, front-loaded startup cost as if it were "serving" time.
+    _startup_monotonic = time.monotonic()
 
     yield
 
 
 app = FastAPI(lifespan=lifespan)
+
+
+@app.middleware("http")
+async def _count_requests_middleware(request, call_next):
+    """Fix 3 (/metrics): counts every HTTP request that reaches this
+    server, INCLUDING ones later rejected by `_require_api_key` (a 401 is
+    still a request the server received and handled, just not one it
+    fulfilled) -- named `total_http_requests_received` in /metrics,
+    deliberately not `_served`, to state that distinction plainly rather
+    than let the field name imply something narrower than what it counts.
+    """
+    global _total_http_requests_received
+    _total_http_requests_received += 1
+    return await call_next(request)
 
 
 def _predict_cumulative_incidence_sync(features_dict: dict) -> tuple[float, torch.Tensor]:
@@ -473,70 +534,94 @@ async def tactical_stream(
     instead of StatsBomb event replay. See `_stream_cv_source`'s docstring
     for the calibration caveat that currently applies to that path's
     `threat_15s` values.
+
+    ADR-022: the API-key check happens HERE, BEFORE `accept()` -- an
+    unauthorized client's connection is refused at the WebSocket handshake
+    itself (close code 1008), the same as it would be rejected before ever
+    reaching a REST endpoint's body via `_require_api_key`'s dependency
+    injection. `Depends()` doesn't apply to `@app.websocket` routes the
+    same way it does REST ones in this FastAPI version, so this is a
+    deliberate, explicit manual check here, not an oversight.
     """
-    await websocket.accept()
-
-    # Connection-LOCAL state (Step 3.3, Milestone 16) -- deliberately a
-    # plain local variable, not module/global state, so concurrent
-    # connections each track their own previous threat value independently
-    # and can never clobber each other's spike detection. The SAME
-    # discipline applies to `source="cv"` below via a freshly-constructed
-    # `CVPipeline` per connection, inside `_stream_cv_source`.
-    connection_lock = asyncio.Lock()
-
-    if source == "cv":
-        if not video_path:
-            await websocket.close(code=1008, reason="video_path is required when source=cv")
-            return
-
-        resolved = _resolve_and_validate_cv_video_path(video_path)
-        if isinstance(resolved, str):  # error message, not a valid Path
-            await websocket.close(code=1008, reason=_truncate_close_reason(resolved))
-            return
-
-        try:
-            await _stream_cv_source(websocket, str(resolved), connection_lock, spike_threshold)
-        except WebSocketDisconnect:
-            pass
+    if API_KEY is not None and websocket.headers.get("x-api-key") != API_KEY:
+        await websocket.close(code=1008, reason="Missing or invalid X-API-Key header")
         return
 
-    previous_threat_15s = None
-    try:
-        async for event, frame in live_match_stream(match_id, delay=delay):
-            features_dict = extract_features(frame)
-            cumulative_incidence, normalized_input = await asyncio.to_thread(
-                _predict_cumulative_incidence_sync, features_dict
-            )
+    await websocket.accept()
 
-            async with connection_lock:
-                await websocket.send_json(
-                    {
-                        "type": "threat",
-                        "minute": event.get("minute"),
-                        "threat_15s": cumulative_incidence,
-                    }
+    # Fix 3 (/metrics): incremented only after a successful accept() (a
+    # rejected/never-accepted connection was never "active"), decremented
+    # in `finally` below so every exit path -- normal completion,
+    # WebSocketDisconnect, or a source="cv" validation failure closing the
+    # connection immediately after accept -- still correctly frees the
+    # count. `global` declared once here for both this counter and the
+    # rest of this function's use of it.
+    global _active_websocket_connections
+    _active_websocket_connections += 1
+    try:
+        # Connection-LOCAL state (Step 3.3, Milestone 16) -- deliberately a
+        # plain local variable, not module/global state, so concurrent
+        # connections each track their own previous threat value independently
+        # and can never clobber each other's spike detection. The SAME
+        # discipline applies to `source="cv"` below via a freshly-constructed
+        # `CVPipeline` per connection, inside `_stream_cv_source`.
+        connection_lock = asyncio.Lock()
+
+        if source == "cv":
+            if not video_path:
+                await websocket.close(code=1008, reason="video_path is required when source=cv")
+                return
+
+            resolved = _resolve_and_validate_cv_video_path(video_path)
+            if isinstance(resolved, str):  # error message, not a valid Path
+                await websocket.close(code=1008, reason=_truncate_close_reason(resolved))
+                return
+
+            try:
+                await _stream_cv_source(websocket, str(resolved), connection_lock, spike_threshold)
+            except WebSocketDisconnect:
+                pass
+            return
+
+        previous_threat_15s = None
+        try:
+            async for event, frame in live_match_stream(match_id, delay=delay):
+                features_dict = extract_features(frame)
+                cumulative_incidence, normalized_input = await asyncio.to_thread(
+                    _predict_cumulative_incidence_sync, features_dict
                 )
 
-            _maybe_trigger_spike_alert(
-                websocket,
-                connection_lock,
-                previous_threat_15s,
-                cumulative_incidence,
-                spike_threshold,
-                features_dict,
-                normalized_input,
-                {
-                    "source": "statsbomb",
-                    "match_id": match_id,
-                    "video_path": None,
-                    "minute": event.get("minute"),
-                },
-            )
+                async with connection_lock:
+                    await websocket.send_json(
+                        {
+                            "type": "threat",
+                            "minute": event.get("minute"),
+                            "threat_15s": cumulative_incidence,
+                        }
+                    )
 
-            # Updated regardless of whether a spike fired (Step 3.7).
-            previous_threat_15s = cumulative_incidence
-    except WebSocketDisconnect:
-        pass
+                _maybe_trigger_spike_alert(
+                    websocket,
+                    connection_lock,
+                    previous_threat_15s,
+                    cumulative_incidence,
+                    spike_threshold,
+                    features_dict,
+                    normalized_input,
+                    {
+                        "source": "statsbomb",
+                        "match_id": match_id,
+                        "video_path": None,
+                        "minute": event.get("minute"),
+                    },
+                )
+
+                # Updated regardless of whether a spike fired (Step 3.7).
+                previous_threat_15s = cumulative_incidence
+        except WebSocketDisconnect:
+            pass
+    finally:
+        _active_websocket_connections -= 1
 
 
 def _find_qualifying_frame_for_minute(
@@ -611,7 +696,7 @@ def _find_qualifying_frame_for_minute(
     return None
 
 
-@app.get("/simulate")
+@app.get("/simulate", dependencies=[Depends(_require_api_key)])
 async def simulate(
     match_id: int,
     minute: int,
@@ -691,14 +776,14 @@ async def simulate(
 # ============================================================================
 
 
-@app.get("/reports/player/{player_id}")
+@app.get("/reports/player/{player_id}", dependencies=[Depends(_require_api_key)])
 async def get_player_report(player_id: int, match_ids: list[int] = Query(...)):
     """Wraps player_report.generate_player_report, unmodified. `match_ids`
     is a repeated query parameter, e.g. `?match_ids=1&match_ids=2`."""
     return await asyncio.to_thread(generate_player_report, player_id, match_ids)
 
 
-@app.get("/reports/player/{player_id}/shot-map")
+@app.get("/reports/player/{player_id}/shot-map", dependencies=[Depends(_require_api_key)])
 async def get_player_shot_map(player_id: int, match_ids: list[int] = Query(...)):
     """Wraps player_report.generate_player_shot_map (or, in PUBLIC_DEPLOYMENT
     mode, generate_player_shot_map_aggregated), unmodified. A DEDICATED
@@ -726,7 +811,7 @@ async def get_player_shot_map(player_id: int, match_ids: list[int] = Query(...))
     return await asyncio.to_thread(generate_player_shot_map, player_id, match_ids)
 
 
-@app.get("/reports/team/{team_name}")
+@app.get("/reports/team/{team_name}", dependencies=[Depends(_require_api_key)])
 async def get_team_report(team_name: str, match_ids: list[int] = Query(default=[])):
     """Wraps team_report.generate_team_report, unmodified.
 
@@ -757,7 +842,7 @@ async def get_team_report(team_name: str, match_ids: list[int] = Query(default=[
     return report
 
 
-@app.get("/reports/team-comparison")
+@app.get("/reports/team-comparison", dependencies=[Depends(_require_api_key)])
 async def get_team_comparison(team_a: str, season_a: int, team_b: str, season_b: int):
     """Wraps team_comparison.compare_team_seasons, unmodified."""
     return await asyncio.to_thread(compare_team_seasons, team_a, season_a, team_b, season_b)
@@ -773,7 +858,7 @@ async def get_team_comparison(team_a: str, season_a: int, team_b: str, season_b:
 # ============================================================================
 
 
-@app.get("/alerts/history")
+@app.get("/alerts/history", dependencies=[Depends(_require_api_key)])
 async def get_alerts_history(
     match_id: int | None = None,
     source: Literal["statsbomb", "cv"] | None = None,
@@ -789,3 +874,66 @@ async def get_alerts_history(
         end_utc=end_utc,
         limit=limit,
     )
+
+
+# ============================================================================
+# Fix 3: /health and /metrics -- both cheap, fast, no side effects (no
+# network calls, no disk I/O beyond a single SQLite COUNT(*) for
+# /metrics). Neither wraps a research/model-logic function; both report
+# on THIS process's own already-in-memory state.
+#
+# /health is deliberately NOT behind `_require_api_key` -- a common,
+# sensible convention (load balancers/uptime monitors need to probe
+# liveness without a credential) and the ONLY endpoint in this file
+# exempted this way; /metrics, by contrast, IS behind the API-key check
+# below, since operational counters (request volume, active connections)
+# are more reasonably treated as needing the same protection as this
+# project's actual reporting endpoints, not as a public liveness signal.
+# ============================================================================
+
+
+@app.get("/health")
+async def health():
+    """Liveness/readiness check. `model_loaded`/`mlflow_reachable` report
+    the SAME underlying signal (whether `lifespan`'s
+    `load_deterministic_mlp()` call succeeded at startup) -- a live
+    MLflow re-query on every health-check call would itself be a network/
+    disk operation, violating the "cheap, fast, no side effects" this
+    endpoint exists to guarantee. This is "was MLflow reachable when the
+    server started," not "is MLflow reachable this instant" -- stated
+    explicitly here so it is never misread as a live re-check.
+    """
+    return {
+        "status": "ok" if _model is not None else "degraded",
+        "model_loaded": _model is not None,
+        "mlflow_reachable": _model is not None,
+        "model_run_id": _model_run_id,
+        "uptime_seconds": (
+            time.monotonic() - _startup_monotonic if _startup_monotonic is not None else None
+        ),
+    }
+
+
+@app.get("/metrics", dependencies=[Depends(_require_api_key)])
+async def metrics():
+    """Basic operational counters -- plain JSON, not a Prometheus-format
+    exporter (no `prometheus_client` dependency exists anywhere in this
+    project; adding one for three counters would be disproportionate
+    machinery here, the same "smallest real step up" reasoning ADR-019
+    already applies to SQLite-over-Postgres). `total_http_requests_received`
+    counts every request the middleware saw, including ones later
+    rejected by the API-key check (see that middleware's own docstring).
+    `total_alerts_logged` is a real SQLite COUNT(*) via
+    `alert_store.count_alerts` (run off the event loop via
+    `asyncio.to_thread`, the same pattern every other blocking call in
+    this file already uses), not an in-memory counter that would silently
+    diverge from the actual persisted alert history.
+    """
+    return {
+        "total_http_requests_received": _total_http_requests_received,
+        "active_websocket_connections": _active_websocket_connections,
+        "total_alerts_logged": await asyncio.to_thread(count_alerts),
+        "uptime_seconds": (
+            time.monotonic() - _startup_monotonic if _startup_monotonic is not None else None
+        ),
+    }
