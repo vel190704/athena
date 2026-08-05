@@ -15,6 +15,10 @@ from collections import Counter
 
 from production.src.ingestion.statsbomb_io import X_SCALE, Y_SCALE, fetch_match_events
 from production.src.pipeline.habit_memory import (
+    CELL_HEIGHT_METERS,
+    CELL_WIDTH_METERS,
+    GRID_COLS,
+    GRID_ROWS,
     MIN_HISTORICAL_EVENTS,
     generate_player_heatmap,
 )
@@ -414,4 +418,79 @@ def generate_player_shot_map(player_id: int, match_ids: list[int]) -> dict:
         "sum_statsbomb_xg": sum_statsbomb_xg,
         "xg_per_shot": (sum_statsbomb_xg / total_shots) if total_shots > 0 else None,
         "shot_map_used_low_sample_flag": total_shots < MIN_SHOTS_FOR_CONFIDENT_SHOT_MAP,
+    }
+
+
+def generate_player_shot_map_aggregated(player_id: int, match_ids: list[int]) -> dict:
+    """ADR-021 condition-2-compliant variant of `generate_player_shot_map`,
+    for PUBLIC deployments: bins individual shots into the SAME
+    GRID_COLS x GRID_ROWS grid convention `habit_memory`/this module's own
+    `generate_player_report` already use for the aggregate positional
+    heatmap, producing shot DENSITY and mean `statsbomb_xg` PER CELL --
+    never an individually-recoverable single shot location. This function
+    NEVER returns a per-shot list; there is no field on this dict a caller
+    could use to reconstruct any one specific shot's exact coordinates.
+
+    Reuses `generate_player_shot_map` internally (not a re-implementation
+    of its fetch/filter/rescale/low-sample logic) and reduces its `shots`
+    list to a grid before returning -- that raw list is a local variable
+    of this function only, and is discarded (via `dict.pop`, not merely
+    left unread) before the return dict is built, so it can never
+    accidentally leak through via e.g. a future `**` merge mistake.
+
+    ADR-021 CONTEXT: condition 2 ("no raw StatsBomb data exposed to site
+    visitors, in any form") was found, in this project's own compliance
+    audit, to be violated by `generate_player_shot_map`'s `shots` field --
+    each entry is one real, individually-located StatsBomb Shot event.
+    This function exists so a PUBLIC deployment can serve a shot map
+    without ever computing or transmitting that per-shot list at all (see
+    `api.py`'s `PUBLIC_DEPLOYMENT` flag, which selects this function over
+    `generate_player_shot_map` for the `/reports/player/{id}/shot-map`
+    endpoint). The summary scalars below (`total_shots`, `goals`,
+    `sum_statsbomb_xg`, `xg_per_shot`, `shots_by_body_part`,
+    `shot_map_used_low_sample_flag`) are reused UNCHANGED from
+    `generate_player_shot_map`'s own return dict -- ADR-021's own
+    reasoning already treats a count/sum/share as condition-2-compliant
+    (not individually traceable to one event), so these do not need to be
+    recomputed or altered for this aggregated variant.
+    """
+    full = generate_player_shot_map(player_id, match_ids)
+    shots = full.pop("shots")  # local only -- deliberately never returned from this function
+
+    shot_count_grid = [[0] * GRID_ROWS for _ in range(GRID_COLS)]
+    xg_sum_grid = [[0.0] * GRID_ROWS for _ in range(GRID_COLS)]
+
+    for shot in shots:
+        x, y = shot["location"]
+        col = min(max(int(x // CELL_WIDTH_METERS), 0), GRID_COLS - 1)
+        row = min(max(int(y // CELL_HEIGHT_METERS), 0), GRID_ROWS - 1)
+        shot_count_grid[col][row] += 1
+        xg_sum_grid[col][row] += shot["statsbomb_xg"]
+
+    total_shots = full["total_shots"]
+    shot_density_grid = [
+        [(shot_count_grid[col][row] / total_shots) if total_shots > 0 else 0.0 for row in range(GRID_ROWS)]
+        for col in range(GRID_COLS)
+    ]
+    # None (not 0.0) for an empty cell -- an honest "no shots landed here",
+    # not a fabricated zero-quality reading, matching team_report.py's own
+    # control_heatmap_grid convention for cells with no observation.
+    mean_xg_grid = [
+        [
+            (xg_sum_grid[col][row] / shot_count_grid[col][row]) if shot_count_grid[col][row] > 0 else None
+            for row in range(GRID_ROWS)
+        ]
+        for col in range(GRID_COLS)
+    ]
+
+    return {
+        **full,
+        "shot_density_grid": shot_density_grid,
+        "mean_xg_grid": mean_xg_grid,
+        "shot_grid_shape": (
+            f"{GRID_COLS} cols (x, {CELL_WIDTH_METERS}m/cell) x {GRID_ROWS} rows "
+            f"(y, {CELL_HEIGHT_METERS:.2f}m/cell); same convention as habit_memory's positional "
+            "heatmap. shot_density_grid cells sum to 1.0 across the whole grid (0.0 if total_shots"
+            "==0); mean_xg_grid cells are None where no shot landed."
+        ),
     }

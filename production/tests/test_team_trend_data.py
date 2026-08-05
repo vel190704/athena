@@ -12,7 +12,10 @@ this test suite is checking the SAME real findings that document reports,
 not a new, weaker standard for a newer file.
 """
 
-from production.src.reporting.team_trend_data import generate_team_trend_report
+from production.src.reporting.team_trend_data import (
+    compare_team_trend_seasons,
+    generate_team_trend_report,
+)
 
 
 def test_generate_team_trend_report_well_supported_no_gaps_real_data():
@@ -78,3 +81,65 @@ def test_generate_team_trend_report_unknown_team_returns_all_gaps_not_a_crash():
     assert set(report["gap_seasons"]) == {"2020-21", "2021-22"}
     assert report["season_stats"] == {}
     assert report["year_over_year_deltas"] == []
+
+
+# ============================================================================
+# Feature 3: compare_team_trend_seasons -- the team-vs-itself two-season
+# comparison, football-data.co.uk track. Reuses the SAME real Man City
+# 2019/20 and 2025/26 season points (81 and 78 respectively) confirmed
+# directly against the live data before writing this test, consistent
+# with this file's own real-data-only discipline.
+# ============================================================================
+
+
+def test_compare_team_trend_seasons_real_data_both_found():
+    comparison = compare_team_trend_seasons("Man City", 2019, 2025)
+
+    assert comparison["team_name"] == "Man City"
+    assert comparison["season_a"] == "2019-20"
+    assert comparison["season_b"] == "2025-26"
+    assert comparison["season_a_found"] is True
+    assert comparison["season_b_found"] is True
+
+    stats_a, stats_b = comparison["season_a_stats"], comparison["season_b_stats"]
+    assert stats_a["points"] == 81
+    assert stats_b["points"] == 78
+
+    diff = comparison["diff_b_minus_a"]
+    assert diff is not None
+    # season_b MINUS season_a, literally: 78 - 81 = -3, a real decrease.
+    assert diff["points_delta"] == -3
+    assert diff["points_delta"] == stats_b["points"] - stats_a["points"]
+    assert diff["goals_scored_delta"] == stats_b["goals_scored"] - stats_a["goals_scored"]
+    assert diff["red_cards_delta"] == stats_b["red_cards"] - stats_a["red_cards"]
+
+    assert "declined" in comparison["summary"] or "improved" in comparison["summary"] or "stayed level" in comparison["summary"]
+    assert "-3" in comparison["summary"] or "declined" in comparison["summary"]
+    assert "NEGATIVE" in comparison["diff_convention"]
+
+
+def test_compare_team_trend_seasons_reversed_order_flips_delta_sign():
+    """Comparing backwards in time (season_b chronologically BEFORE
+    season_a) is a real, valid use case -- the diff must be the literal
+    season_b-minus-season_a subtraction, sign-flipped from the forward
+    comparison of the same two seasons, not silently reordered."""
+    forward = compare_team_trend_seasons("Man City", 2019, 2025)
+    backward = compare_team_trend_seasons("Man City", 2025, 2019)
+
+    assert backward["season_a"] == "2025-26"
+    assert backward["season_b"] == "2019-20"
+    assert backward["diff_b_minus_a"]["points_delta"] == -forward["diff_b_minus_a"]["points_delta"]
+
+
+def test_compare_team_trend_seasons_gap_season_honest_no_data():
+    """A season before football-data.co.uk's archive starts (real,
+    verified 404 -- see this module's own docstring) must report
+    season_a_found=False and a None diff, never a fabricated comparison."""
+    comparison = compare_team_trend_seasons("Man City", 1990, 2025)
+
+    assert comparison["season_a_found"] is False
+    assert comparison["season_b_found"] is True
+    assert comparison["diff_b_minus_a"] is None
+    assert "1990-91" in comparison["summary"]
+    assert comparison["season_a_stats"] is None
+    assert comparison["season_b_stats"] is not None

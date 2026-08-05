@@ -36,9 +36,11 @@ import time
 
 import pytest
 import requests
+import streamlit as st
 import uvicorn
 from streamlit.testing.v1 import AppTest
 
+import production.src.serving.api as api_module
 from production.src.serving.api import app as _fastapi_app
 
 DASHBOARD_PATH = "production/frontend/dashboard.py"
@@ -158,6 +160,171 @@ def test_player_reports_tab_well_supported_no_false_positive_warning_real_data(l
     assert len(player_tab.image) == 2
 
 
+# ============================================================================
+# ADR-021 condition-2 compliance fix: PUBLIC_DEPLOYMENT gates the shot-map
+# panel's rendered variant AND the Team Trends tab entirely. `live_api_server`
+# runs api_module.app in-process (a background thread, same Python process
+# as this test), so monkeypatch.setattr(api_module, "PUBLIC_DEPLOYMENT", ...)
+# genuinely changes what that live server returns on its next request --
+# combined with monkeypatch.setenv for dashboard.py's OWN copy of the flag
+# (re-read fresh on every AppTest .run(), since Streamlit re-executes the
+# whole script top-to-bottom on every rerun -- there is no stale-import
+# concern here the way there might be for a one-shot script).
+# ============================================================================
+
+
+def test_player_reports_shot_map_panel_renders_aggregated_when_public_deployment_set(live_api_server, monkeypatch):
+    """Both flags set consistently (the correctly-configured case): the
+    shot-map panel must render the aggregated variant, and its raw-data
+    JSON expander -- the ACTUAL rendered page content, not just the
+    underlying function's return value -- must carry no `"shots"` field
+    anywhere."""
+    monkeypatch.setattr(api_module, "PUBLIC_DEPLOYMENT", True)
+    monkeypatch.setenv("PUBLIC_DEPLOYMENT", "true")
+    # st.cache_data's cache is process-global, not per-AppTest-instance --
+    # in REAL usage PUBLIC_DEPLOYMENT never changes mid-process (it's an
+    # env var read once at startup), so this staleness never occurs
+    # outside a test suite that flips the flag between runs of the same
+    # (rest_base_url, player_id, match_ids) cache key, as these tests do.
+    # Cleared explicitly so each test's actual HTTP round-trip reflects
+    # ITS OWN flag state, not a previous test's cached response.
+    st.cache_data.clear()
+
+    at = AppTest.from_file(DASHBOARD_PATH)
+    at.run(timeout=APP_TIMEOUT_SECONDS)
+    at.sidebar.text_input[0].set_value(live_api_server)
+
+    player_tab = at.tabs[1]
+    messi_label = next(o for o in player_tab.selectbox[0].options if "(5503)" in o)
+    player_tab.selectbox[0].set_value(messi_label)
+    at.run(timeout=APP_TIMEOUT_SECONDS)
+    player_tab = at.tabs[1]
+    player_tab.button[0].click()
+    at.run(timeout=APP_TIMEOUT_SECONDS)
+    player_tab = at.tabs[1]
+
+    assert not at.exception
+    # No "Configuration error" fail-closed message -- both flags agree, so
+    # the dashboard's defense-in-depth check must not trip.
+    assert not any("Configuration error" in e.value for e in player_tab.error)
+    # Still exactly 2 images: the player-report image, plus ONE shot-map
+    # image (the aggregated-grid render, not the raw scatter).
+    assert len(player_tab.image) == 2
+
+    # The shot map's OWN raw-data JSON expander (rendered after the player
+    # report's own "Raw report data" expander) is the last st.json call on
+    # this tab -- parse the ACTUAL rendered JSON text, not the underlying
+    # dict the endpoint returned, to confirm no per-shot field reached the
+    # page.
+    shot_map_json = json.loads(player_tab.json[-1].value)
+    assert "shots" not in shot_map_json
+    assert "shot_density_grid" in shot_map_json
+    assert "mean_xg_grid" in shot_map_json
+    assert '"shots"' not in player_tab.json[-1].value  # raw-text belt-and-suspenders, same as the API-level test
+
+
+def test_player_reports_shot_map_panel_unaffected_when_public_deployment_unset(live_api_server, monkeypatch):
+    """Explicit control for the default state (mirrors
+    test_shot_map_endpoint_public_deployment_off_by_default_confirmed in
+    test_api.py, at the dashboard-UI level): confirms the flag genuinely
+    defaults to off and the raw per-shot scatter still renders, with the
+    real per-shot data still present in the raw-data expander -- byte-for-
+    byte the same behavior as before this fix existed."""
+    monkeypatch.delenv("PUBLIC_DEPLOYMENT", raising=False)
+    assert api_module.PUBLIC_DEPLOYMENT is False
+    st.cache_data.clear()  # see the previous test's comment on why this is needed here
+
+    at = AppTest.from_file(DASHBOARD_PATH)
+    at.run(timeout=APP_TIMEOUT_SECONDS)
+    at.sidebar.text_input[0].set_value(live_api_server)
+
+    player_tab = at.tabs[1]
+    messi_label = next(o for o in player_tab.selectbox[0].options if "(5503)" in o)
+    player_tab.selectbox[0].set_value(messi_label)
+    at.run(timeout=APP_TIMEOUT_SECONDS)
+    player_tab = at.tabs[1]
+    player_tab.button[0].click()
+    at.run(timeout=APP_TIMEOUT_SECONDS)
+    player_tab = at.tabs[1]
+
+    assert not at.exception
+    assert len(player_tab.image) == 2
+    shot_map_json = json.loads(player_tab.json[-1].value)
+    assert "shots" in shot_map_json
+    assert len(shot_map_json["shots"]) == shot_map_json["total_shots"] > 0
+
+
+def test_player_reports_shot_map_panel_fails_closed_on_mismatched_flags(live_api_server, monkeypatch):
+    """Defense-in-depth check itself, under real test: dashboard.py's flag
+    says public, but the live api.py server's flag was left off (a real,
+    plausible misconfiguration -- e.g. only one of two deployed processes
+    got the env var). The panel must refuse to render/display anything
+    from the mismatched response rather than silently show raw per-shot
+    data just because ITS OWN flag was the only one checked."""
+    monkeypatch.setenv("PUBLIC_DEPLOYMENT", "true")
+    # api_module.PUBLIC_DEPLOYMENT deliberately left at its real default
+    # (False) here -- this IS the misconfiguration under test.
+    assert api_module.PUBLIC_DEPLOYMENT is False
+    st.cache_data.clear()  # see the first flag test's comment on why this is needed here
+
+    at = AppTest.from_file(DASHBOARD_PATH)
+    at.run(timeout=APP_TIMEOUT_SECONDS)
+    at.sidebar.text_input[0].set_value(live_api_server)
+
+    player_tab = at.tabs[1]
+    messi_label = next(o for o in player_tab.selectbox[0].options if "(5503)" in o)
+    player_tab.selectbox[0].set_value(messi_label)
+    at.run(timeout=APP_TIMEOUT_SECONDS)
+    player_tab = at.tabs[1]
+    player_tab.button[0].click()
+    at.run(timeout=APP_TIMEOUT_SECONDS)
+    player_tab = at.tabs[1]
+
+    assert not at.exception
+    assert any("Configuration error" in e.value for e in player_tab.error)
+    # Only the ORIGINAL player-report image may render -- no shot-map
+    # image (raw or aggregated) and no raw-data expander for it at all.
+    assert len(player_tab.image) == 1
+    assert len(player_tab.json) == 1  # only the player report's own expander, not a second one for the shot map
+
+
+def test_team_trends_tab_disabled_when_public_deployment_set(monkeypatch):
+    """The Team Trends serving-contradiction fix: with PUBLIC_DEPLOYMENT
+    set, the entire tab must be replaced with an explanatory message --
+    no button, no text input, nothing that could trigger
+    generate_team_trend_report (which would mean a real
+    football-data.co.uk network request / data/raw/ write happening from
+    a public deployment)."""
+    monkeypatch.setenv("PUBLIC_DEPLOYMENT", "true")
+
+    at = AppTest.from_file(DASHBOARD_PATH)
+    at.run(timeout=APP_TIMEOUT_SECONDS)
+
+    trends_tab = next(tab for tab in at.tabs if any("Team Trend" in h.value for h in tab.header))
+    assert not at.exception
+    assert len(trends_tab.button) == 0
+    assert len(trends_tab.text_input) == 0
+    assert any("disabled in this deployment" in i.value for i in trends_tab.info)
+
+
+def test_team_trends_tab_unaffected_when_public_deployment_unset(monkeypatch):
+    """Explicit control: with the flag unset (default), the tab's real
+    interactive elements are still present -- unchanged from before this
+    fix."""
+    monkeypatch.delenv("PUBLIC_DEPLOYMENT", raising=False)
+
+    at = AppTest.from_file(DASHBOARD_PATH)
+    at.run(timeout=APP_TIMEOUT_SECONDS)
+
+    trends_tab = next(tab for tab in at.tabs if any("Team Trend" in h.value for h in tab.header))
+    assert not at.exception
+    # 2 buttons/text_inputs now, not 1: "Generate Trend Report" (year-by-
+    # year view) plus the new, additive "Compare Seasons" section (Feature
+    # 3) -- both live in the same non-public branch of this tab.
+    assert len(trends_tab.button) == 2
+    assert len(trends_tab.text_input) == 2
+
+
 def test_player_reports_tab_season_subselector_produces_distinct_reports_real_data(live_api_server):
     """Candidate-index update (new coverage): Messi has 25 real cached
     competition-seasons, not one flat aggregate entry -- selecting just
@@ -273,11 +440,23 @@ def test_team_reports_tab_low_sample_warning_fires_for_real_low_sample_team_real
 
 def test_team_reports_tab_default_selection_is_single_most_recent_season_real_data():
     """Timeout-incident fix, Step 1: the season multiselect's default must
-    be a single season, not every cached one -- Real Madrid has 19 cached
-    seasons; selecting all of them (the literal reported failure shape)
-    must never be what a user gets just by clicking through without
-    touching the multiselect. No live_api_server needed -- this only
-    checks the widget's default value, before any Generate click."""
+    be a single season, not every cached one -- Real Madrid has 22 cached
+    seasons (was 19 pre-existing; a separate, real, exhaustive
+    data_fallback.find_or_fetch_player_matches search for Cristiano
+    Ronaldo, run with candidate_team_names including "Real Madrid" across
+    the FULL unscoped catalog, checked every historical "Real Madrid"
+    match for Ronaldo's presence -- including matches from eras before he
+    was born, e.g. Copa del Rey 1982/1983 and La Liga 1973/1974 -- and
+    fetch_match_events's own established caching convention caches any
+    checked match's events regardless of whether the player was actually
+    found in it, so those 3 old, unrelated, non-360-covered matches are
+    now genuinely part of Real Madrid's own cached footprint too). Real,
+    confirmed directly against the live cache before updating this
+    assumption -- not guessed. Selecting all 22 (the literal reported
+    failure shape) must never be what a user gets just by clicking
+    through without touching the multiselect. No live_api_server needed
+    -- this only checks the widget's default value, before any Generate
+    click."""
     at = AppTest.from_file(DASHBOARD_PATH)
     at.run(timeout=APP_TIMEOUT_SECONDS)
 
@@ -288,19 +467,21 @@ def test_team_reports_tab_default_selection_is_single_most_recent_season_real_da
     team_tab = at.tabs[2]
 
     season_multiselect = team_tab.multiselect[0]
-    assert len(season_multiselect.options) == 19, "test assumption: Real Madrid has 19 cached seasons"
+    assert len(season_multiselect.options) == 22, "test assumption: Real Madrid has 22 cached seasons"
     assert len(season_multiselect.value) == 1, (
         f"default should be exactly one season, got {len(season_multiselect.value)}: {season_multiselect.value}"
     )
 
 
 def test_team_reports_tab_warns_before_generate_click_for_wasteful_selection_real_data():
-    """Timeout-incident fix, Step 2: selecting ALL of Real Madrid's 19
-    seasons (68 raw matches, only 2 360-covered -- confirmed during the
-    audit) must show a clear st.warning IMMEDIATELY, before the Generate
-    button is ever clicked -- not only after a slow/empty result. No
-    live_api_server needed -- this checks UI state before any report
-    request is made.
+    """Timeout-incident fix, Step 2: selecting ALL of Real Madrid's 22
+    seasons (71 raw matches, still only 2 360-covered -- the 3 additional
+    raw matches found by the exhaustive Ronaldo search above are all
+    non-360-covered old-era matches, so this split's own "2 have the 360"
+    half is unchanged from before that search) must show a clear
+    st.warning IMMEDIATELY, before the Generate button is ever clicked --
+    not only after a slow/empty result. No live_api_server needed -- this
+    checks UI state before any report request is made.
     """
     at = AppTest.from_file(DASHBOARD_PATH)
     at.run(timeout=APP_TIMEOUT_SECONDS)
@@ -317,8 +498,8 @@ def test_team_reports_tab_warns_before_generate_click_for_wasteful_selection_rea
     team_tab = at.tabs[2]
 
     # No button click yet -- this warning must already be visible.
-    assert any("68 cached match(es)" in w.value and "2 have the 360" in w.value for w in team_tab.warning), (
-        f"expected a pre-generation warning naming the real 68-cached/2-360-covered split, got: "
+    assert any("71 cached match(es)" in w.value and "2 have the 360" in w.value for w in team_tab.warning), (
+        f"expected a pre-generation warning naming the real 71-cached/2-360-covered split, got: "
         f"{[w.value for w in team_tab.warning]}"
     )
 
@@ -449,3 +630,40 @@ def test_team_trends_tab_gap_seasons_render_and_compliance_caption_visible_real_
     assert not at.exception
     assert len(trends_tab.warning) == 1
     assert "Gap seasons" in trends_tab.warning[0].value
+
+
+def test_team_trends_tab_compare_two_seasons_real_data():
+    """Feature 3, end-to-end through the real dashboard UI: Man City's
+    default 2019/2025 comparison must render a real image plus the
+    negative-delta clarification caption, additive alongside (not
+    replacing) the existing year-by-year 'Generate Trend Report' section
+    -- both sections' own widgets/results must coexist on the same tab."""
+    at = AppTest.from_file(DASHBOARD_PATH)
+    at.run(timeout=APP_TIMEOUT_SECONDS)
+
+    trends_tab = at.tabs[3]
+    # The negative-delta clarification caption (Feature 3.5) must be
+    # visible before any button is even clicked -- not buried behind a
+    # result the user might never trigger.
+    assert any("NEGATIVE value is a real decrease" in c.value for c in trends_tab.caption)
+
+    # Compare Seasons uses its own, second text_input/number_inputs --
+    # defaults (Man City, 2019, 2025) are already real, known football
+    # history (see test_team_trend_data.py's own docstring), so clicking
+    # straight through with no changes is itself a real test case.
+    trends_tab.button[1].click()
+    at.run(timeout=APP_TIMEOUT_SECONDS)
+    trends_tab = at.tabs[3]
+
+    assert not at.exception
+    assert len(trends_tab.image) == 1
+    comparison_json = json.loads(trends_tab.json[-1].value)
+    assert comparison_json["season_a_found"] is True
+    assert comparison_json["season_b_found"] is True
+    assert comparison_json["diff_b_minus_a"]["points_delta"] == -3
+    assert "NEGATIVE" in comparison_json["diff_convention"]
+
+    # The original year-by-year section's own widgets must still be
+    # present and untouched -- additive, not a replacement.
+    assert len(trends_tab.button) == 2
+    assert len(trends_tab.text_input) == 2

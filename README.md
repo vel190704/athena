@@ -56,4 +56,15 @@ streamlit run production/frontend/dashboard.py   # live dashboard (5 tabs: CV mo
 
 This direct-process path is the only one actually validated end-to-end on this machine. A `docker-compose.yml` and two Dockerfiles also exist in this repo (see the Docker row above) — they represent real, reviewed work, but **were never successfully run via `docker compose up`** here due to local disk-space limits encountered mid-build. Treat them as a real starting point for a machine with more headroom, not as a validated alternative to the commands above.
 
+## Public deployment mode
+
+Set `PUBLIC_DEPLOYMENT=true` in the environment of **both** the `api.py` process and the `dashboard.py` process before deploying this app somewhere the general public can reach it (a free, non-monetized public site — see [ADR-021](docs/adr/ADR-021-statsbomb-free-public-deployment-scoping.md) for the licensing scoping this flag enforces). Unset, or set to anything other than `"true"` (the default): behavior is identical to local/private research use, unchanged from before this flag existed.
+
+What the flag changes when set:
+
+- **Shot map** (`/reports/player/{player_id}/shot-map`): serves and renders only an aggregated shot-density / mean-xG grid — no individual shot's exact location is ever computed or returned on this path. Local/private mode (flag unset) continues to show the real per-shot scatter plot exactly as before. See ADR-021's Update section for the full reasoning.
+- **Team Trends tab**: disabled entirely, with a visible explanation in its place. This tab's data source (football-data.co.uk, via `team_trend_data.py`) has its own separate, already-documented restriction — personal, non-distributed research use only — that a public deployment of the dashboard would otherwise silently violate regardless of this flag's effect on the shot map. See `team_trend_data.py`'s own docstring and [ADR-018](docs/adr/ADR-018-consolidate-reporting-behind-api-boundary.md)'s Update section.
+
+Both the shot map and Team Trends fixes were found via a dedicated compliance audit that checked every user-facing feature against ADR-021's condition 2 ("no raw StatsBomb data exposed to site visitors") — everything else audited (positional distribution, the aggregate heatmap, team reports, team comparison, the What-If simulator, the StatsBomb-sourced live tactical stream) was already compliant by construction and needed no gate.
+
 See `context.md` §2 for the full directory layout and module table, and `docs/FULL_PROJECT_REPORT.md` for the complete verified history.

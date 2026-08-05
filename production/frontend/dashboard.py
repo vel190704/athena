@@ -91,6 +91,7 @@ stop failure mode described above.
 """
 
 import json
+import os
 import sys
 import tempfile
 import time
@@ -121,9 +122,30 @@ from production.src.reporting.candidate_index import enumerate_cached_candidates
 from production.src.reporting.player_visualizer import (
     render_player_dashboard,
     render_shot_map,
+    render_shot_map_aggregated,
 )
-from production.src.reporting.team_trend_data import generate_team_trend_report
+from production.src.reporting.team_trend_data import (
+    compare_team_trend_seasons,
+    generate_team_trend_report,
+)
+from production.src.reporting.team_trend_visualizer import render_team_trend_comparison
 from production.src.reporting.team_visualizer import render_team_dashboard
+
+# ADR-021 condition-2 / Team Trends serving-contradiction compliance fix:
+# this dashboard process's OWN copy of the same flag api.py checks (see
+# that file's own comment for the full reasoning). Read ONCE at import
+# time, same convention. This flag does two independent things in this
+# file: (1) decides whether the shot-map panel may ever render/display
+# individual per-shot data (belt-and-suspenders on top of api.py's own
+# server-side gate -- see the shot-map panel below for why this is
+# checked in BOTH places rather than trusted from only one), and (2)
+# fully hides the Team Trends tab, since that tab's own data source
+# (football-data.co.uk, via team_trend_data.py) has its own separate,
+# pre-existing "never served/distributed" restriction that a public
+# deployment of THIS dashboard process would otherwise silently violate
+# regardless of api.py's flag (see team_trend_data.py's own docstring and
+# ADR-018's Update section).
+PUBLIC_DEPLOYMENT = os.environ.get("PUBLIC_DEPLOYMENT", "false").strip().lower() == "true"
 
 DEFAULT_REST_BASE_URL = "http://127.0.0.1:8000"
 DEFAULT_WS_URL = "ws://127.0.0.1:8000/ws/tactical-stream"
@@ -274,6 +296,21 @@ def _cached_player_shot_map_png(shot_map: dict) -> bytes:
 
 
 @st.cache_data(show_spinner=False)
+def _cached_player_shot_map_aggregated_png(shot_map_aggregated: dict) -> bytes:
+    """ADR-021 condition-2 compliance fix -- the PUBLIC-deployment
+    counterpart to `_cached_player_shot_map_png` above. Only ever called
+    on a dict that has already been confirmed (see the shot-map panel
+    below) to carry no `"shots"` key."""
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+        tmp_path = tmp.name
+    try:
+        render_shot_map_aggregated(shot_map_aggregated, tmp_path)
+        return Path(tmp_path).read_bytes()
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
+
+
+@st.cache_data(show_spinner=False)
 def _cached_team_report(rest_base_url: str, team_name: str, match_ids: tuple[int, ...]) -> dict:
     response = requests.get(
         f"{rest_base_url}/reports/team/{requests.utils.quote(team_name, safe='')}",
@@ -304,6 +341,27 @@ def _cached_team_png(report: dict) -> bytes:
 @st.cache_data(show_spinner=False)
 def _cached_team_trend_report(team_name: str, start_season: int, end_season: int) -> dict:
     return generate_team_trend_report(team_name, start_season, end_season)
+
+
+# Feature 3 (Compare Two Seasons): same deliberate, named ADR-018 exception
+# as _cached_team_trend_report above -- compare_team_trend_seasons is
+# called in-process for the exact same licensing reason, never through
+# api.py. This section is gated behind the SAME PUBLIC_DEPLOYMENT check as
+# the rest of this tab (see the tab body below) -- no separate/weaker gate.
+@st.cache_data(show_spinner=False)
+def _cached_team_trend_comparison(team_name: str, season_a: int, season_b: int) -> dict:
+    return compare_team_trend_seasons(team_name, season_a, season_b)
+
+
+@st.cache_data(show_spinner=False)
+def _cached_team_trend_comparison_png(comparison: dict) -> bytes:
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+        tmp_path = tmp.name
+    try:
+        render_team_trend_comparison(comparison, tmp_path)
+        return Path(tmp_path).read_bytes()
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
 
 
 @st.cache_data(show_spinner=False)
@@ -741,8 +799,6 @@ with tab_player:
                         lambda: _cached_player_shot_map(rest_base_url, player_id, match_ids), rest_base_url
                     )
                 if shot_map is not None:
-                    shot_map_png = _cached_player_shot_map_png(shot_map)
-
                     # Same low-sample visual convention as the positional/
                     # heatmap warnings above -- reused, not reinvented.
                     if shot_map.get("shot_map_used_low_sample_flag"):
@@ -751,10 +807,53 @@ with tab_player:
                             "treat the shot map below as illustrative, not a confident pattern."
                         )
 
-                    st.image(shot_map_png, caption=f"Shot Map -- player_id={player_id}", width="stretch")
+                    # ADR-021 condition-2 compliance fix. DEFENSE IN DEPTH,
+                    # deliberately checking BOTH signals rather than trusting
+                    # either alone:
+                    #   1. response_has_raw_shots -- the ACTUAL shape of what
+                    #      api.py returned (ground truth: api.py's own
+                    #      PUBLIC_DEPLOYMENT flag already decided server-side
+                    #      whether generate_player_shot_map's raw `shots` list
+                    #      was ever computed at all).
+                    #   2. this process's OWN PUBLIC_DEPLOYMENT flag.
+                    # If this dashboard's flag says public but the response
+                    # still carries raw shots (the two processes' flags are
+                    # misconfigured out of sync), FAIL CLOSED: refuse to
+                    # render or display anything from this panel rather than
+                    # silently trust either signal alone -- a compliance
+                    # boundary should never rely on one unverified check.
+                    response_has_raw_shots = "shots" in shot_map
 
-                    with st.expander("Raw shot map data"):
-                        st.json(shot_map)
+                    if PUBLIC_DEPLOYMENT and response_has_raw_shots:
+                        st.error(
+                            "Configuration error: this dashboard process has PUBLIC_DEPLOYMENT=true, "
+                            "but the API server returned raw per-shot data -- refusing to render or "
+                            "display it. Set PUBLIC_DEPLOYMENT=true on the API server process too "
+                            "(see README.md's 'Public deployment mode' section)."
+                        )
+                    elif PUBLIC_DEPLOYMENT or not response_has_raw_shots:
+                        # Aggregated path: either this deployment is public
+                        # (and the server correctly agreed, per the check
+                        # above), or the server is simply already running in
+                        # aggregated mode regardless of this process's own
+                        # flag -- either way, no raw per-shot data exists on
+                        # this dict, so it's safe to render/display.
+                        shot_map_png = _cached_player_shot_map_aggregated_png(shot_map)
+                        st.image(
+                            shot_map_png,
+                            caption=f"Shot Map (aggregated) -- player_id={player_id}",
+                            width="stretch",
+                        )
+                        with st.expander("Raw shot map data (aggregated grids only -- no per-shot data)"):
+                            st.json(shot_map)
+                    else:
+                        # Local/private mode, response confirmed to carry
+                        # real per-shot data -- unchanged from before this
+                        # flag existed.
+                        shot_map_png = _cached_player_shot_map_png(shot_map)
+                        st.image(shot_map_png, caption=f"Shot Map -- player_id={player_id}", width="stretch")
+                        with st.expander("Raw shot map data"):
+                            st.json(shot_map)
 
 # ============================================================================
 # TAB: Team Reports -- report DATA now fetched over HTTP from api.py's
@@ -914,6 +1013,21 @@ with tab_team:
 
         _variant_to_match_ids_360 = {v: _capped(ids) for v, ids in _variant_to_match_ids_360.items()}
 
+        # Fix 1 (zero-usable-match repro: Atlético Madrid, La Liga 2020/21
+        # -- 2 raw cached matches, 0 with 360 coverage): a variant with
+        # ZERO 360-covered matches must not remain as a dict key mapping
+        # to an empty tuple. `_variant_to_match_ids_360_raw.setdefault(
+        # _variant, set())` above always creates the key even when the
+        # season-360 intersection is empty, so `not _variant_to_match_ids_360`
+        # below (a plain dict-truthiness check) would NOT catch this --
+        # a dict with one key and an empty-tuple value is still truthy.
+        # Without this filter, that empty tuple reached
+        # `_cached_team_report(rest_base_url, variant, ())`, which
+        # `requests` sends as NO `match_ids` param at all -- reproduced
+        # directly as api.py's raw 422 before this fix (see api.py's own
+        # comment on this same case).
+        _variant_to_match_ids_360 = {v: ids for v, ids in _variant_to_match_ids_360.items() if ids}
+
     generate_team_clicked = st.button("Generate Team Report")
 
     if generate_team_clicked:
@@ -959,7 +1073,21 @@ with tab_team:
                     lambda: _cached_team_report(rest_base_url, _single_variant, _single_match_ids), rest_base_url
                 )
 
-            if team_report_dict is not None:
+            if team_report_dict is not None and team_report_dict.get("no_data"):
+                # Fix 1 defense-in-depth: the dict-filter fix above already
+                # prevents this dashboard from ever sending an empty
+                # match_ids selection in the normal preset flow, so this
+                # should not fire in practice -- kept anyway as a second,
+                # independent layer (e.g. a stale candidate-index cache,
+                # or any future caller of api.py's endpoint that isn't
+                # this dashboard) rather than trusting the client-side
+                # filter alone to be the only thing standing between a
+                # user and api.py's raw 422.
+                st.info(
+                    team_report_dict.get("reason")
+                    or "No 360-covered matches available for this selection -- try a different season."
+                )
+            elif team_report_dict is not None:
                 team_png_bytes = _cached_team_png(team_report_dict)
 
                 # team_report.py/team_visualizer.py's existing sample-size
@@ -1007,75 +1135,152 @@ with tab_team:
 # reporting tab that still requires dashboard.py to run with its own
 # data/raw/ and football-data.co.uk network access -- not fully separated
 # from the backend the way the other three tabs now are.
+#
+# Team Trends serving-contradiction fix (this ADR-018 exception was always
+# CONDITIONED on dashboard.py itself never being publicly deployed -- see
+# team_trend_data.py's own updated docstring and ADR-018's own Update
+# section): when PUBLIC_DEPLOYMENT is set, this ENTIRE TAB is disabled --
+# not degraded, not shown with a caveat -- because in-process is no longer
+# a meaningful distinction from "served" once the process itself is public.
+# generate_team_trend_report is never called in this mode: no
+# football-data.co.uk network request is made, no data/raw/ write happens,
+# nothing from this data source reaches a public visitor at all.
 # ============================================================================
 with tab_trends:
-    st.header("Team Trend Report (football-data.co.uk)")
+    if PUBLIC_DEPLOYMENT:
+        st.header("Team Trend Report (football-data.co.uk)")
+        st.info(
+            "This tab is disabled in this deployment (PUBLIC_DEPLOYMENT=true). "
+            "football-data.co.uk's own stated terms ('for the purposes of league match "
+            "prediction only', notes.txt) are scoped to personal, non-distributed research "
+            "use only -- a real, unresolved licensing ambiguity handled conservatively, the "
+            "same way ADR-014 handles the AGPL-derived pitch-keypoint CV model, and the same "
+            "way team_trend_data.py's own docstring already states this feature must never be "
+            "served/distributed. Run this dashboard locally with PUBLIC_DEPLOYMENT unset (or "
+            "'false') to use this tab. See REPORTING_FINDINGS.md §8 and ADR-018 for the full "
+            "compliance note."
+        )
+    else:
+        st.header("Team Trend Report (football-data.co.uk)")
 
-    st.caption(
-        "Data source: football-data.co.uk. Per its stated terms ('for the purposes of "
-        "league match prediction only', notes.txt), this feature is scoped to personal, "
-        "non-distributed research use only -- a real, unresolved licensing ambiguity "
-        "handled conservatively, the same way ADR-014 handles the AGPL-derived "
-        "pitch-keypoint CV model. See REPORTING_FINDINGS.md §8 for the full compliance note."
-    )
+        st.caption(
+            "Data source: football-data.co.uk. Per its stated terms ('for the purposes of "
+            "league match prediction only', notes.txt), this feature is scoped to personal, "
+            "non-distributed research use only -- a real, unresolved licensing ambiguity "
+            "handled conservatively, the same way ADR-014 handles the AGPL-derived "
+            "pitch-keypoint CV model. See REPORTING_FINDINGS.md §8 for the full compliance note."
+        )
 
-    trend_team_name = st.text_input("Team name (football-data.co.uk spelling, e.g. 'Man City')", value="Man City")
-    trend_col1, trend_col2 = st.columns(2)
-    with trend_col1:
-        trend_start_season = st.number_input("Start season (start year, e.g. 2019 for 2019/20)", min_value=1990, max_value=2100, value=2019, step=1)
-    with trend_col2:
-        trend_end_season = st.number_input("End season (start year, e.g. 2025 for 2025/26)", min_value=1990, max_value=2100, value=2025, step=1)
+        trend_team_name = st.text_input("Team name (football-data.co.uk spelling, e.g. 'Man City')", value="Man City")
+        trend_col1, trend_col2 = st.columns(2)
+        with trend_col1:
+            trend_start_season = st.number_input("Start season (start year, e.g. 2019 for 2019/20)", min_value=1990, max_value=2100, value=2019, step=1)
+        with trend_col2:
+            trend_end_season = st.number_input("End season (start year, e.g. 2025 for 2025/26)", min_value=1990, max_value=2100, value=2025, step=1)
 
-    generate_trend_clicked = st.button("Generate Trend Report")
+        generate_trend_clicked = st.button("Generate Trend Report")
 
-    if generate_trend_clicked:
-        if trend_start_season > trend_end_season:
-            st.error("Start season must be <= end season.")
-        else:
-            with st.spinner("Fetching and aggregating season data..."):
-                trend_report = _cached_team_trend_report(trend_team_name.strip(), int(trend_start_season), int(trend_end_season))
+        if generate_trend_clicked:
+            if trend_start_season > trend_end_season:
+                st.error("Start season must be <= end season.")
+            else:
+                with st.spinner("Fetching and aggregating season data..."):
+                    trend_report = _cached_team_trend_report(trend_team_name.strip(), int(trend_start_season), int(trend_end_season))
 
-            st.write(
-                f"Seasons found: {trend_report['seasons_found']} / {trend_report['seasons_requested']} requested."
-            )
-
-            # gap_seasons: reused directly, shown honestly -- never silently
-            # omitted just because this is now a UI instead of a printed dict.
-            if trend_report["gap_seasons"]:
-                st.warning(
-                    "Gap seasons (team not found in any of the five covered top-flight leagues -- "
-                    "relegated, not yet promoted, or otherwise absent that year): "
-                    + ", ".join(trend_report["gap_seasons"])
+                st.write(
+                    f"Seasons found: {trend_report['seasons_found']} / {trend_report['seasons_requested']} requested."
                 )
 
-            season_stats = trend_report["season_stats"]
-            if season_stats:
-                trend_df = pd.DataFrame.from_dict(season_stats, orient="index")
-                trend_df.index.name = "season"
+                # gap_seasons: reused directly, shown honestly -- never silently
+                # omitted just because this is now a UI instead of a printed dict.
+                if trend_report["gap_seasons"]:
+                    st.warning(
+                        "Gap seasons (team not found in any of the five covered top-flight leagues -- "
+                        "relegated, not yet promoted, or otherwise absent that year): "
+                        + ", ".join(trend_report["gap_seasons"])
+                    )
 
-                st.subheader("Year-by-year trend")
-                chart_metrics = [m for m in ["points", "goals_scored", "goals_conceded", "win_rate"] if m in trend_df.columns]
-                if chart_metrics:
-                    st.line_chart(trend_df[chart_metrics])
+                season_stats = trend_report["season_stats"]
+                if season_stats:
+                    trend_df = pd.DataFrame.from_dict(season_stats, orient="index")
+                    trend_df.index.name = "season"
 
-                st.subheader("Raw per-season data")
-                st.dataframe(trend_df)
+                    st.subheader("Year-by-year trend")
+                    chart_metrics = [m for m in ["points", "goals_scored", "goals_conceded", "win_rate"] if m in trend_df.columns]
+                    if chart_metrics:
+                        st.line_chart(trend_df[chart_metrics])
 
-                if trend_report["year_over_year_deltas"]:
-                    st.subheader("Year-over-year deltas")
-                    deltas_df = pd.DataFrame(trend_report["year_over_year_deltas"])
-                    st.dataframe(deltas_df)
-                    non_consecutive = deltas_df[~deltas_df["consecutive"]]
-                    if not non_consecutive.empty:
-                        st.info(
-                            "Rows marked consecutive=False span a gap season -- not an "
-                            "adjacent-year comparison, shown as such rather than implied to be one."
-                        )
+                    st.subheader("Raw per-season data")
+                    st.dataframe(trend_df)
+
+                    if trend_report["year_over_year_deltas"]:
+                        st.subheader("Year-over-year deltas")
+                        deltas_df = pd.DataFrame(trend_report["year_over_year_deltas"])
+                        st.dataframe(deltas_df)
+                        non_consecutive = deltas_df[~deltas_df["consecutive"]]
+                        if not non_consecutive.empty:
+                            st.info(
+                                "Rows marked consecutive=False span a gap season -- not an "
+                                "adjacent-year comparison, shown as such rather than implied to be one."
+                            )
+                else:
+                    st.error(f"No seasons found for {trend_team_name!r} in the requested range across any covered league.")
+
+                with st.expander("Raw report data"):
+                    st.json(trend_report)
+
+        # --- Compare Two Seasons (Feature 3, additive) -----------------
+        # A SEPARATE section, alongside (not replacing) the year-by-year
+        # trend view above -- same team-vs-itself pattern as
+        # team_comparison.py's two-DIFFERENT-teams comparison, but for
+        # this data source's own plain results/output stats (no
+        # pitch-control/event-location data exists here to compare).
+        # Governed by the EXACT SAME PUBLIC_DEPLOYMENT gate as the rest of
+        # this tab (this whole block is inside the `else:` branch above --
+        # zero separate/weaker condition for this section specifically).
+        st.divider()
+        st.subheader("Compare Two Seasons")
+        st.caption(
+            "Compares one team against its own past/future self across two specific seasons -- "
+            "goals, points, shots, cards, etc. Every delta below is season_b MINUS season_a: a "
+            "NEGATIVE value is a real decrease (e.g. fewer goals scored, a lower points total), "
+            "not an error or missing data. A positive value is a real increase."
+        )
+
+        compare_team_name = st.text_input(
+            "Team name (football-data.co.uk spelling)", value="Man City", key="trend_compare_team_name"
+        )
+        compare_col1, compare_col2 = st.columns(2)
+        with compare_col1:
+            compare_season_a = st.number_input(
+                "Season A (start year)", min_value=1990, max_value=2100, value=2019, step=1, key="trend_compare_season_a"
+            )
+        with compare_col2:
+            compare_season_b = st.number_input(
+                "Season B (start year)", min_value=1990, max_value=2100, value=2025, step=1, key="trend_compare_season_b"
+            )
+
+        compare_clicked = st.button("Compare Seasons")
+
+        if compare_clicked:
+            with st.spinner("Fetching and comparing both seasons..."):
+                comparison = _cached_team_trend_comparison(
+                    compare_team_name.strip(), int(compare_season_a), int(compare_season_b)
+                )
+
+            if not comparison["season_a_found"] or not comparison["season_b_found"]:
+                st.warning(comparison["summary"])
             else:
-                st.error(f"No seasons found for {trend_team_name!r} in the requested range across any covered league.")
+                st.write(comparison["summary"])
+                comparison_png = _cached_team_trend_comparison_png(comparison)
+                st.image(
+                    comparison_png,
+                    caption=f"{compare_team_name} -- {comparison['season_a']} vs {comparison['season_b']}",
+                    width="stretch",
+                )
 
-            with st.expander("Raw report data"):
-                st.json(trend_report)
+            with st.expander("Raw comparison data"):
+                st.json(comparison)
 
 # ============================================================================
 # TAB: Team Comparison -- report DATA now fetched over HTTP from api.py's

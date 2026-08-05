@@ -51,12 +51,29 @@ from production.src.pipeline.survival_dataset import FEATURE_KEYS
 from production.src.reporting.player_report import (
     generate_player_report,
     generate_player_shot_map,
+    generate_player_shot_map_aggregated,
 )
 from production.src.reporting.team_comparison import compare_team_seasons
 from production.src.reporting.team_report import generate_team_report
 from production.src.serving.alert_store import DB_PATH as ALERT_DB_PATH
 from production.src.serving.alert_store import fetch_alerts, init_db, log_alert
 from production.src.serving.simulator import live_match_stream
+
+# ADR-021 condition-2 compliance fix: an explicit, visible config switch --
+# checked ONCE here at import time, not re-read per-request -- gating which
+# variant of the shot map `/reports/player/{player_id}/shot-map` serves.
+# Unset/anything-but-"true" (the DEFAULT: local/private/research use):
+# behavior is byte-for-byte unchanged from before this flag existed --
+# `generate_player_shot_map`'s real per-shot data is served, same as
+# always. Set to "true" (a real public deployment): only
+# `generate_player_shot_map_aggregated`'s binned-grid variant is ever
+# computed or returned for that endpoint -- the raw per-shot `shots` list
+# is never even constructed in this mode, not merely stripped from an
+# already-built response. See ADR-021's own addendum and README.md's
+# "Public deployment mode" section for the full reasoning. Mirrors this
+# project's established os.environ.get(...)-flag convention exactly
+# (MLFLOW_ALLOW_FILE_STORE above, GEMINI_API_KEY in explainer.py).
+PUBLIC_DEPLOYMENT = os.environ.get("PUBLIC_DEPLOYMENT", "false").strip().lower() == "true"
 
 DEFAULT_MATCH_ID = 3857276
 # TIME_BIN (15s horizon, matching Milestones 8/13/14/15) now comes from
@@ -98,6 +115,11 @@ async def lifespan(app: FastAPI):
     global _model, _normalization_mean, _normalization_std, _model_run_id
     _model, _normalization_mean, _normalization_std, _model_run_id = load_deterministic_mlp()
     print(f"[api] Live inference server ready. Loaded MLP run_id={_model_run_id}")
+    print(
+        f"[api] PUBLIC_DEPLOYMENT={PUBLIC_DEPLOYMENT} -- shot-map endpoint will serve "
+        + ("the AGGREGATED (ADR-021 condition-2-compliant) variant only." if PUBLIC_DEPLOYMENT
+           else "raw per-shot data (local/private mode -- unchanged default behavior).")
+    )
 
     # Milestone 33 Step 1.1: warm the CV YOLO checkpoint ONCE at startup --
     # heavy, stateless-once-downloaded weights should be fetched/cached
@@ -678,23 +700,61 @@ async def get_player_report(player_id: int, match_ids: list[int] = Query(...)):
 
 @app.get("/reports/player/{player_id}/shot-map")
 async def get_player_shot_map(player_id: int, match_ids: list[int] = Query(...)):
-    """Wraps player_report.generate_player_shot_map, unmodified. A
-    DEDICATED endpoint, not a field added to /reports/player/{player_id}'s
-    response, deliberately: extending that endpoint's response would mean
-    EVERY existing caller pays the shot-map computation's cost (measured
-    ~11s for a full 596-match career) on every call, whether or not they
-    want shot-map data -- a real, if secondary, violation of "additive
-    only" (performance, not just response shape) that a separate endpoint
-    avoids entirely. Existing /reports/player/{player_id} callers and
-    response shape are completely unaffected by this endpoint's existence.
+    """Wraps player_report.generate_player_shot_map (or, in PUBLIC_DEPLOYMENT
+    mode, generate_player_shot_map_aggregated), unmodified. A DEDICATED
+    endpoint, not a field added to /reports/player/{player_id}'s response,
+    deliberately: extending that endpoint's response would mean EVERY
+    existing caller pays the shot-map computation's cost (measured ~11s for
+    a full 596-match career) on every call, whether or not they want
+    shot-map data -- a real, if secondary, violation of "additive only"
+    (performance, not just response shape) that a separate endpoint avoids
+    entirely. Existing /reports/player/{player_id} callers and response
+    shape are completely unaffected by this endpoint's existence.
+
+    ADR-021 condition-2 compliance fix (public/private branch, decided ONCE
+    from the module-level PUBLIC_DEPLOYMENT flag, not per-request logic
+    that could be tricked): PUBLIC_DEPLOYMENT=false (default) returns
+    generate_player_shot_map's real per-shot data, byte-for-byte identical
+    to this endpoint's behavior before this flag existed.
+    PUBLIC_DEPLOYMENT=true returns generate_player_shot_map_aggregated's
+    binned-grid-only variant instead -- the raw per-shot `shots` list is
+    never computed at all on this path, not merely omitted from an
+    already-built response.
     """
+    if PUBLIC_DEPLOYMENT:
+        return await asyncio.to_thread(generate_player_shot_map_aggregated, player_id, match_ids)
     return await asyncio.to_thread(generate_player_shot_map, player_id, match_ids)
 
 
 @app.get("/reports/team/{team_name}")
-async def get_team_report(team_name: str, match_ids: list[int] = Query(...)):
-    """Wraps team_report.generate_team_report, unmodified."""
-    return await asyncio.to_thread(generate_team_report, team_name, match_ids)
+async def get_team_report(team_name: str, match_ids: list[int] = Query(default=[])):
+    """Wraps team_report.generate_team_report, unmodified.
+
+    Zero-usable-match fix, reproduced directly before this change:
+    Atlético Madrid, La Liga 2020/21 (2 raw cached matches, 0 with 360
+    coverage) -- selecting this in dashboard.py could reach this endpoint
+    with an empty `match_ids` list, which `requests` sends as NO
+    `match_ids` param at all. With the old `Query(...)` (required),
+    FastAPI rejected this before `generate_team_report` ever ran, with its
+    own raw, caller-unfriendly 422 body
+    (`{"detail":[{"type":"missing","loc":["query","match_ids"],...}]}`).
+    `match_ids` is now OPTIONAL (default empty list) -- an empty
+    selection is a real, expected case (many real cached teams have zero
+    360-covered matches for a given season), not caller error.
+    `generate_team_report` itself already handles an empty `match_ids`
+    list gracefully with no code change needed (confirmed directly:
+    `matches_used=0`, an all-None `control_heatmap_grid`, no crash) -- the
+    real bug was purely this endpoint's parameter validation rejecting
+    the request before that graceful path ever ran. `no_data`/`reason`
+    are added here, on top of that unmodified return dict, only when
+    `match_ids` was empty -- an explicit signal so a caller doesn't have
+    to infer "no data" indirectly from `matches_used==0` alone.
+    """
+    report = await asyncio.to_thread(generate_team_report, team_name, match_ids)
+    if not match_ids:
+        report["no_data"] = True
+        report["reason"] = "No match_ids provided -- select a team/season with at least one 360-covered match."
+    return report
 
 
 @app.get("/reports/team-comparison")

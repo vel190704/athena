@@ -178,3 +178,79 @@ to `.gitignore`, matching `data/raw/`'s own treatment.
   connection tests already create a real concurrent-write scenario; WAL
   plus a busy_timeout is the correct-sized fix for that, not an
   over-engineered one.
+
+## Update: "WAL + busy_timeout Alone Is Enough" Was Not Fully True — Found, Fixed, and Verified
+
+This ADR's original Decision claimed WAL mode "paired with a busy_timeout,
+lets concurrent writers queue safely instead of erroring." This project's
+own `test_concurrent_writes_no_corruption_no_lost_writes` — described in
+its own docstring as "the single most important test in ADR-019" — was
+built specifically to hold that claim to account. It did its job: a real
+run of the full test suite surfaced a genuine failure (`expected 40 rows,
+found 39`, with a logged `sqlite3.OperationalError: database is locked`),
+not a hypothetical one.
+
+**Characterization (Step 1, before any code change).** Ran the test 10
+times, unmodified, in isolation: **2/10 failed (20%)** — a real,
+meaningfully reproducible failure rate under this project's own existing
+40-concurrent-writer test load, not a one-off fluke.
+
+**Root cause, confirmed by reading `log_alert`'s actual implementation
+before writing any fix (not assumed):** `_get_connection()` already sets
+a 5000ms SQLite busy_timeout, which makes SQLite's own internal busy
+handler retry a blocked write repeatedly for up to 5 seconds before
+raising `OperationalError`. That part of the original claim is true. What
+was missing: `log_alert` caught that error with the exact same broad
+`except Exception` used for genuinely unrecoverable failures (disk full,
+a corrupt db file) and immediately logged-and-swallowed it — **there was
+no APPLICATION-level retry at all.** Under a genuine burst of 40
+simultaneous writers, an individual writer can lose SQLite's own internal
+busy-handler race against the other 39 and exhaust its 5-second budget
+purely from scheduling bad luck, even though the lock clears again
+shortly after — at which point the original code gave up permanently
+instead of trying again. A `database is locked` error is a transient,
+recoverable condition under this specific load pattern; treating it
+identically to a disk-full error was the actual gap between what this ADR
+claimed and what the code did.
+
+**Fix applied (Step 2, `alert_store.py`):** `log_alert` now retries up to
+`_MAX_LOCK_RETRIES` (5) additional times, with exponential backoff
+(50ms/100ms/200ms/400ms/800ms), **specifically and only** for
+`sqlite3.OperationalError` whose message contains "database is locked" —
+confirmed via a new `_is_database_locked_error` helper, not a blanket
+retry-everything change. Every other exception (the existing
+`test_write_failure_logs_warning_and_does_not_raise` case: a genuinely
+unwritable path) still fails immediately on the first attempt, logged and
+swallowed exactly as before — this fix narrows what gets a second chance,
+it does not weaken the existing "never raises, never blocks the live
+alert" guarantee for anything else. This is safe to make generous with
+retries specifically because `log_alert` is invoked via
+`asyncio.create_task(asyncio.to_thread(...))` and is never awaited before
+the real-time WebSocket alert send (see Decision above) — a slower
+background write cannot delay or block what the client actually receives.
+
+**Verification (Step 2.3), same methodology as the baseline:** re-ran the
+test 30 times post-fix (10 immediately after the change, then 20 more for
+statistical confidence beyond what a single 10/10 result alone would
+justify, given a true 20% underlying rate has roughly an 11% chance of
+producing 10/10 passes by pure luck) — **0/30 failed (0%)**. The full
+`test_alert_store.py` suite (all 4 tests, including the unrecoverable-
+failure and idempotency tests) still passes unchanged.
+
+**What was explicitly NOT done, per this project's own discipline against
+hiding a real gap behind a weaker test:** the test's concurrency level
+(40 threads) was not reduced, no timeout was loosened to paper over the
+symptom, and the test was not marked expected-to-flake. The actual
+guarantee this ADR claims — no lost writes under real concurrent load —
+is now genuinely, measurably true (0/30), not just less frequently false.
+
+A secondary, non-blocking observation from this investigation, recorded
+here for completeness rather than acted on: `log_alert` also calls
+`init_db()` (a second connection, its own `CREATE TABLE`/`INDEX IF NOT
+EXISTS` transaction) on every single invocation, not just once — under
+the same 40-writer burst this doubles the number of write-lock
+acquisitions actually hitting the file before the retry fix even applies.
+The retry fix alone was sufficient to reach 0/30 without touching this,
+so it was left as-is rather than changed speculatively; it remains a
+plausible amplifying factor worth revisiting if failure-rate regressions
+are ever observed again at a higher concurrency level than 40.

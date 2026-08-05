@@ -18,6 +18,7 @@ Postgres, why no aiosqlite/ORM).
 
 import logging
 import sqlite3
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -54,6 +55,43 @@ _INDEX_SQL = (
 # `sqlite3.OperationalError: database is locked`. Generous relative to how
 # short a single INSERT is, tiny relative to a human reviewing history.
 _BUSY_TIMEOUT_MS = 5000
+
+# ADR-019 UPDATE (real, reproducible failure found in production use of this
+# test suite, not a hypothetical): SQLite's own busy_timeout above makes a
+# SINGLE blocked write wait up to 5s internally before raising `database is
+# locked` -- but under a genuine burst of many simultaneous writers (this
+# project's own `test_concurrent_writes_no_corruption_no_lost_writes`, 40
+# threads), an individual writer can still exhaust that internal 5s budget
+# purely from bad luck in SQLite's retry/backoff scheduling against 39
+# competing writers, even though the lock genuinely does clear soon after.
+# Measured directly (10 real runs of that test, unmodified code): 2/10
+# failed with exactly this `OperationalError('database is locked')`, a real
+# 20% failure rate under this project's own existing concurrency load, not
+# a one-off flake. `log_alert`'s prior code caught this exact transient,
+# recoverable condition with the SAME broad `except Exception` used for
+# genuinely unrecoverable failures (disk full, corrupt db) and never
+# retried -- silently losing the write. This is an APPLICATION-level retry
+# on top of SQLite's own busy_timeout, not a duplicate of it: it gives a
+# write that lost the internal busy-timeout race additional independent
+# attempts, each with its own fresh busy_timeout window, before finally
+# giving up and logging a warning.
+_MAX_LOCK_RETRIES = 5
+# Exponential backoff starting at 50ms, doubling each retry (50/100/200/
+# 400/800ms, ~1.55s of explicit sleep across all retries) -- short relative
+# to the 5s busy_timeout each individual attempt already gets internally,
+# long enough to let a losing writer fall behind the current contention
+# burst before trying again rather than immediately re-joining the same
+# thundering herd. `log_alert` is invoked via `asyncio.create_task(
+# asyncio.to_thread(...))` and is NEVER awaited before the real-time
+# WebSocket alert send (see this module's/ADR-019's own docstring) -- a
+# slower background write here cannot delay or block the alert a client
+# actually receives, so being generous with retries costs nothing
+# user-facing.
+_RETRY_BACKOFF_BASE_SECONDS = 0.05
+
+
+def _is_database_locked_error(exc: BaseException) -> bool:
+    return isinstance(exc, sqlite3.OperationalError) and "database is locked" in str(exc).lower()
 
 
 def _get_connection() -> sqlite3.Connection:
@@ -108,42 +146,62 @@ def log_alert(
     directly on the event loop.
 
     NEVER raises: any failure (disk full, a lock timeout past
-    `_BUSY_TIMEOUT_MS`, a corrupt db file, anything else) is caught and
-    logged as a `logging.warning`, then swallowed. ADR-019: the real-time
-    alert must reach the client regardless of whether this companion write
-    succeeds -- persistence is strictly additive, never a dependency of
-    the live alert flow.
+    `_BUSY_TIMEOUT_MS` on every retry attempt, a corrupt db file, anything
+    else) is caught and logged as a `logging.warning`, then swallowed.
+    ADR-019: the real-time alert must reach the client regardless of
+    whether this companion write succeeds -- persistence is strictly
+    additive, never a dependency of the live alert flow.
+
+    RETRY, ADR-019 UPDATE: a `database is locked` `OperationalError` is a
+    transient, recoverable condition under real concurrent-writer load
+    (measured, not assumed -- see `_MAX_LOCK_RETRIES`'s own comment), not
+    the same class of failure as a disk-full or corrupt-db error. This is
+    retried up to `_MAX_LOCK_RETRIES` times with exponential backoff
+    before being treated the same way those genuinely unrecoverable
+    failures are (logged and swallowed). Any OTHER exception is still
+    caught and swallowed immediately, on the first attempt, exactly as
+    before this change -- only the specific, transient lock error gets
+    retried.
     """
-    try:
-        init_db()  # idempotent; defends direct/test callers bypassing api.py's lifespan
-        conn = _get_connection()
+    last_exc: Exception | None = None
+    for attempt in range(_MAX_LOCK_RETRIES + 1):
         try:
-            conn.execute(
-                """
-                INSERT INTO alerts (
-                    logged_at_utc, source, match_id, video_path, minute,
-                    threat_before, threat_after, delta,
-                    explanation_text, explanation_source
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    datetime.now(UTC).isoformat(),
-                    source,
-                    match_id,
-                    video_path,
-                    minute,
-                    threat_before,
-                    threat_after,
-                    threat_after - threat_before,
-                    explanation_text,
-                    explanation_source,
-                ),
-            )
-            conn.commit()
-        finally:
-            conn.close()
-    except Exception as exc:  # noqa: BLE001 -- deliberately broad, see docstring
-        logger.warning(f"[alert_store] Failed to persist alert history entry: {exc!r}")
+            init_db()  # idempotent; defends direct/test callers bypassing api.py's lifespan
+            conn = _get_connection()
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO alerts (
+                        logged_at_utc, source, match_id, video_path, minute,
+                        threat_before, threat_after, delta,
+                        explanation_text, explanation_source
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        datetime.now(UTC).isoformat(),
+                        source,
+                        match_id,
+                        video_path,
+                        minute,
+                        threat_before,
+                        threat_after,
+                        threat_after - threat_before,
+                        explanation_text,
+                        explanation_source,
+                    ),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            return  # success -- no retry needed
+        except Exception as exc:  # noqa: BLE001 -- deliberately broad, see docstring
+            last_exc = exc
+            if _is_database_locked_error(exc) and attempt < _MAX_LOCK_RETRIES:
+                time.sleep(_RETRY_BACKOFF_BASE_SECONDS * (2**attempt))
+                continue
+            break
+
+    logger.warning(f"[alert_store] Failed to persist alert history entry: {last_exc!r}")
 
 
 def fetch_alerts(

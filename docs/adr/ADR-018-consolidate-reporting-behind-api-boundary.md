@@ -202,3 +202,46 @@ requires `dashboard.py` to run with its own `data/raw/` access, exactly
 like the `team_trend_data.py` exception already documented, just for a
 different reason (a dropdown convenience feature, not a licensing
 restriction).
+
+## Update: The Team Trends Exception Had an Unenforced Precondition — Now Gated
+
+A later real compliance audit (ADR-021's own StatsBomb-public-deployment
+scoping work, cross-referenced against every reporting feature) checked
+this ADR's Team Trends exception against an actual goal this project is
+now pursuing — a free, publicly-deployed dashboard — and found a real gap
+this ADR had not previously named.
+
+**The gap, stated plainly**: the Team Trends exception above justifies
+calling `generate_team_trend_report` in-process (rather than through
+`api.py`) because `team_trend_data.py`'s own docstring restricts it to
+"personal, non-distributed research use" and states it must "never [be]
+wired into `production/src/serving/api.py`'s live WebSocket/REST layer or
+any other network-served endpoint." That restriction was honored to the
+letter — the function genuinely never touches `api.py` — but the
+*in-process* call path was never actually a safe substitute for that
+restriction's real intent once `dashboard.py` itself is a candidate for
+public deployment. A public visitor reaches this data identically whether
+`dashboard.py` calls `api.py` first or calls `generate_team_trend_report`
+directly; "never served" was never really about which internal Python
+call happened, it was about who ends up seeing football-data.co.uk data
+downstream. This ADR's original text did not say so, and nothing enforced
+it — it was an unchecked assumption sitting underneath a real decision,
+not a resolved question.
+
+**What actually changed**: `dashboard.py` now reads its own
+`PUBLIC_DEPLOYMENT` environment-variable flag (the same flag ADR-021's
+shot-map fix introduced for `api.py`) and, when it is set, disables the
+Team Trends tab **entirely** — the tab shows a clear, visible explanatory
+message instead, `generate_team_trend_report` is never called, and no
+football-data.co.uk network request or `data/raw/` write happens in that
+mode. When the flag is unset (the default — local/private use), the tab
+is completely unchanged from before this update. See
+`team_trend_data.py`'s own updated docstring for the same note from that
+module's side, and `dashboard.py`'s Team Trends tab for the actual gate.
+
+**This does not change this ADR's original Decision or Consequences
+above** — Team Trends is still, correctly, excluded from `api.py`'s
+consolidation, for the same licensing reason. What changed is that the
+*precondition* under which that exception is actually safe (dashboard.py
+never being publicly deployed) is now a real, checked gate instead of an
+assumption nobody had verified would hold.

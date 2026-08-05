@@ -59,6 +59,28 @@ research use only. Concretely, that means:
   this note is not a permanent green light, it is the current
   conservative stance pending that resolution.
 
+COMPLIANCE-GATE UPDATE (ADR-021's compliance audit + Team-Trends-serving-
+contradiction fix): `dashboard.py`'s Team Trends tab has always called
+`generate_team_trend_report` directly, in-process, rather than through
+`api.py` (ADR-018's own named exception, for exactly the restriction
+above). That in-process call was ALWAYS implicitly conditioned on
+`dashboard.py` itself never being publicly deployed -- "never wired into
+a served layer" was never actually about which internal Python call path
+was used; it was about this data never reaching the public. Calling this
+function in-process inside a PUBLICLY deployed Streamlit process reaches
+exactly the same public audience `api.py` would have, just via a
+different code path -- an unenforced assumption, not something anyone had
+actually verified would hold. This gap was found (not assumed) during a
+real compliance audit and is now genuinely closed, not just documented:
+`dashboard.py` checks its own `PUBLIC_DEPLOYMENT` environment-variable
+flag and, when set, disables the entire Team Trends tab -- this function
+is never called, no football-data.co.uk network request is made, no
+`data/raw/` write happens, in that mode. See `dashboard.py`'s Team Trends
+tab and ADR-018's Update section for the enforcement itself; this note
+exists so a reader of THIS module's docstring alone (without also reading
+`dashboard.py`) still learns the "never served" restriction now has a
+real, checked gate behind it, not just a hopeful assumption.
+
 SCHEMA NOTE (verified across two+ leagues, not assumed uniform): England's
 CSVs (E0) include a `Referee` column that Spain/Germany/Italy/France's
 (SP1/D1/I1/F1) do NOT. This module never reads `Referee`, so that
@@ -303,6 +325,112 @@ def _compute_year_over_year_deltas(ordered_labels: list[str], seasons_found: dic
         entry["win_rate_delta"] = curr["win_rate"] - prev["win_rate"]
         deltas.append(entry)
     return deltas
+
+
+_COMPARISON_METRICS = [
+    "matches_played", "wins", "draws", "losses", "points",
+    "goals_scored", "goals_conceded", "goal_difference",
+    "shots_for", "shots_on_target_for", "corners_for", "fouls_committed",
+    "yellow_cards", "red_cards",
+]
+
+
+def _trend_diff_summary(
+    team_name: str, label_a: str, stats_a: dict | None, label_b: str, stats_b: dict | None, diff: dict | None
+) -> str:
+    if diff is None:
+        missing = [label for label, stats in ((label_a, stats_a), (label_b, stats_b)) if stats is None]
+        return (
+            f"{team_name}: no comparison possible -- {' and '.join(missing)} not found in any of the "
+            "five covered top-flight leagues (a real gap season -- relegated, not yet promoted, or "
+            "otherwise absent that year)."
+        )
+    points_delta = diff["points_delta"]
+    direction = "improved" if points_delta > 0 else "declined" if points_delta < 0 else "stayed level"
+    return (
+        f"{team_name} {direction} from {label_a} to {label_b}: {points_delta:+d} points "
+        f"({stats_a['points']} -> {stats_b['points']}), goal difference {diff['goal_difference_delta']:+d} "
+        f"({stats_a['goal_difference']:+d} -> {stats_b['goal_difference']:+d})."
+    )
+
+
+def compare_team_trend_seasons(
+    team_name: str,
+    season_a: int,
+    season_b: int,
+    *,
+    known_aliases: list[str] | None = None,
+) -> dict:
+    """Two-season side-by-side comparison for ONE team against its own
+    past/future self -- the football-data.co.uk-track counterpart to
+    `team_comparison.compare_team_seasons` (which compares two DIFFERENT
+    teams' StatsBomb-derived pitch-control/threat patterns). This module
+    has no event-level or pitch-coordinate data at all (see this module's
+    own docstring's SCOPE BOUNDARY) -- the comparison here is real
+    match-results/output stats only (goals, shots, cards, points, etc.),
+    never combined with anything from `team_report.py`/`team_comparison.py`.
+
+    `season_a`/`season_b`: season START years (e.g. 2019 for 2019/20),
+    NOT required to be adjacent or ordered -- comparing a team against an
+    EARLIER season (season_b < season_a) is a real, valid use case (e.g.
+    "how much better were we THIS season vs. that title-winning one"), so
+    the diff is always `season_b - season_a` regardless of which year is
+    chronologically first; a caller comparing backwards in time should
+    expect a `diff_b_minus_a` sign flipped from what a forward comparison
+    of the same two seasons would show -- not a bug, the literal
+    subtraction direction the field name states.
+
+    Reuses `generate_team_trend_report` internally, once per season
+    (rather than one call over the full [season_a, season_b] range, which
+    would fetch every league-season CSV in between for no benefit when
+    the two requested seasons are far apart) -- the SAME real
+    multi-league search, gap-season detection, and alias-matching logic
+    that function already has, not reimplemented here. A season not found
+    in any of the five covered leagues (a real gap -- relegation, not yet
+    promoted, or a season before/after this league's archive) is reported
+    honestly via `season_a_found`/`season_b_found`, with `diff_b_minus_a`
+    left `None` rather than a fabricated comparison against missing data.
+    """
+    label_a = _season_label(season_a)
+    label_b = _season_label(season_b)
+
+    report_a = generate_team_trend_report(team_name, season_a, season_a, known_aliases=known_aliases)
+    report_b = generate_team_trend_report(team_name, season_b, season_b, known_aliases=known_aliases)
+
+    stats_a = report_a["season_stats"].get(label_a)
+    stats_b = report_b["season_stats"].get(label_b)
+
+    diff = None
+    if stats_a is not None and stats_b is not None:
+        diff = {f"{metric}_delta": stats_b[metric] - stats_a[metric] for metric in _COMPARISON_METRICS}
+        diff["points_per_game_delta"] = (
+            stats_b["points_per_game"] - stats_a["points_per_game"]
+            if stats_a["points_per_game"] is not None and stats_b["points_per_game"] is not None
+            else None
+        )
+        diff["win_rate_delta"] = (
+            stats_b["win_rate"] - stats_a["win_rate"]
+            if stats_a["win_rate"] is not None and stats_b["win_rate"] is not None
+            else None
+        )
+
+    return {
+        "team_name": team_name,
+        "known_aliases": list(known_aliases or []),
+        "season_a": label_a,
+        "season_b": label_b,
+        "season_a_found": stats_a is not None,
+        "season_b_found": stats_b is not None,
+        "season_a_stats": stats_a,
+        "season_b_stats": stats_b,
+        "diff_b_minus_a": diff,
+        "diff_convention": (
+            "Every *_delta field is season_b's value MINUS season_a's value -- a NEGATIVE delta means a "
+            "real decrease from season_a to season_b (e.g. fewer goals scored, a lower points total), not "
+            "an error or a missing value. A positive delta means a real increase."
+        ),
+        "summary": _trend_diff_summary(team_name, label_a, stats_a, label_b, stats_b, diff),
+    }
 
 
 def generate_team_trend_report(

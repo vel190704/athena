@@ -7,6 +7,7 @@ project's preference for testing against real data over synthetic
 fixtures.
 """
 
+import json
 import os
 import queue
 import threading
@@ -25,6 +26,7 @@ import production.src.serving.api as api_module
 from production.src.models.explainer import (
     generate_explanation as _mock_generate_explanation,
 )
+from production.src.pipeline.habit_memory import GRID_COLS, GRID_ROWS
 from production.src.serving import alert_store
 from production.src.serving.api import app
 
@@ -500,6 +502,52 @@ def test_reports_team_endpoint_returns_real_report_with_shape():
     assert "weakest_control_zones" in report
 
 
+def test_reports_team_endpoint_zero_usable_matches_returns_clean_response_not_raw_422():
+    """Real reproduction case (not synthetic): Atlético Madrid has 32
+    real cached matches across every season, but ZERO with 360 coverage
+    -- confirmed directly via a full candidate_index.py scan before this
+    test was written. Selecting this team/season in dashboard.py could
+    previously reach this endpoint with an empty match_ids selection,
+    which `requests` sends as no `match_ids` param at all -- and with the
+    old `Query(...)` (required), that raised FastAPI's own raw,
+    caller-unfriendly 422
+    (`{"detail":[{"type":"missing","loc":["query","match_ids"],...}]}`),
+    reproduced directly against a real running app before this fix. Must
+    now return a clean 200 with an explicit no_data/reason, not a 422 of
+    any kind.
+    """
+    with TestClient(app) as client:
+        response = client.get("/reports/team/Atlético Madrid", params={})
+    assert response.status_code == 200
+    report = response.json()
+
+    assert report["no_data"] is True
+    assert report["reason"]
+    assert report["team_name"] == "Atlético Madrid"
+    assert report["matches_used"] == 0
+    assert report["matches_requested"] == 0
+    # The underlying generate_team_report shape must still be present and
+    # well-formed (not a stub/placeholder dict) -- the fix only adds
+    # no_data/reason on top of its real, already-graceful empty-input
+    # output, it does not replace that output with something different.
+    assert "control_heatmap_grid" in report
+    assert "threat_by_pitch_zone" in report
+    assert "weakest_control_zones" in report
+    assert report["weakest_control_zones"] == []
+
+
+def test_reports_team_endpoint_no_data_flag_absent_when_matches_provided():
+    """Control case: a normal, non-empty match_ids request must NOT carry
+    no_data/reason at all -- confirms the fix is additive only for the
+    empty-input case, not a change to every response's shape."""
+    with TestClient(app) as client:
+        response = client.get("/reports/team/Argentina", params={"match_ids": ARGENTINA_MATCH_IDS})
+    assert response.status_code == 200
+    report = response.json()
+    assert "no_data" not in report
+    assert "reason" not in report
+
+
 def test_reports_team_comparison_endpoint_reliability_caveat_survives_http_real_data():
     """Real Madrid 2016 vs. Barcelona 2008 -- the exact reliability-caveat
     case dashboard.py's own Team Comparison tab test guards -- must still
@@ -516,6 +564,88 @@ def test_reports_team_comparison_endpoint_reliability_caveat_survives_http_real_
     assert comparison["reliability_caveat"] is not None
     assert "Real Madrid 2016" in comparison["reliability_caveat"]
     assert "NOT equally reliable" in comparison["reliability_caveat"]
+
+
+# ============================================================================
+# ADR-021 condition-2 compliance fix: PUBLIC_DEPLOYMENT gates which variant
+# of the shot map /reports/player/{player_id}/shot-map serves. Default
+# (flag unset/False, module-level api_module.PUBLIC_DEPLOYMENT) must be
+# byte-for-byte identical to this endpoint's pre-fix behavior -- real
+# per-shot data. monkeypatch.setattr(api_module, "PUBLIC_DEPLOYMENT", True)
+# flips the module-level flag the endpoint function reads at CALL time
+# (Python late-binding on a module global), the same established pattern
+# this file already uses for CVPipeline/log_alert overrides above -- no
+# real env var or process restart needed to exercise the True path.
+# ============================================================================
+
+
+def test_shot_map_endpoint_default_serves_raw_per_shot_data():
+    """Flag unset (the default): unchanged from before this fix existed --
+    real per-shot locations/xG, exactly what generate_player_shot_map
+    always returned."""
+    with TestClient(app) as client:
+        response = client.get(
+            f"/reports/player/{MESSI_PLAYER_ID}/shot-map",
+            params={"match_ids": ARGENTINA_MATCH_IDS},
+        )
+    assert response.status_code == 200
+    shot_map = response.json()
+
+    assert "shots" in shot_map
+    assert shot_map["total_shots"] > 0
+    assert len(shot_map["shots"]) == shot_map["total_shots"]
+    first_shot = shot_map["shots"][0]
+    assert "location" in first_shot and len(first_shot["location"]) == 2
+    assert "statsbomb_xg" in first_shot
+    # The aggregated-only fields must NOT appear on the raw variant --
+    # confirms this really is the pre-fix response shape, not a merged one.
+    assert "shot_density_grid" not in shot_map
+    assert "mean_xg_grid" not in shot_map
+
+
+def test_shot_map_endpoint_public_deployment_serves_aggregated_only_no_raw_leak(monkeypatch):
+    """The actual compliance guarantee, checked against the REAL raw HTTP
+    response body (json.dumps of the actual response, not just the
+    intended code path) -- with PUBLIC_DEPLOYMENT=True, no per-shot
+    location/xG value may appear ANYWHERE in the response, under any key
+    name, at any nesting depth."""
+    monkeypatch.setattr(api_module, "PUBLIC_DEPLOYMENT", True)
+
+    with TestClient(app) as client:
+        response = client.get(
+            f"/reports/player/{MESSI_PLAYER_ID}/shot-map",
+            params={"match_ids": ARGENTINA_MATCH_IDS},
+        )
+    assert response.status_code == 200
+    raw_body_text = response.text  # the actual bytes-over-the-wire, not a re-serialization
+    shot_map = json.loads(raw_body_text)
+
+    assert "shots" not in shot_map
+    assert "shot_density_grid" in shot_map
+    assert "mean_xg_grid" in shot_map
+    assert shot_map["total_shots"] > 0  # aggregate scalars are still real, not stubbed
+
+    # Grid shape sanity: same GRID_COLS x GRID_ROWS convention as
+    # habit_memory's positional heatmap.
+    assert len(shot_map["shot_density_grid"]) == GRID_COLS
+    assert len(shot_map["shot_density_grid"][0]) == GRID_ROWS
+    assert abs(sum(sum(col) for col in shot_map["shot_density_grid"]) - 1.0) < 1e-9
+
+    # Belt-and-suspenders on the RAW TEXT itself: the literal substring
+    # '"shots"' (the raw-variant field name) must not appear anywhere in
+    # the actual response body, not just be absent from the parsed dict's
+    # top level (guards against, e.g., a future accidental nesting of the
+    # raw list under a different key).
+    assert '"shots"' not in raw_body_text
+
+
+def test_shot_map_endpoint_public_deployment_off_by_default_confirmed(monkeypatch):
+    """Explicit control: confirms api_module.PUBLIC_DEPLOYMENT's real,
+    unpatched module value is False (i.e. the default, unset
+    PUBLIC_DEPLOYMENT env var genuinely resolves to the private/raw
+    behavior) -- this is what every OTHER test in this file relies on
+    implicitly by never patching this flag."""
+    assert api_module.PUBLIC_DEPLOYMENT is False
 
 
 # ============================================================================

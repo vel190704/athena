@@ -395,6 +395,14 @@ def render_shot_map(shot_map_data: dict, output_path: str) -> None:
     stats sidebar -- total shots, body-part breakdown, goals, total xG,
     xG per shot (right). A NEW, STANDALONE function alongside
     `render_player_dashboard`, not a modification of it.
+
+    ADR-021 condition 2 (no raw StatsBomb data exposed to PUBLIC
+    deployments): this function plots each individual shot's exact
+    location, so it must only ever be called for LOCAL/private use --
+    `render_shot_map_aggregated` below is the PUBLIC-deployment
+    counterpart. Not gated inside this function itself (that decision
+    belongs to the caller -- see `api.py`'s `PUBLIC_DEPLOYMENT` flag and
+    `dashboard.py`'s shot-map panel).
     """
     fig = plt.figure(figsize=(12, 7))
     fig.suptitle(f"Shot Map -- player_id={shot_map_data['player_id']}", fontsize=15, y=0.98)
@@ -406,6 +414,110 @@ def render_shot_map(shot_map_data: dict, output_path: str) -> None:
 
     ax_stats = fig.add_subplot(grid[0, 1])
     _draw_shot_map_stats(ax_stats, shot_map_data)
+
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
+    fig.savefig(output_path, dpi=130, facecolor="white")
+    plt.close(fig)
+
+
+# ============================================================================
+# Shot map, AGGREGATED variant (ADR-021 condition-2 compliance fix): pure
+# RENDERING layer over `player_report.generate_player_shot_map_aggregated`'s
+# output -- binned density/xG grids only, no individual shot marker
+# anywhere. Consumes ONLY `shot_density_grid`/`mean_xg_grid` and the same
+# summary scalars `_draw_shot_map_stats` above already reads; never reads
+# a `"shots"` key (that field does not exist on this function's input
+# dict in the first place). Nothing above this line is modified.
+# ============================================================================
+
+
+def _draw_shot_density_heatmap(ax, shot_density_grid: list[list[float]], total_shots: int, low_sample: bool) -> None:
+    draw_pitch_outline(ax)
+    ax.set_xlim(SHOT_MAP_X_MIN, PITCH_LENGTH + 2)  # same attacking-third crop as the raw scatter version
+    ax.set_title(f"Shot density (aggregated, {total_shots} shots)", color="white", fontsize=11)
+
+    grid = np.array(shot_density_grid)
+    if grid.sum() == 0:
+        ax.text(
+            (SHOT_MAP_X_MIN + PITCH_LENGTH) / 2, PITCH_WIDTH / 2, "No shot data",
+            color="white", ha="center", va="center",
+        )
+        return
+
+    # Same gaussian-smoothed imshow convention `_draw_heatmap` already uses
+    # for the aggregate positional heatmap panel -- styled consistently,
+    # not a new visual language invented for this one panel.
+    smoothed = gaussian_filter(grid, sigma=HEATMAP_GAUSSIAN_SIGMA)
+    ax.imshow(
+        smoothed.T, extent=[0, PITCH_LENGTH, 0, PITCH_WIDTH], origin="lower",
+        cmap="hot", alpha=0.75, aspect="auto", zorder=2,
+    )
+
+    # Same LOW SAMPLE banner convention as _draw_shot_scatter/_draw_heatmap
+    # -- reused verbatim, not reinvented for this aggregated panel.
+    if low_sample:
+        ax.text(
+            (SHOT_MAP_X_MIN + PITCH_LENGTH) / 2, PITCH_WIDTH + 5,
+            f"LOW SAMPLE ({total_shots} shot{'s' if total_shots != 1 else ''}) -- not a confident shot pattern",
+            color="#ff4444", ha="center", va="bottom", fontsize=8, fontweight="bold", zorder=5,
+        )
+
+
+def _draw_mean_xg_heatmap(ax, mean_xg_grid: list[list[float | None]]) -> None:
+    draw_pitch_outline(ax)
+    ax.set_xlim(SHOT_MAP_X_MIN, PITCH_LENGTH + 2)
+    ax.set_title("Mean statsbomb_xg per cell (aggregated)", color="white", fontsize=11)
+
+    # None-for-unobserved-cell handling matches _draw_control_heatmap's own
+    # masked-array convention exactly (team_visualizer.py) -- a cell with no
+    # shots is drawn as genuinely blank, not a fabricated 0 xG reading.
+    grid = np.array([[np.nan if v is None else v for v in col] for col in mean_xg_grid], dtype=np.float64)
+    populated = grid[~np.isnan(grid)]
+    if populated.size == 0:
+        ax.text(
+            (SHOT_MAP_X_MIN + PITCH_LENGTH) / 2, PITCH_WIDTH / 2, "No shot data",
+            color="white", ha="center", va="center",
+        )
+        return
+
+    masked = np.ma.masked_invalid(grid)
+    im = ax.imshow(
+        masked.T, extent=[0, PITCH_LENGTH, 0, PITCH_WIDTH], origin="lower",
+        cmap="YlOrRd", vmin=0.0, vmax=max(float(populated.max()), 0.01), alpha=0.8, aspect="auto", zorder=2,
+    )
+    cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label("mean statsbomb_xg", fontsize=8)
+
+
+def render_shot_map_aggregated(shot_map_aggregated_data: dict, output_path: str) -> None:
+    """Renders `player_report.generate_player_shot_map_aggregated`'s
+    output as a single static PNG: a shot-DENSITY heatmap (left) and a
+    mean-`statsbomb_xg`-per-cell heatmap (middle), both binned into the
+    same grid `_draw_heatmap`'s aggregate positional panel already uses,
+    plus the same stats sidebar `render_shot_map` uses (right) -- no
+    individual shot marker anywhere in this figure. The PUBLIC-deployment
+    counterpart to `render_shot_map` above (ADR-021 condition 2).
+    """
+    fig = plt.figure(figsize=(15, 7))
+    fig.suptitle(
+        f"Shot Map (aggregated) -- player_id={shot_map_aggregated_data['player_id']}", fontsize=15, y=0.98
+    )
+
+    grid = GridSpec(1, 3, width_ratios=[1.3, 1.3, 1.0], figure=fig)
+
+    ax_density = fig.add_subplot(grid[0, 0])
+    _draw_shot_density_heatmap(
+        ax_density,
+        shot_map_aggregated_data.get("shot_density_grid", [[0.0] * GRID_ROWS] * GRID_COLS),
+        shot_map_aggregated_data.get("total_shots", 0),
+        shot_map_aggregated_data.get("shot_map_used_low_sample_flag", False),
+    )
+
+    ax_xg = fig.add_subplot(grid[0, 1])
+    _draw_mean_xg_heatmap(ax_xg, shot_map_aggregated_data.get("mean_xg_grid", [[None] * GRID_ROWS] * GRID_COLS))
+
+    ax_stats = fig.add_subplot(grid[0, 2])
+    _draw_shot_map_stats(ax_stats, shot_map_aggregated_data)
 
     fig.tight_layout(rect=[0, 0, 1, 0.95])
     fig.savefig(output_path, dpi=130, facecolor="white")
