@@ -120,6 +120,10 @@ import websocket
 
 import production.src.reporting.candidate_index as candidate_index_module
 from production.src.reporting.candidate_index import enumerate_cached_candidates
+from production.src.reporting.pass_network_visualizer import (
+    render_pass_network,
+    render_pass_network_aggregated,
+)
 from production.src.reporting.player_visualizer import (
     render_player_dashboard,
     render_shot_map,
@@ -391,6 +395,42 @@ def _cached_team_comparison(
     return response.json()
 
 
+@st.cache_data(show_spinner=False)
+def _cached_pass_network(rest_base_url: str, match_id: int) -> dict:
+    response = requests.get(
+        f"{rest_base_url}/reports/pass-network/{match_id}",
+        timeout=REPORT_REQUEST_TIMEOUT_SECONDS,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+@st.cache_data(show_spinner=False)
+def _cached_pass_network_png(pass_network: dict) -> bytes:
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+        tmp_path = tmp.name
+    try:
+        render_pass_network(pass_network, tmp_path)
+        return Path(tmp_path).read_bytes()
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
+
+
+@st.cache_data(show_spinner=False)
+def _cached_pass_network_aggregated_png(pass_network_aggregated: dict) -> bytes:
+    """ADR-021 condition-2 compliance -- the PUBLIC-deployment counterpart
+    to `_cached_pass_network_png` above. Only ever called on a dict that
+    has already been confirmed (see the Pass Network panel below) to
+    carry no `"nodes"`/`"edges"` key."""
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+        tmp_path = tmp.name
+    try:
+        render_pass_network_aggregated(pass_network_aggregated, tmp_path)
+        return Path(tmp_path).read_bytes()
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
+
+
 # Alerts History tab: GET /alerts/history (ADR-019's persistence store, via
 # alert_store.fetch_alerts -- see api.py). Every filter param is Optional on
 # the endpoint's own side (None = no filter, AND-combined) -- `requests`
@@ -493,8 +533,11 @@ with st.sidebar:
     )
     st.divider()
 
-tab_cv, tab_player, tab_team, tab_trends, tab_compare, tab_alerts = st.tabs(
-    ["Live CV Monitor", "Player Reports", "Team Reports", "Team Trends", "Team Comparison", "Alerts History"]
+tab_cv, tab_player, tab_team, tab_trends, tab_compare, tab_pass_network, tab_alerts = st.tabs(
+    [
+        "Live CV Monitor", "Player Reports", "Team Reports", "Team Trends", "Team Comparison",
+        "Pass Network", "Alerts History",
+    ]
 )
 
 # ============================================================================
@@ -1428,6 +1471,89 @@ with tab_compare:
 
             with st.expander("Raw comparison data"):
                 st.json(comparison)
+
+
+# ============================================================================
+# TAB: Pass Network -- report DATA fetched over HTTP from api.py's new
+# /reports/pass-network/{match_id} (same ADR-018 "call api.py, don't
+# reimplement" principle as the other reporting tabs); PNG rendering calls
+# pass_network_visualizer.py directly (pure client-side rendering, no
+# MLflow/StatsBomb access of its own -- same split as every other
+# reporting tab's PNG step).
+#
+# ADR-021 condition-2 compliance: SAME gating pattern as the Shot Map panel
+# in the Player Reports tab above, applied here rather than reinvented --
+# see that panel's own comment for the full defense-in-depth reasoning
+# (this dashboard process's OWN PUBLIC_DEPLOYMENT flag, PLUS an inspection
+# of whether the actual API response still carries a raw `nodes`/`edges`
+# field, failing closed on any mismatch between the two signals).
+# ============================================================================
+with tab_pass_network:
+    st.header("Pass Network")
+    st.caption(
+        "Single-match pass network: each Starting XI player's own average location, connected "
+        "by real completed-pass counts to their teammates. Built from real StatsBomb event data "
+        "via the new GET /reports/pass-network/{match_id} endpoint."
+    )
+
+    pass_network_match_id_input = st.text_input(
+        "Match ID (StatsBomb match_id)", value=DEFAULT_MATCH_ID, key="pass_network_match_id_input"
+    )
+    pass_network_generate_clicked = st.button("Generate Pass Network")
+
+    if pass_network_generate_clicked:
+        try:
+            pass_network_match_id = int(pass_network_match_id_input.strip())
+        except ValueError:
+            st.error(f"Match ID must be a whole number -- got {pass_network_match_id_input!r}.")
+        else:
+            with st.spinner("Generating pass network..."):
+                pass_network = _fetch_report_safely(
+                    lambda: _cached_pass_network(rest_base_url, pass_network_match_id), rest_base_url
+                )
+
+            if pass_network is not None:
+                if pass_network.get("no_data"):
+                    st.info(pass_network.get("reason", "No pass network data available for this match_id."))
+                else:
+                    # ADR-021 condition-2 compliance fix. DEFENSE IN DEPTH,
+                    # deliberately checking BOTH signals rather than trusting
+                    # either alone -- see the Shot Map panel's own comment
+                    # (Player Reports tab) for the full reasoning; mirrored
+                    # here unchanged:
+                    #   1. response_has_raw_network -- the ACTUAL shape of
+                    #      what api.py returned (ground truth: api.py's own
+                    #      PUBLIC_DEPLOYMENT flag already decided server-side
+                    #      whether generate_pass_network's raw nodes/edges
+                    #      were ever computed at all).
+                    #   2. this process's OWN PUBLIC_DEPLOYMENT flag.
+                    response_has_raw_network = "nodes" in pass_network
+
+                    if PUBLIC_DEPLOYMENT and response_has_raw_network:
+                        st.error(
+                            "Configuration error: this dashboard process has PUBLIC_DEPLOYMENT=true, "
+                            "but the API server returned raw per-player location/edge data -- refusing "
+                            "to render or display it. Set PUBLIC_DEPLOYMENT=true on the API server "
+                            "process too (see README.md's 'Public deployment mode' section)."
+                        )
+                    elif PUBLIC_DEPLOYMENT or not response_has_raw_network:
+                        pass_network_png = _cached_pass_network_aggregated_png(pass_network)
+                        st.image(
+                            pass_network_png,
+                            caption=f"Pass Network (aggregated) -- match_id={pass_network_match_id}",
+                            width="stretch",
+                        )
+                        with st.expander("Raw pass network data (per-player totals only -- no location/edges)"):
+                            st.json(pass_network)
+                    else:
+                        pass_network_png = _cached_pass_network_png(pass_network)
+                        st.image(
+                            pass_network_png,
+                            caption=f"Pass Network -- match_id={pass_network_match_id}",
+                            width="stretch",
+                        )
+                        with st.expander("Raw pass network data"):
+                            st.json(pass_network)
 
 
 # ============================================================================

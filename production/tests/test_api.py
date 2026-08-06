@@ -649,6 +649,91 @@ def test_shot_map_endpoint_public_deployment_off_by_default_confirmed(monkeypatc
 
 
 # ============================================================================
+# ADR-021 condition-2 compliance (Step 0 decision, see that ADR's own
+# addendum): PUBLIC_DEPLOYMENT gates which variant of the pass network
+# /reports/pass-network/{match_id} serves -- SAME pattern as the shot map
+# tests above, applied here. Default (flag unset/False) must be byte-for-
+# byte identical to this endpoint's real per-player location/edge data.
+# ============================================================================
+
+
+def test_pass_network_endpoint_default_serves_raw_network_real_data():
+    """Flag unset (the default): real per-player average location and
+    real pairwise completed-pass edge weights for match 3857276 (Canada
+    vs. Morocco, 22 real Starting XI players -- verified directly against
+    this match's own cached event data before writing this test)."""
+    with TestClient(app) as client:
+        response = client.get(f"/reports/pass-network/{MATCH_ID}")
+    assert response.status_code == 200
+    pass_network = response.json()
+
+    assert pass_network["no_data"] is False
+    assert "nodes" in pass_network and "edges" in pass_network
+    assert len(pass_network["nodes"]) == 22  # 11 a side, both Starting XIs
+    assert len(pass_network["edges"]) > 0
+    first_node = pass_network["nodes"][0]
+    assert "avg_location" in first_node and len(first_node["avg_location"]) == 2
+    assert "name" in first_node and "team" in first_node
+    first_edge = pass_network["edges"][0]
+    assert first_edge["completed_passes"] > 0
+    # The aggregated-only fields must NOT appear on the raw variant.
+    assert "player_summary" not in pass_network
+    assert "network_density" not in pass_network
+
+
+def test_pass_network_endpoint_public_deployment_serves_aggregated_only_no_raw_leak(monkeypatch):
+    """The actual compliance guarantee, checked against the REAL raw HTTP
+    response body (same discipline as the shot map's own equivalent test
+    above): with PUBLIC_DEPLOYMENT=True, no player's individual average
+    location and no pairwise edge weight may appear ANYWHERE in the
+    response, under any key name, at any nesting depth."""
+    monkeypatch.setattr(api_module, "PUBLIC_DEPLOYMENT", True)
+
+    with TestClient(app) as client:
+        response = client.get(f"/reports/pass-network/{MATCH_ID}")
+    assert response.status_code == 200
+    raw_body_text = response.text  # the actual bytes-over-the-wire, not a re-serialization
+    pass_network = json.loads(raw_body_text)
+
+    assert "nodes" not in pass_network
+    assert "edges" not in pass_network
+    assert "player_summary" in pass_network
+    assert pass_network["num_players"] == 22
+    assert pass_network["num_edges"] > 0
+    assert pass_network["total_completed_passes_in_network"] > 0
+
+    first_summary = pass_network["player_summary"][0]
+    assert "completed_passes_sent" in first_summary
+    assert "avg_location" not in first_summary
+
+    # Belt-and-suspenders on the RAW TEXT itself: neither the raw-variant
+    # field names nor the literal string "avg_location" may appear
+    # anywhere in the actual response body.
+    assert '"nodes"' not in raw_body_text
+    assert '"edges"' not in raw_body_text
+    assert "avg_location" not in raw_body_text
+
+
+def test_pass_network_endpoint_public_deployment_off_by_default_confirmed():
+    """Explicit control, same convention as the shot map's own equivalent
+    test -- confirms the real, unpatched default."""
+    assert api_module.PUBLIC_DEPLOYMENT is False
+
+
+def test_pass_network_endpoint_no_data_for_unfetchable_match():
+    """A match_id with no fetchable event data (neither cached nor a real
+    StatsBomb open-data match) must return a clean no_data response, not a
+    500 or a crash -- mirrors generate_pass_network's own documented
+    no_data convention."""
+    with TestClient(app) as client:
+        response = client.get("/reports/pass-network/1")
+    assert response.status_code == 200
+    pass_network = response.json()
+    assert pass_network["no_data"] is True
+    assert "nodes" not in pass_network
+
+
+# ============================================================================
 # ADR-019 (Stage 2 persistence): the alert-history store, exercised through
 # the REAL WebSocket alert flow (not alert_store.py directly -- that's
 # test_alert_store.py's job). These tests confirm the two things ADR-019

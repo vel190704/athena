@@ -241,3 +241,100 @@ exposure of individually-located events; it says nothing against a
 researcher, running this project locally for their own analysis, plotting
 real shot locations for their own use. Removing the capability entirely
 would over-correct past what condition 2 actually requires.
+
+## Update: Condition 2 Applied to the Pass Network (Step 0 Decision)
+
+A new reporting feature — a per-match pass network (`production/src/
+reporting/pass_network.py`) — was scoped BEFORE being built, this time,
+rather than being audited for condition-2 compliance after the fact (the
+shot map's own history above). The question: does a pass network's raw
+form count as RAW, individually-attributable data under condition 2, the
+same as the shot map, or is it already condition-2-compliant by
+construction, the same as the aggregate positional heatmap (which the
+audit above found fine specifically because it is "collapsed into counts,
+shares, or per-cell means with no single event individually recoverable")?
+
+**On its face, a pass network's raw form looks structurally close to
+BOTH precedents, not cleanly either one:**
+
+- Like the shot map: it names real individual players and, for the
+  network's NODES, plots something location-shaped (a Starting XI
+  player's own average `(x, y)` for this match).
+- Like the heatmap: a node's average location is a genuine aggregate
+  (the mean of many individual pass-start locations for one player, not
+  any single event's raw coordinate) — by the SAME test the audit above
+  applied to the heatmap ("no single event individually recoverable"), an
+  average alone does not let a viewer reconstruct any one specific pass's
+  exact location.
+
+**The deciding factor, on closer inspection, is the EDGES, not the
+nodes, and it is a real difference from the heatmap precedent, not a
+superficial one:** the heatmap aggregates over a whole SEASON's worth of
+events for one player (large N, genuinely non-recoverable). A pass
+network is inherently SINGLE-MATCH scope (see `pass_network.py`'s own
+module docstring for why aggregating it across matches the way player/
+team reports do would not mean anything). At single-match granularity,
+many real player-pairs complete only 1-3 passes to each other over 90
+minutes — verified directly against match 3857276's real cached data
+(the validation match used throughout this addendum): 171 real directed
+edges among 22 Starting XI players, several with `completed_passes == 1`.
+An edge weight that low is not a meaningfully "aggregated" count in the
+same sense a season total is — it is, in practice, a direct restatement
+of one specific real pass event (two named players, StatsBomb's own
+`pass.recipient` link), just relabeled as a "count." Combined with both
+players' own average locations, a low-weight edge lets a viewer infer an
+approximate real start/end location for that one specific pass — exactly
+the kind of individual-event reconstruction condition 2 exists to
+prevent, even though nothing on the response dict is literally named
+`location` the way the shot map's per-shot field is.
+
+**Decision: treat the raw pass network (`generate_pass_network`) as RAW,
+individually-attributable data under condition 2 — the SAME treatment as
+the shot map, not an exception, and not assumed automatically compliant
+just because it resembles the (already-cleared) heatmap on the surface.**
+This was decided BEFORE writing `api.py`'s endpoint or `dashboard.py`'s
+panel, not discovered afterward by a separate compliance audit — the
+explicit goal of scoping this up front was to not repeat the shot map's
+own history (built first, found non-compliant only by a later dedicated
+audit).
+
+**Resolution, following the shot map's own established pattern exactly**
+(itself following ADR-014's precedent: scope the constraint, do not
+remove the capability):
+
+- `pass_network.generate_pass_network` — the raw variant (real per-player
+  average location, real pairwise completed-pass edge weights) — remains
+  fully available for LOCAL/private research use, unchanged.
+- `pass_network.generate_pass_network_aggregated` is the condition-2-
+  compliant counterpart: real per-player TOTALS only (completed passes
+  sent/received, distinct-partner count) and network-level summary stats
+  (player/edge counts, density) — no player's average location and no
+  PAIRWISE edge weight appears anywhere in this variant's output. A
+  per-player total (e.g. "34 completed passes sent") is the same class of
+  aggregate as the shot map's own already-compliant `shots_by_body_part`/
+  `total_shots` scalars — real, but not individually recoverable back to
+  any one specific pass.
+- `pass_network_visualizer.render_pass_network_aggregated` renders that
+  as a per-team bar chart of completed passes sent, styled consistently
+  with the shot map's own aggregated-heatmap panel — no node position, no
+  edge line, anywhere.
+- The SAME `PUBLIC_DEPLOYMENT` environment-variable flag (`api.py`,
+  already checked once at startup) decides which variant
+  `/reports/pass-network/{match_id}` serves — unset (default) serves the
+  real raw network, byte-for-byte the same shape this module always
+  produces; `true` serves ONLY the aggregated variant, and the raw
+  `nodes`/`edges` lists are never even computed on that path.
+- `dashboard.py`'s Pass Network panel mirrors the shot map panel's exact
+  defense-in-depth check: it inspects whether the actual API response it
+  received still carries a raw `nodes` field, and fails closed (a visible
+  configuration error, nothing rendered) if its own flag says public but
+  the response says otherwise.
+
+Not chosen: treating the raw pass network as automatically condition-2-
+compliant on the theory that it is "just like the heatmap." Rejected
+because the single-match/low-edge-weight reasoning above is a real,
+substantive difference from the heatmap's season-long, large-N
+aggregation, not a surface-level distinction — and this project's own
+standing discipline (ADR-014, ADR-020, this ADR's own original Decision
+section) is to resolve a genuine ambiguity conservatively, not by
+whichever reading is more convenient to build.

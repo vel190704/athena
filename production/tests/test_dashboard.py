@@ -85,17 +85,18 @@ def live_api_server():
     thread.join(timeout=10)
 
 
-def test_dashboard_loads_all_six_tabs_no_exception():
+def test_dashboard_loads_all_seven_tabs_no_exception():
     at = AppTest.from_file(DASHBOARD_PATH)
     at.run(timeout=APP_TIMEOUT_SECONDS)
 
     assert not at.exception
-    assert len(at.tabs) == 6
+    assert len(at.tabs) == 7
     headers = [h.value for tab in at.tabs for h in tab.header]
     assert "Player Report" in headers
     assert "Team Report" in headers
     assert "Team Trend Report (football-data.co.uk)" in headers
     assert "Team-Season Style Comparison" in headers
+    assert "Pass Network" in headers
     assert "Alerts History" in headers
 
 
@@ -672,6 +673,126 @@ def test_team_trends_tab_compare_two_seasons_real_data():
 
 
 # ============================================================================
+# Pass Network tab: GET /reports/pass-network/{match_id} via api.py, same
+# real-HTTP-through-live_api_server discipline as the other reporting tabs
+# (ADR-018). ADR-021 condition-2 compliance tests mirror the Shot Map
+# panel's own PUBLIC_DEPLOYMENT flag tests exactly (see those above) --
+# same monkeypatch pattern, applied to this new tab instead of reinvented.
+# ============================================================================
+
+PASS_NETWORK_MATCH_ID = "3857276"  # Canada vs. Morocco -- 22 real Starting XI players, 171 real edges
+
+
+def test_pass_network_tab_renders_real_data_default_local_private(live_api_server):
+    """Flag unset (the default): the real per-player pitch-network image
+    renders, and the raw-data expander carries real node/edge data."""
+    at = AppTest.from_file(DASHBOARD_PATH)
+    at.run(timeout=APP_TIMEOUT_SECONDS)
+    at.sidebar.text_input[0].set_value(live_api_server)
+
+    pn_tab = at.tabs[5]
+    pn_tab.text_input[0].set_value(PASS_NETWORK_MATCH_ID)
+    at.run(timeout=APP_TIMEOUT_SECONDS)
+    pn_tab = at.tabs[5]
+    pn_tab.button[0].click()
+    at.run(timeout=APP_TIMEOUT_SECONDS)
+    pn_tab = at.tabs[5]
+
+    assert not at.exception
+    assert len(pn_tab.error) == 0
+    assert len(pn_tab.image) == 1
+    raw = json.loads(pn_tab.json[0].value)
+    assert len(raw["nodes"]) == 22
+    assert len(raw["edges"]) > 0
+
+
+def test_pass_network_tab_renders_aggregated_when_public_deployment_set(live_api_server, monkeypatch):
+    """Both flags set consistently (the correctly-configured public
+    case): the aggregated variant must render, and its raw-data expander
+    must carry no `nodes`/`edges`/`avg_location` anywhere."""
+    monkeypatch.setattr(api_module, "PUBLIC_DEPLOYMENT", True)
+    monkeypatch.setenv("PUBLIC_DEPLOYMENT", "true")
+    st.cache_data.clear()  # see the shot-map flag tests above for why this matters across real HTTP reruns
+
+    at = AppTest.from_file(DASHBOARD_PATH)
+    at.run(timeout=APP_TIMEOUT_SECONDS)
+    at.sidebar.text_input[0].set_value(live_api_server)
+
+    pn_tab = at.tabs[5]
+    pn_tab.text_input[0].set_value(PASS_NETWORK_MATCH_ID)
+    at.run(timeout=APP_TIMEOUT_SECONDS)
+    pn_tab = at.tabs[5]
+    pn_tab.button[0].click()
+    at.run(timeout=APP_TIMEOUT_SECONDS)
+    pn_tab = at.tabs[5]
+
+    assert not at.exception
+    assert not any("Configuration error" in e.value for e in pn_tab.error)
+    assert len(pn_tab.image) == 1
+    raw_text = pn_tab.json[0].value
+    assert '"nodes"' not in raw_text
+    assert '"edges"' not in raw_text
+    assert "avg_location" not in raw_text
+    assert '"player_summary"' in raw_text
+
+
+def test_pass_network_tab_unaffected_when_public_deployment_unset(live_api_server, monkeypatch):
+    """Explicit control for the default state: confirms the flag genuinely
+    defaults to off and the raw network still renders with real per-player
+    location data still present in the raw expander."""
+    monkeypatch.delenv("PUBLIC_DEPLOYMENT", raising=False)
+    assert api_module.PUBLIC_DEPLOYMENT is False
+    st.cache_data.clear()
+
+    at = AppTest.from_file(DASHBOARD_PATH)
+    at.run(timeout=APP_TIMEOUT_SECONDS)
+    at.sidebar.text_input[0].set_value(live_api_server)
+
+    pn_tab = at.tabs[5]
+    pn_tab.text_input[0].set_value(PASS_NETWORK_MATCH_ID)
+    at.run(timeout=APP_TIMEOUT_SECONDS)
+    pn_tab = at.tabs[5]
+    pn_tab.button[0].click()
+    at.run(timeout=APP_TIMEOUT_SECONDS)
+    pn_tab = at.tabs[5]
+
+    assert not at.exception
+    assert len(pn_tab.image) == 1
+    raw = json.loads(pn_tab.json[0].value)
+    assert "nodes" in raw
+    assert "avg_location" in raw["nodes"][0]
+
+
+def test_pass_network_tab_fails_closed_on_mismatched_flags(live_api_server, monkeypatch):
+    """Defense-in-depth check itself, under real test: dashboard.py's flag
+    says public, but the live api.py server's flag was left off. The
+    panel must refuse to render/display anything from the mismatched
+    response rather than silently show raw network data."""
+    monkeypatch.setenv("PUBLIC_DEPLOYMENT", "true")
+    # api_module.PUBLIC_DEPLOYMENT deliberately left at its real default
+    # (False) here -- this IS the misconfiguration under test.
+    assert api_module.PUBLIC_DEPLOYMENT is False
+    st.cache_data.clear()
+
+    at = AppTest.from_file(DASHBOARD_PATH)
+    at.run(timeout=APP_TIMEOUT_SECONDS)
+    at.sidebar.text_input[0].set_value(live_api_server)
+
+    pn_tab = at.tabs[5]
+    pn_tab.text_input[0].set_value(PASS_NETWORK_MATCH_ID)
+    at.run(timeout=APP_TIMEOUT_SECONDS)
+    pn_tab = at.tabs[5]
+    pn_tab.button[0].click()
+    at.run(timeout=APP_TIMEOUT_SECONDS)
+    pn_tab = at.tabs[5]
+
+    assert not at.exception
+    assert any("Configuration error" in e.value for e in pn_tab.error)
+    assert len(pn_tab.image) == 0
+    assert len(pn_tab.json) == 0
+
+
+# ============================================================================
 # Alerts History tab (ADR-019's persistence store, surfaced for the first
 # time): GET /alerts/history via api.py, same real-HTTP-through-live_api_server
 # discipline as the Player/Team Reports tabs above (ADR-018).
@@ -716,13 +837,13 @@ def test_alerts_history_tab_renders_and_filters_by_match_id_real_data(live_api_s
     at.run(timeout=APP_TIMEOUT_SECONDS)
     at.sidebar.text_input[0].set_value(live_api_server)
 
-    alerts_tab = at.tabs[5]
+    alerts_tab = at.tabs[6]
     alerts_tab.text_input[0].set_value("111")
     at.run(timeout=APP_TIMEOUT_SECONDS)
-    alerts_tab = at.tabs[5]
+    alerts_tab = at.tabs[6]
     alerts_tab.button[0].click()
     at.run(timeout=APP_TIMEOUT_SECONDS)
-    alerts_tab = at.tabs[5]
+    alerts_tab = at.tabs[6]
 
     assert not at.exception
     assert len(alerts_tab.dataframe) == 1
@@ -745,10 +866,10 @@ def test_alerts_history_tab_empty_result_shows_info_message_not_broken_table(liv
     at.run(timeout=APP_TIMEOUT_SECONDS)
     at.sidebar.text_input[0].set_value(live_api_server)
 
-    alerts_tab = at.tabs[5]
+    alerts_tab = at.tabs[6]
     alerts_tab.button[0].click()
     at.run(timeout=APP_TIMEOUT_SECONDS)
-    alerts_tab = at.tabs[5]
+    alerts_tab = at.tabs[6]
 
     assert not at.exception
     assert len(alerts_tab.dataframe) == 0
@@ -773,13 +894,13 @@ def test_alerts_history_tab_source_filter_genuinely_filters_real_data(live_api_s
     at.run(timeout=APP_TIMEOUT_SECONDS)
     at.sidebar.text_input[0].set_value(live_api_server)
 
-    alerts_tab = at.tabs[5]
+    alerts_tab = at.tabs[6]
     alerts_tab.selectbox[0].set_value("cv")
     at.run(timeout=APP_TIMEOUT_SECONDS)
-    alerts_tab = at.tabs[5]
+    alerts_tab = at.tabs[6]
     alerts_tab.button[0].click()
     at.run(timeout=APP_TIMEOUT_SECONDS)
-    alerts_tab = at.tabs[5]
+    alerts_tab = at.tabs[6]
 
     assert not at.exception
     assert len(alerts_tab.dataframe) == 1
@@ -799,13 +920,13 @@ def test_alerts_history_tab_invalid_match_id_shows_clean_error_no_crash():
     at = AppTest.from_file(DASHBOARD_PATH)
     at.run(timeout=APP_TIMEOUT_SECONDS)
 
-    alerts_tab = at.tabs[5]
+    alerts_tab = at.tabs[6]
     alerts_tab.text_input[0].set_value("not-a-number")
     at.run(timeout=APP_TIMEOUT_SECONDS)
-    alerts_tab = at.tabs[5]
+    alerts_tab = at.tabs[6]
     alerts_tab.button[0].click()
     at.run(timeout=APP_TIMEOUT_SECONDS)
-    alerts_tab = at.tabs[5]
+    alerts_tab = at.tabs[6]
 
     assert not at.exception
     assert any("must be a whole number" in e.value for e in alerts_tab.error)

@@ -49,6 +49,10 @@ from production.src.models.explainer import (
 from production.src.pipeline.feature_extractor import extract_features
 from production.src.pipeline.simulator import perturb_features
 from production.src.pipeline.survival_dataset import FEATURE_KEYS
+from production.src.reporting.pass_network import (
+    generate_pass_network,
+    generate_pass_network_aggregated,
+)
 from production.src.reporting.player_report import (
     generate_player_report,
     generate_player_shot_map,
@@ -157,6 +161,12 @@ async def lifespan(app: FastAPI):
         f"PUBLIC_DEPLOYMENT={PUBLIC_DEPLOYMENT} -- shot-map endpoint will serve "
         + ("the AGGREGATED (ADR-021 condition-2-compliant) variant only." if PUBLIC_DEPLOYMENT
            else "raw per-shot data (local/private mode -- unchanged default behavior).")
+    )
+    logger.info(
+        f"PUBLIC_DEPLOYMENT={PUBLIC_DEPLOYMENT} -- pass-network endpoint will serve "
+        + ("the AGGREGATED (ADR-021 condition-2-compliant) variant only (no player location, no "
+           "pairwise edge weight)." if PUBLIC_DEPLOYMENT
+           else "raw per-player location/pairwise edge data (local/private mode).")
     )
     logger.info(
         f"API_KEY {'is set -- protected endpoints now require a matching X-API-Key header.' if API_KEY else 'is unset -- no auth check, local/private default behavior (see ADR-022).'}"
@@ -809,6 +819,32 @@ async def get_player_shot_map(player_id: int, match_ids: list[int] = Query(...))
     if PUBLIC_DEPLOYMENT:
         return await asyncio.to_thread(generate_player_shot_map_aggregated, player_id, match_ids)
     return await asyncio.to_thread(generate_player_shot_map, player_id, match_ids)
+
+
+@app.get("/reports/pass-network/{match_id}", dependencies=[Depends(_require_api_key)])
+async def get_pass_network(match_id: int):
+    """Wraps pass_network.generate_pass_network (or, in PUBLIC_DEPLOYMENT
+    mode, generate_pass_network_aggregated), unmodified. Single `match_id`
+    path parameter, not a `match_ids` list like the other /reports/*
+    endpoints -- a pass network is inherently a per-match shape (see
+    pass_network.py's own module docstring for why aggregating it across
+    matches the way player/team reports do would not mean anything).
+
+    ADR-021 condition-2 compliance (SAME gating decision and pattern as
+    the shot-map endpoint above, decided ONCE from the module-level
+    PUBLIC_DEPLOYMENT flag, not per-request logic that could be tricked):
+    PUBLIC_DEPLOYMENT=false (default) returns generate_pass_network's real
+    per-player average location and real pairwise completed-pass edge
+    weights. PUBLIC_DEPLOYMENT=true returns generate_pass_network_aggregated's
+    per-player-totals-only variant instead -- the raw `nodes`/`edges`
+    lists are never computed at all on this path, not merely omitted from
+    an already-built response. See docs/adr/ADR-021's own addendum for the
+    full reasoning behind treating the raw pass network as RAW,
+    individually-attributable data under condition 2.
+    """
+    if PUBLIC_DEPLOYMENT:
+        return await asyncio.to_thread(generate_pass_network_aggregated, match_id)
+    return await asyncio.to_thread(generate_pass_network, match_id)
 
 
 @app.get("/reports/team/{team_name}", dependencies=[Depends(_require_api_key)])
