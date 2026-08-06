@@ -95,6 +95,7 @@ import os
 import sys
 import tempfile
 import time
+from datetime import date, timedelta
 from pathlib import Path
 
 # `streamlit run production/frontend/dashboard.py` puts THIS SCRIPT'S OWN
@@ -218,6 +219,19 @@ TEAM_REPORT_MAX_360_MATCHES_PER_REQUEST = 25
 # would remove it; out of this task's stated scope, which is a
 # dashboard/enumeration-layer change only).
 REFRESH_CACHE_LIST_TTL_SECONDS = 3600  # 1 hour -- generous; paired with a manual refresh button below for on-demand invalidation
+
+# Alerts History tab (ADR-019 persistence, surfaced here for the first time):
+# a SHORT TTL, unlike REFRESH_CACHE_LIST_TTL_SECONDS above -- that cache backs
+# a slow, mostly-static scan of data/raw/ (what candidates EXIST), while this
+# one backs a fast SQLite query over genuinely time-sensitive data (new
+# alerts can be logged continuously, e.g. by a live WebSocket stream running
+# in another session against the same backend). 30s keeps the tab from
+# re-querying on every unrelated widget interaction/tab switch (Streamlit
+# reruns the whole script on both) while still staying well under a minute
+# stale for a "check what's happened recently" panel.
+ALERTS_HISTORY_CACHE_TTL_SECONDS = 30
+ALERTS_HISTORY_REQUEST_TIMEOUT_SECONDS = 10.0  # a single indexed SQLite SELECT -- fast, not a report-generation call
+ALERTS_HISTORY_DEFAULT_LIMIT = 500  # matches fetch_alerts's own default (alert_store.py)
 
 
 @st.cache_data(show_spinner="Scanning data/raw/ for cached players/teams (one-time, ~15-20s at current cache size)...", ttl=REFRESH_CACHE_LIST_TTL_SECONDS)
@@ -377,6 +391,47 @@ def _cached_team_comparison(
     return response.json()
 
 
+# Alerts History tab: GET /alerts/history (ADR-019's persistence store, via
+# alert_store.fetch_alerts -- see api.py). Every filter param is Optional on
+# the endpoint's own side (None = no filter, AND-combined) -- `requests`
+# itself drops any dict entry whose value is None from the querystring
+# (confirmed directly, not assumed), so passing match_id/source/start_utc/
+# end_utc through unconditionally, even when a filter is unset, is correct
+# and needs no manual "only include if set" branching here.
+#
+# No `X-API-Key` header is sent -- confirmed directly that NO existing call
+# in this file sends one either (grepped this module for "X-API-Key"/
+# "headers=" before adding this). Per ADR-022, `API_KEY` is unset by
+# default (every environment this project has actually run in, including
+# its own test suite), so this is zero-friction, unchanged behavior; if an
+# operator ever sets `API_KEY` server-side without also updating this
+# dashboard to send the header, EVERY existing REST call in this file
+# (`/simulate`, `/reports/*`) would already 401 identically -- a pre-existing
+# gap this one new call does not introduce or worsen.
+@st.cache_data(show_spinner=False, ttl=ALERTS_HISTORY_CACHE_TTL_SECONDS)
+def _cached_alerts_history(
+    rest_base_url: str,
+    match_id: int | None,
+    source: str | None,
+    start_utc: str | None,
+    end_utc: str | None,
+    limit: int,
+) -> list[dict]:
+    response = requests.get(
+        f"{rest_base_url}/alerts/history",
+        params={
+            "match_id": match_id,
+            "source": source,
+            "start_utc": start_utc,
+            "end_utc": end_utc,
+            "limit": limit,
+        },
+        timeout=ALERTS_HISTORY_REQUEST_TIMEOUT_SECONDS,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
 def _fetch_report_safely(fetch_fn, rest_base_url: str) -> dict | None:
     """Calls `fetch_fn()` (a zero-arg closure around one of the `_cached_*`
     HTTP wrappers above) and returns its parsed JSON, or `None` if the
@@ -438,8 +493,8 @@ with st.sidebar:
     )
     st.divider()
 
-tab_cv, tab_player, tab_team, tab_trends, tab_compare = st.tabs(
-    ["Live CV Monitor", "Player Reports", "Team Reports", "Team Trends", "Team Comparison"]
+tab_cv, tab_player, tab_team, tab_trends, tab_compare, tab_alerts = st.tabs(
+    ["Live CV Monitor", "Player Reports", "Team Reports", "Team Trends", "Team Comparison", "Alerts History"]
 )
 
 # ============================================================================
@@ -1373,3 +1428,116 @@ with tab_compare:
 
             with st.expander("Raw comparison data"):
                 st.json(comparison)
+
+
+# ============================================================================
+# TAB: Alerts History (ADR-019's persistence store, surfaced here for the
+# first time) -- a pure UI wiring layer over GET /alerts/history, the same
+# "call api.py over HTTP, don't reimplement" principle ADR-018 established
+# for the four reporting tabs above. Read-only: this tab never logs an
+# alert itself, only fetches and displays what the Live CV Monitor's two
+# panels (or any other client) already logged via `log_alert`.
+#
+# Placed LAST, after Team Comparison, not folded into the "Live CV Monitor"
+# tab: that tab already carries the module docstring's documented
+# "PERMANENT CONSEQUENCE" (a running stream/simulation blocks the entire
+# script, every other tab included) -- adding a third, unrelated panel
+# there would only add to that same blocking surface for no benefit, since
+# this feature has no interaction with the live stream/simulator beyond
+# reading what they already persisted. A new tab keeps this read-only
+# browsing feature independent of that blocking behavior entirely, the
+# same way the four reporting tabs already are.
+# ============================================================================
+with tab_alerts:
+    st.header("Alerts History")
+    st.caption(
+        "Browse previously-logged tactical alerts (ADR-019). Both the What-If Simulator and "
+        "the Live Tactical Threat Monitor (Live CV Monitor tab) log a companion history entry "
+        "for every alert they raise -- this tab only reads that history; it never logs "
+        "anything itself."
+    )
+
+    alerts_match_id_input = st.text_input(
+        "Match ID (optional)",
+        value="",
+        help=(
+            "Free-text StatsBomb match_id, exact match only. Deliberately free text, not a "
+            "dropdown built from candidate_index.py's enumeration used elsewhere in this "
+            "dashboard: that scan reads data/raw/'s cached event files, a DIFFERENT population "
+            "from what's actually in the alerts history table below (a match_id could have "
+            "cached event data but zero alerts, or vice versa), and is a slow, ~15-20s one-time "
+            "scan besides -- a mismatched, non-cheap fit for this specific filter."
+        ),
+        key="alerts_match_id_input",
+    )
+    alerts_source_input = st.selectbox("Source", ["All", "statsbomb", "cv"], key="alerts_source_input")
+
+    alerts_filter_by_date = st.checkbox("Filter by date range", value=False, key="alerts_filter_by_date")
+    alerts_date_range = None
+    if alerts_filter_by_date:
+        alerts_date_range = st.date_input(
+            "Date range (UTC, both ends inclusive)",
+            value=(date.today() - timedelta(days=30), date.today()),
+            key="alerts_date_range",
+        )
+
+    alerts_fetch_clicked = st.button("Fetch Alert History")
+
+    if alerts_fetch_clicked:
+        alerts_match_id: int | None = None
+        alerts_match_id_error = False
+        if alerts_match_id_input.strip():
+            try:
+                alerts_match_id = int(alerts_match_id_input.strip())
+            except ValueError:
+                st.error(f"Match ID must be a whole number -- got {alerts_match_id_input!r}.")
+                alerts_match_id_error = True
+
+        if not alerts_match_id_error:
+            alerts_source = None if alerts_source_input == "All" else alerts_source_input
+
+            start_utc = end_utc = None
+            if alerts_filter_by_date and alerts_date_range and len(alerts_date_range) == 2:
+                start_date, end_date = alerts_date_range
+                # logged_at_utc is stored as datetime.now(UTC).isoformat() (alert_store.py) --
+                # always this exact "+00:00"-suffixed ISO-8601 form, which sorts correctly as
+                # plain text (fetch_alerts compares these as strings, not parsed dates). Matching
+                # that same form here, at each day's real start/end instant, is what makes the
+                # ">= start_utc" / "<= end_utc" string comparisons on the API side correct.
+                start_utc = f"{start_date.isoformat()}T00:00:00+00:00"
+                end_utc = f"{end_date.isoformat()}T23:59:59.999999+00:00"
+
+            with st.spinner("Fetching alert history..."):
+                alerts = _fetch_report_safely(
+                    lambda: _cached_alerts_history(
+                        rest_base_url, alerts_match_id, alerts_source, start_utc, end_utc,
+                        ALERTS_HISTORY_DEFAULT_LIMIT,
+                    ),
+                    rest_base_url,
+                )
+
+            if alerts is not None:
+                if len(alerts) == 0:
+                    st.info("No alerts found for the given filters.")
+                else:
+                    st.write(f"{len(alerts)} alert(s) found (most recent first).")
+                    display_df = pd.DataFrame(alerts)[[
+                        "logged_at_utc", "source", "match_id", "video_path", "minute",
+                        "threat_before", "threat_after", "delta",
+                        "explanation_text", "explanation_source",
+                    ]].rename(columns={
+                        "logged_at_utc": "Timestamp (UTC)",
+                        "source": "Source",
+                        "match_id": "Match ID",
+                        "video_path": "Video Path",
+                        "minute": "Minute",
+                        "threat_before": "Threat Before",
+                        "threat_after": "Threat After",
+                        "delta": "Delta",
+                        "explanation_text": "Explanation",
+                        "explanation_source": "Explanation Source",
+                    })
+                    st.dataframe(display_df, width="stretch")
+
+                    with st.expander("Raw alert data"):
+                        st.json(alerts)

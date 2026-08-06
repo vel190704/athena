@@ -41,6 +41,7 @@ import uvicorn
 from streamlit.testing.v1 import AppTest
 
 import production.src.serving.api as api_module
+from production.src.serving import alert_store as alert_store_module
 from production.src.serving.api import app as _fastapi_app
 
 DASHBOARD_PATH = "production/frontend/dashboard.py"
@@ -84,17 +85,18 @@ def live_api_server():
     thread.join(timeout=10)
 
 
-def test_dashboard_loads_all_five_tabs_no_exception():
+def test_dashboard_loads_all_six_tabs_no_exception():
     at = AppTest.from_file(DASHBOARD_PATH)
     at.run(timeout=APP_TIMEOUT_SECONDS)
 
     assert not at.exception
-    assert len(at.tabs) == 5
+    assert len(at.tabs) == 6
     headers = [h.value for tab in at.tabs for h in tab.header]
     assert "Player Report" in headers
     assert "Team Report" in headers
     assert "Team Trend Report (football-data.co.uk)" in headers
     assert "Team-Season Style Comparison" in headers
+    assert "Alerts History" in headers
 
 
 def test_player_reports_tab_low_sample_warning_renders_real_data(live_api_server):
@@ -667,3 +669,144 @@ def test_team_trends_tab_compare_two_seasons_real_data():
     # present and untouched -- additive, not a replacement.
     assert len(trends_tab.button) == 2
     assert len(trends_tab.text_input) == 2
+
+
+# ============================================================================
+# Alerts History tab (ADR-019's persistence store, surfaced for the first
+# time): GET /alerts/history via api.py, same real-HTTP-through-live_api_server
+# discipline as the Player/Team Reports tabs above (ADR-018).
+#
+# `_isolated_alerts_db` mirrors test_alert_store.py's own `_isolated_db`
+# fixture exactly (monkeypatching alert_store's module-level DB_DIR/DB_PATH
+# into pytest's tmp_path) so these tests never read or write the real
+# data/app_state/alerts.db -- `live_api_server` runs api.py's real FastAPI
+# app in a background thread of THIS SAME test process, so the monkeypatch
+# is visible to it too: fetch_alerts/log_alert look up DB_PATH via their
+# own defining module's globals when they run, not a copy frozen at import
+# time, regardless of how api.py imported them.
+# ============================================================================
+
+
+@pytest.fixture
+def _isolated_alerts_db(tmp_path, monkeypatch):
+    monkeypatch.setattr(alert_store_module, "DB_DIR", tmp_path / "app_state")
+    monkeypatch.setattr(alert_store_module, "DB_PATH", tmp_path / "app_state" / "alerts.db")
+
+
+def test_alerts_history_tab_renders_and_filters_by_match_id_real_data(live_api_server, _isolated_alerts_db):
+    """Two real alerts logged against match_id=111, one against a
+    different match (222) -- filtering by 111 must return exactly the two
+    matching rows, in a real, readable table (not a raw JSON dump), and
+    the raw-data expander below it must reflect that SAME filtered set."""
+    alert_store_module.log_alert(
+        source="statsbomb", match_id=111, video_path=None, minute=5.0,
+        threat_before=0.10, threat_after=0.30, explanation_text="alert A", explanation_source="mock",
+    )
+    alert_store_module.log_alert(
+        source="statsbomb", match_id=111, video_path=None, minute=10.0,
+        threat_before=0.20, threat_after=0.60, explanation_text="alert B", explanation_source="mock",
+    )
+    alert_store_module.log_alert(
+        source="cv", match_id=222, video_path="data/raw/other.mp4", minute=3.0,
+        threat_before=0.05, threat_after=0.40, explanation_text="alert C (different match)", explanation_source="gemini",
+    )
+    st.cache_data.clear()  # see the PUBLIC_DEPLOYMENT tests above for why this matters across real HTTP reruns
+
+    at = AppTest.from_file(DASHBOARD_PATH)
+    at.run(timeout=APP_TIMEOUT_SECONDS)
+    at.sidebar.text_input[0].set_value(live_api_server)
+
+    alerts_tab = at.tabs[5]
+    alerts_tab.text_input[0].set_value("111")
+    at.run(timeout=APP_TIMEOUT_SECONDS)
+    alerts_tab = at.tabs[5]
+    alerts_tab.button[0].click()
+    at.run(timeout=APP_TIMEOUT_SECONDS)
+    alerts_tab = at.tabs[5]
+
+    assert not at.exception
+    assert len(alerts_tab.dataframe) == 1
+    df = alerts_tab.dataframe[0].value
+    assert df.shape[0] == 2
+    assert set(df["Match ID"]) == {111}
+    assert set(df["Explanation"]) == {"alert A", "alert B"}
+
+    raw = json.loads(alerts_tab.json[0].value)
+    assert len(raw) == 2
+    assert all(r["match_id"] == 111 for r in raw)
+
+
+def test_alerts_history_tab_empty_result_shows_info_message_not_broken_table(live_api_server, _isolated_alerts_db):
+    """An empty, isolated alerts db -- no rows logged at all -- must render
+    a clean 'no alerts found' message, not an empty/broken dataframe."""
+    st.cache_data.clear()
+
+    at = AppTest.from_file(DASHBOARD_PATH)
+    at.run(timeout=APP_TIMEOUT_SECONDS)
+    at.sidebar.text_input[0].set_value(live_api_server)
+
+    alerts_tab = at.tabs[5]
+    alerts_tab.button[0].click()
+    at.run(timeout=APP_TIMEOUT_SECONDS)
+    alerts_tab = at.tabs[5]
+
+    assert not at.exception
+    assert len(alerts_tab.dataframe) == 0
+    assert any("No alerts found" in i.value for i in alerts_tab.info)
+
+
+def test_alerts_history_tab_source_filter_genuinely_filters_real_data(live_api_server, _isolated_alerts_db):
+    """One statsbomb alert, one cv alert -- filtering by source=cv must
+    return only the cv one, confirming the filter actually filters rather
+    than silently ignoring the selectbox and returning everything."""
+    alert_store_module.log_alert(
+        source="statsbomb", match_id=1, video_path=None, minute=1.0,
+        threat_before=0.10, threat_after=0.20, explanation_text="sb alert", explanation_source="mock",
+    )
+    alert_store_module.log_alert(
+        source="cv", match_id=None, video_path="data/raw/clip.mp4", minute=2.0,
+        threat_before=0.10, threat_after=0.50, explanation_text="cv alert", explanation_source="gemini",
+    )
+    st.cache_data.clear()
+
+    at = AppTest.from_file(DASHBOARD_PATH)
+    at.run(timeout=APP_TIMEOUT_SECONDS)
+    at.sidebar.text_input[0].set_value(live_api_server)
+
+    alerts_tab = at.tabs[5]
+    alerts_tab.selectbox[0].set_value("cv")
+    at.run(timeout=APP_TIMEOUT_SECONDS)
+    alerts_tab = at.tabs[5]
+    alerts_tab.button[0].click()
+    at.run(timeout=APP_TIMEOUT_SECONDS)
+    alerts_tab = at.tabs[5]
+
+    assert not at.exception
+    assert len(alerts_tab.dataframe) == 1
+    df = alerts_tab.dataframe[0].value
+    assert df.shape[0] == 1
+    assert df["Source"].tolist() == ["cv"]
+    assert df["Explanation"].tolist() == ["cv alert"]
+
+
+def test_alerts_history_tab_invalid_match_id_shows_clean_error_no_crash():
+    """A non-numeric Match ID must be validated BEFORE any request is
+    made -- a clean st.error, no unhandled exception, and no dataframe.
+    No live_api_server needed: this validation happens client-side, before
+    any HTTP call, the same 'no live server needed for pre-request
+    validation' convention the Team Reports tab's own pre-generation
+    warning tests above already establish."""
+    at = AppTest.from_file(DASHBOARD_PATH)
+    at.run(timeout=APP_TIMEOUT_SECONDS)
+
+    alerts_tab = at.tabs[5]
+    alerts_tab.text_input[0].set_value("not-a-number")
+    at.run(timeout=APP_TIMEOUT_SECONDS)
+    alerts_tab = at.tabs[5]
+    alerts_tab.button[0].click()
+    at.run(timeout=APP_TIMEOUT_SECONDS)
+    alerts_tab = at.tabs[5]
+
+    assert not at.exception
+    assert any("must be a whole number" in e.value for e in alerts_tab.error)
+    assert len(alerts_tab.dataframe) == 0
