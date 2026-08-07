@@ -526,3 +526,228 @@ def render_shot_map_aggregated(shot_map_aggregated_data: dict, output_path: str)
     fig.tight_layout(rect=[0, 0, 1, 0.95])
     fig.savefig(output_path, dpi=130, facecolor="white")
     plt.close(fig)
+
+
+# ============================================================================
+# Player Dashboard (additive new feature): match-level touch map + timeline
+# visualizers, over `player_report.py`'s new match-level functions -- pure
+# RENDERING layer, same discipline as every panel above. Nothing above this
+# line is modified. See `player_report.py`'s own Player Dashboard section
+# for the full ADR-021 condition-2 gating reasoning each pair below follows.
+# ============================================================================
+
+TOUCH_DOT_RADIUS_M = 2.2
+TOUCH_DOT_COLOR = "#00b4d8"
+
+
+def _draw_touch_scatter(ax, touches: list[dict], match_id: int, low_sample: bool) -> None:
+    draw_pitch_outline(ax)
+    ax.set_title(f"Touch map ({len(touches)} touches) -- match_id={match_id}", color="white", fontsize=11)
+
+    if not touches:
+        ax.text(PITCH_LENGTH / 2, PITCH_WIDTH / 2, "No touch data", color="white", ha="center", va="center")
+        return
+
+    if low_sample:
+        ax.text(
+            PITCH_LENGTH / 2, PITCH_WIDTH + 5,
+            f"LOW SAMPLE ({len(touches)} touch{'es' if len(touches) != 1 else ''}) -- not a confident pattern",
+            color="#ff4444", ha="center", va="bottom", fontsize=8, fontweight="bold", zorder=5,
+        )
+
+    xs = [t["location"][0] for t in touches]
+    ys = [t["location"][1] for t in touches]
+    ax.scatter(
+        xs, ys, s=TOUCH_DOT_RADIUS_M**2 * 12, color=TOUCH_DOT_COLOR, edgecolors="black",
+        linewidths=0.5, alpha=0.7, zorder=3,
+    )
+
+
+def _draw_touch_map_stats(ax, touch_map: dict) -> None:
+    ax.axis("off")
+    lines = [
+        f"Player ID: {touch_map['player_id']}",
+        f"Match ID: {touch_map['match_id']}",
+        "",
+        f"Total touches: {touch_map['total_touches']}",
+    ]
+    ax.text(
+        0.02, 0.98, "\n".join(lines), transform=ax.transAxes, va="top", ha="left",
+        fontsize=10, color="black", family="monospace",
+    )
+
+
+def render_player_match_touch_map(touch_map_data: dict, output_path: str) -> None:
+    """Renders `player_report.generate_player_match_touch_map`'s output:
+    a full-pitch scatter of every individual touch location for one
+    player, one match (left), and a small stats sidebar (right).
+
+    ADR-021 condition 2 (no raw StatsBomb data exposed to PUBLIC
+    deployments): this function plots each individual touch's exact
+    location, so it must only ever be called for LOCAL/private use --
+    `render_player_match_touch_map_aggregated` below is the PUBLIC-
+    deployment counterpart. Not gated inside this function itself (that
+    decision belongs to the caller -- see `api.py`'s `PUBLIC_DEPLOYMENT`
+    flag and `dashboard.py`'s touch-map panel).
+    """
+    fig = plt.figure(figsize=(12, 7))
+    fig.suptitle(f"Touch Map -- player_id={touch_map_data['player_id']}", fontsize=15, y=0.98)
+
+    grid = GridSpec(1, 2, width_ratios=[1.6, 1.0], figure=fig)
+
+    ax_touches = fig.add_subplot(grid[0, 0])
+    _draw_touch_scatter(
+        ax_touches, touch_map_data.get("touches", []), touch_map_data["match_id"],
+        touch_map_data.get("touch_map_used_low_sample_flag", False),
+    )
+
+    ax_stats = fig.add_subplot(grid[0, 1])
+    _draw_touch_map_stats(ax_stats, touch_map_data)
+
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
+    fig.savefig(output_path, dpi=130, facecolor="white")
+    plt.close(fig)
+
+
+def _draw_touch_density_heatmap(ax, touch_density_grid: list[list[float]], match_id: int, total_touches: int, low_sample: bool) -> None:
+    draw_pitch_outline(ax)
+    ax.set_title(f"Touch density (aggregated, {total_touches} touches) -- match_id={match_id}", color="white", fontsize=11)
+
+    grid = np.array(touch_density_grid)
+    if grid.sum() == 0:
+        ax.text(PITCH_LENGTH / 2, PITCH_WIDTH / 2, "No touch data", color="white", ha="center", va="center")
+        return
+
+    smoothed = gaussian_filter(grid, sigma=HEATMAP_GAUSSIAN_SIGMA)
+    ax.imshow(
+        smoothed.T, extent=[0, PITCH_LENGTH, 0, PITCH_WIDTH], origin="lower",
+        cmap="hot", alpha=0.75, aspect="auto", zorder=2,
+    )
+
+    if low_sample:
+        ax.text(
+            PITCH_LENGTH / 2, PITCH_WIDTH + 5,
+            f"LOW SAMPLE ({total_touches} touch{'es' if total_touches != 1 else ''}) -- not a confident pattern",
+            color="#ff4444", ha="center", va="bottom", fontsize=8, fontweight="bold", zorder=5,
+        )
+
+
+def render_player_match_touch_map_aggregated(touch_map_aggregated_data: dict, output_path: str) -> None:
+    """Renders `player_report.generate_player_match_touch_map_aggregated`'s
+    output: a single grid-binned touch-density heatmap for one player, one
+    match -- no individual touch marker anywhere. The PUBLIC-deployment
+    counterpart to `render_player_match_touch_map` above (ADR-021
+    condition 2).
+    """
+    fig = plt.figure(figsize=(12, 7))
+    fig.suptitle(
+        f"Touch Map (aggregated) -- player_id={touch_map_aggregated_data['player_id']}", fontsize=15, y=0.98
+    )
+
+    grid = GridSpec(1, 2, width_ratios=[1.6, 1.0], figure=fig)
+
+    ax_density = fig.add_subplot(grid[0, 0])
+    _draw_touch_density_heatmap(
+        ax_density,
+        touch_map_aggregated_data.get("touch_density_grid", [[0.0] * GRID_ROWS] * GRID_COLS),
+        touch_map_aggregated_data["match_id"],
+        touch_map_aggregated_data.get("total_touches", 0),
+        touch_map_aggregated_data.get("touch_map_used_low_sample_flag", False),
+    )
+
+    ax_stats = fig.add_subplot(grid[0, 1])
+    _draw_touch_map_stats(ax_stats, touch_map_aggregated_data)
+
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
+    fig.savefig(output_path, dpi=130, facecolor="white")
+    plt.close(fig)
+
+
+# --- Key-event timeline (RAW + aggregated) ---------------------------------
+
+_TIMELINE_EVENT_TYPE_COLOR = "#ffcc00"
+
+
+def render_player_match_timeline(timeline_data: dict, output_path: str) -> None:
+    """Renders `player_report.generate_player_match_timeline`'s output: a
+    per-event strip plot -- x-axis = match minute, y-axis = event type
+    (categorical) -- one marker per individually-enumerated tagged event.
+
+    ADR-021 condition 2: this function plots one marker per RAW,
+    individually-enumerated event (an "interactive table of raw events" in
+    visual form), so it must only ever be called for LOCAL/private use --
+    `render_player_match_timeline_aggregated` below is the PUBLIC-
+    deployment counterpart. Not gated inside this function itself (see
+    `api.py`'s `PUBLIC_DEPLOYMENT` flag and `dashboard.py`'s timeline
+    panel).
+    """
+    timeline = timeline_data.get("timeline", [])
+    fig, ax = plt.subplots(figsize=(12, 5))
+    ax.set_title(
+        f"Key-Event Timeline -- player_id={timeline_data['player_id']}, "
+        f"match_id={timeline_data['match_id']} ({len(timeline)} events)",
+        fontsize=12,
+    )
+
+    if not timeline:
+        ax.text(0.5, 0.5, "No event data", ha="center", va="center", transform=ax.transAxes)
+        fig.savefig(output_path, dpi=130, facecolor="white")
+        plt.close(fig)
+        return
+
+    event_types = sorted({e["event_type"] for e in timeline})
+    type_to_y = {t: i for i, t in enumerate(event_types)}
+
+    xs = [e["minute"] for e in timeline]
+    ys = [type_to_y[e["event_type"]] for e in timeline]
+    ax.scatter(xs, ys, color=_TIMELINE_EVENT_TYPE_COLOR, edgecolors="black", linewidths=0.5, s=40, zorder=3)
+
+    ax.set_yticks(range(len(event_types)))
+    ax.set_yticklabels(event_types, fontsize=8)
+    ax.set_xlabel("Match minute", fontsize=9)
+    ax.grid(axis="x", alpha=0.3)
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=130, facecolor="white")
+    plt.close(fig)
+
+
+def render_player_match_timeline_aggregated(timeline_aggregated_data: dict, output_path: str) -> None:
+    """Renders `player_report.generate_player_match_timeline_aggregated`'s
+    output: a stacked bar chart of event-TYPE counts per coarse time
+    bucket -- no individual event's exact minute or outcome detail is ever
+    plotted, matching that function's own return dict (which never
+    includes them). The PUBLIC-deployment counterpart to
+    `render_player_match_timeline` above (ADR-021 condition 2).
+    """
+    buckets = timeline_aggregated_data.get("buckets", [])
+    fig, ax = plt.subplots(figsize=(12, 5))
+    ax.set_title(
+        f"Key-Event Timeline (aggregated) -- player_id={timeline_aggregated_data['player_id']}, "
+        f"match_id={timeline_aggregated_data['match_id']}",
+        fontsize=12,
+    )
+
+    if not buckets:
+        ax.text(0.5, 0.5, "No event data", ha="center", va="center", transform=ax.transAxes)
+        fig.savefig(output_path, dpi=130, facecolor="white")
+        plt.close(fig)
+        return
+
+    event_types = sorted({t for b in buckets for t in b["event_type_counts"]})
+    bucket_labels = [f"{b['bucket_start_minute']:.0f}-{b['bucket_end_minute']:.0f}" for b in buckets]
+    cmap = plt.get_cmap("tab20")
+
+    bottoms = [0] * len(buckets)
+    for i, event_type in enumerate(event_types):
+        counts = [b["event_type_counts"].get(event_type, 0) for b in buckets]
+        ax.bar(bucket_labels, counts, bottom=bottoms, label=event_type, color=cmap(i % 20))
+        bottoms = [bt + c for bt, c in zip(bottoms, counts, strict=True)]
+
+    ax.set_xlabel("Match minute bucket", fontsize=9)
+    ax.set_ylabel("Event count", fontsize=9)
+    ax.legend(fontsize=6, ncol=2, loc="upper right")
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=130, facecolor="white")
+    plt.close(fig)

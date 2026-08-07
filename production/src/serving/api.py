@@ -54,6 +54,11 @@ from production.src.reporting.pass_network import (
     generate_pass_network_aggregated,
 )
 from production.src.reporting.player_report import (
+    generate_player_match_summary,
+    generate_player_match_timeline,
+    generate_player_match_timeline_aggregated,
+    generate_player_match_touch_map,
+    generate_player_match_touch_map_aggregated,
     generate_player_report,
     generate_player_shot_map,
     generate_player_shot_map_aggregated,
@@ -134,6 +139,14 @@ _model_run_id: str | None = None
 _startup_monotonic: float | None = None
 _total_http_requests_received = 0
 _active_websocket_connections = 0
+# Aug 2026 OOM-incident fix companion flag -- see `lifespan`'s own comment
+# on `_model`'s idempotency guard for the full reasoning; applied here to
+# the YOLO checkpoint warm-up for the same reason (a real server process
+# warms it exactly once; `production/tests/` re-entering `lifespan` many
+# times within one process was re-deserializing the checkpoint file on
+# every entry for no behavioral benefit -- the checkpoint's already local
+# after the first warm-up, in a real server OR a test process alike).
+_yolo_checkpoint_warmed = False
 
 
 async def _require_api_key(x_api_key: str | None = Header(default=None)) -> None:
@@ -154,9 +167,28 @@ async def _require_api_key(x_api_key: str | None = Header(default=None)) -> None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _model, _normalization_mean, _normalization_std, _model_run_id, _startup_monotonic
-    _model, _normalization_mean, _normalization_std, _model_run_id = load_deterministic_mlp()
-    logger.info(f"Live inference server ready. Loaded MLP run_id={_model_run_id}")
+    global _model, _normalization_mean, _normalization_std, _model_run_id, _startup_monotonic, _yolo_checkpoint_warmed
+    # Idempotency guard (Aug 2026 OOM-incident fix): a REAL server process
+    # only ever enters this function once, for its whole lifetime -- this
+    # guard is a no-op there. It matters for `production/tests/`, where
+    # `with TestClient(app) as client:` re-triggers this SAME lifespan
+    # function on the SAME already-imported `app`/module globals every
+    # time it's used (test_api.py alone does this 36 times; test_simulate_api.py
+    # 4 more) -- `load_deterministic_mlp()` is deterministic (same run_id,
+    # same weights, every call, per its own name), so a fresh reload on
+    # the 2nd-36th call was always redundant work, not fresh state, adding
+    # real -- if measured smaller than initially assumed, see this
+    # incident's own write-up -- memory/wall-clock cost across a full
+    # suite run for zero behavioral benefit. Guarded on `_model` (not a
+    # separate flag): `None` really does mean "never loaded in this
+    # process," and no test anywhere sets `api_module._model` back to
+    # `None` to force a genuine reload (confirmed by direct search before
+    # relying on this).
+    if _model is None:
+        _model, _normalization_mean, _normalization_std, _model_run_id = load_deterministic_mlp()
+        logger.info(f"Live inference server ready. Loaded MLP run_id={_model_run_id}")
+    else:
+        logger.info(f"Model already loaded (run_id={_model_run_id}) -- skipping redundant reload.")
     logger.info(
         f"PUBLIC_DEPLOYMENT={PUBLIC_DEPLOYMENT} -- shot-map endpoint will serve "
         + ("the AGGREGATED (ADR-021 condition-2-compliant) variant only." if PUBLIC_DEPLOYMENT
@@ -167,6 +199,13 @@ async def lifespan(app: FastAPI):
         + ("the AGGREGATED (ADR-021 condition-2-compliant) variant only (no player location, no "
            "pairwise edge weight)." if PUBLIC_DEPLOYMENT
            else "raw per-player location/pairwise edge data (local/private mode).")
+    )
+    logger.info(
+        f"PUBLIC_DEPLOYMENT={PUBLIC_DEPLOYMENT} -- player touch-map/timeline endpoints will serve "
+        + ("the AGGREGATED (ADR-021 condition-2-compliant) variants only (no individual touch "
+           "location, no individually-enumerated event)." if PUBLIC_DEPLOYMENT
+           else "raw per-touch location / per-event timeline data (local/private mode). Match "
+           "summary is unaffected -- it is unconditionally aggregate, never gated.")
     )
     logger.info(
         f"API_KEY {'is set -- protected endpoints now require a matching X-API-Key header.' if API_KEY else 'is unset -- no auth check, local/private default behavior (see ADR-022).'}"
@@ -185,9 +224,13 @@ async def lifespan(app: FastAPI):
     # DOES buy: the checkpoint FILE is downloaded/deserialized once here,
     # so every later per-connection `CVPipeline()` construction is fast
     # (loading already-local weights), not a fresh cold-start each time.
-    logger.info(f"Warming CV model checkpoint {CV_MODEL_CHECKPOINT} ...")
-    YOLO(CV_MODEL_CHECKPOINT)
-    logger.info("CV model checkpoint ready.")
+    if not _yolo_checkpoint_warmed:
+        logger.info(f"Warming CV model checkpoint {CV_MODEL_CHECKPOINT} ...")
+        YOLO(CV_MODEL_CHECKPOINT)
+        _yolo_checkpoint_warmed = True
+        logger.info("CV model checkpoint ready.")
+    else:
+        logger.info(f"CV model checkpoint {CV_MODEL_CHECKPOINT} already warmed -- skipping redundant reload.")
 
     # ADR-019 (Stage 2 persistence): ensure the alert-history schema exists
     # before any connection could fire an alert. `init_db()` is also called
@@ -819,6 +862,57 @@ async def get_player_shot_map(player_id: int, match_ids: list[int] = Query(...))
     if PUBLIC_DEPLOYMENT:
         return await asyncio.to_thread(generate_player_shot_map_aggregated, player_id, match_ids)
     return await asyncio.to_thread(generate_player_shot_map, player_id, match_ids)
+
+
+@app.get("/reports/player/{player_id}/match-summary", dependencies=[Depends(_require_api_key)])
+async def get_player_match_summary(player_id: int, match_ids: list[int] = Query(...)):
+    """Wraps player_report.generate_player_match_summary, unmodified.
+
+    ADR-021 condition 2: NOT gated by PUBLIC_DEPLOYMENT -- per-match TOTALS
+    only (minutes, event-type counts), the same aggregate-count class of
+    data /reports/player/{player_id} already serves unconditionally, just
+    broken out per match instead of summed across all of them. See
+    player_report.py's own Player Dashboard section for the full Step 0
+    reasoning.
+    """
+    return await asyncio.to_thread(generate_player_match_summary, player_id, match_ids)
+
+
+@app.get("/reports/player/{player_id}/match/{match_id}/touch-map", dependencies=[Depends(_require_api_key)])
+async def get_player_match_touch_map(player_id: int, match_id: int):
+    """Wraps player_report.generate_player_match_touch_map (or, in
+    PUBLIC_DEPLOYMENT mode, generate_player_match_touch_map_aggregated),
+    unmodified. Single `match_id` path parameter, not a `match_ids` list --
+    a touch map is inherently a per-match view (see pass_network.py's own
+    precedent for the same single-match-scope reasoning).
+
+    ADR-021 condition-2 compliance (SAME gating pattern as the shot-map/
+    pass-network endpoints above): PUBLIC_DEPLOYMENT=false (default)
+    returns real per-touch locations. PUBLIC_DEPLOYMENT=true returns the
+    grid-binned aggregated variant instead -- the raw `touches` list is
+    never computed at all on this path.
+    """
+    if PUBLIC_DEPLOYMENT:
+        return await asyncio.to_thread(generate_player_match_touch_map_aggregated, player_id, match_id)
+    return await asyncio.to_thread(generate_player_match_touch_map, player_id, match_id)
+
+
+@app.get("/reports/player/{player_id}/match/{match_id}/timeline", dependencies=[Depends(_require_api_key)])
+async def get_player_match_timeline(player_id: int, match_id: int):
+    """Wraps player_report.generate_player_match_timeline (or, in
+    PUBLIC_DEPLOYMENT mode, generate_player_match_timeline_aggregated),
+    unmodified. Single `match_id` path parameter -- same per-match scope
+    reasoning as the touch-map endpoint above.
+
+    ADR-021 condition-2 compliance: PUBLIC_DEPLOYMENT=false (default)
+    returns the real, individually-enumerated per-event timeline.
+    PUBLIC_DEPLOYMENT=true returns only event-TYPE counts per coarse time
+    bucket -- the raw `timeline` list (and every individual event's exact
+    minute/outcome/body-part detail) is never computed at all on this path.
+    """
+    if PUBLIC_DEPLOYMENT:
+        return await asyncio.to_thread(generate_player_match_timeline_aggregated, player_id, match_id)
+    return await asyncio.to_thread(generate_player_match_timeline, player_id, match_id)
 
 
 @app.get("/reports/pass-network/{match_id}", dependencies=[Depends(_require_api_key)])

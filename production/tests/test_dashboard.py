@@ -130,10 +130,11 @@ def test_player_reports_tab_low_sample_warning_renders_real_data(live_api_server
     assert not at.exception
     assert len(player_tab.warning) >= 1
     assert any("LOW SAMPLE" in w.value for w in player_tab.warning)
-    # 2 images now, not 1: the original player-report dashboard image plus
-    # the new, additive Shot Map image (rendered in its own section below
-    # the existing report -- see generate_player_shot_map/render_shot_map).
-    assert len(player_tab.image) == 2
+    # 4 images now, not 2: player report + Shot Map + the Player Dashboard's
+    # own additive Touch Map + Key-Event Timeline (rendered in their own
+    # section below the existing report -- see player_report.py's Player
+    # Dashboard section / dashboard.py's own comment for why).
+    assert len(player_tab.image) == 4
 
 
 def test_player_reports_tab_well_supported_no_false_positive_warning_real_data(live_api_server):
@@ -158,9 +159,9 @@ def test_player_reports_tab_well_supported_no_false_positive_warning_real_data(l
 
     assert not at.exception
     assert len(player_tab.warning) == 0
-    # 2 images now, not 1: the original player-report dashboard image plus
-    # the new, additive Shot Map image (see comment above).
-    assert len(player_tab.image) == 2
+    # 4 images now: player report + Shot Map + Touch Map + Key-Event
+    # Timeline (see comment above).
+    assert len(player_tab.image) == 4
 
 
 # ============================================================================
@@ -210,20 +211,23 @@ def test_player_reports_shot_map_panel_renders_aggregated_when_public_deployment
     # No "Configuration error" fail-closed message -- both flags agree, so
     # the dashboard's defense-in-depth check must not trip.
     assert not any("Configuration error" in e.value for e in player_tab.error)
-    # Still exactly 2 images: the player-report image, plus ONE shot-map
-    # image (the aggregated-grid render, not the raw scatter).
-    assert len(player_tab.image) == 2
+    # 4 images now: player report, shot map (aggregated-grid render, not
+    # the raw scatter), Touch Map (aggregated), Key-Event Timeline
+    # (aggregated) -- the Player Dashboard section's own two panels are
+    # ALSO gated and ALSO agree with PUBLIC_DEPLOYMENT here.
+    assert len(player_tab.image) == 4
 
-    # The shot map's OWN raw-data JSON expander (rendered after the player
-    # report's own "Raw report data" expander) is the last st.json call on
-    # this tab -- parse the ACTUAL rendered JSON text, not the underlying
-    # dict the endpoint returned, to confirm no per-shot field reached the
-    # page.
-    shot_map_json = json.loads(player_tab.json[-1].value)
+    # The shot map's OWN raw-data JSON expander is the SECOND st.json call
+    # on this tab (index 1: player report's own "Raw report data" comes
+    # first, then shot map's, then the Player Dashboard section's match
+    # summary/touch map/timeline expanders) -- parse the ACTUAL rendered
+    # JSON text, not the underlying dict the endpoint returned, to confirm
+    # no per-shot field reached the page.
+    shot_map_json = json.loads(player_tab.json[1].value)
     assert "shots" not in shot_map_json
     assert "shot_density_grid" in shot_map_json
     assert "mean_xg_grid" in shot_map_json
-    assert '"shots"' not in player_tab.json[-1].value  # raw-text belt-and-suspenders, same as the API-level test
+    assert '"shots"' not in player_tab.json[1].value  # raw-text belt-and-suspenders, same as the API-level test
 
 
 def test_player_reports_shot_map_panel_unaffected_when_public_deployment_unset(live_api_server, monkeypatch):
@@ -251,8 +255,14 @@ def test_player_reports_shot_map_panel_unaffected_when_public_deployment_unset(l
     player_tab = at.tabs[1]
 
     assert not at.exception
-    assert len(player_tab.image) == 2
-    shot_map_json = json.loads(player_tab.json[-1].value)
+    # 4 images now: player report, shot map (raw scatter), Touch Map
+    # (raw), Key-Event Timeline (raw) -- the Player Dashboard section's
+    # own two panels are unaffected by this flag too, same as shot map.
+    assert len(player_tab.image) == 4
+    # Shot map's own raw-data expander is the SECOND st.json call on this
+    # tab now (index 1) -- see the flag-agree test above for the full
+    # ordering explanation.
+    shot_map_json = json.loads(player_tab.json[1].value)
     assert "shots" in shot_map_json
     assert len(shot_map_json["shots"]) == shot_map_json["total_shots"] > 0
 
@@ -284,11 +294,169 @@ def test_player_reports_shot_map_panel_fails_closed_on_mismatched_flags(live_api
     player_tab = at.tabs[1]
 
     assert not at.exception
-    assert any("Configuration error" in e.value for e in player_tab.error)
-    # Only the ORIGINAL player-report image may render -- no shot-map
-    # image (raw or aggregated) and no raw-data expander for it at all.
+    # 3 configuration errors now: shot map, Touch Map, and Key-Event
+    # Timeline all independently fail closed under this same mismatch
+    # (each runs its own defense-in-depth check -- see dashboard.py's
+    # Player Dashboard section).
+    config_errors = [e.value for e in player_tab.error if "Configuration error" in e.value]
+    assert len(config_errors) == 3
+    # Only the ORIGINAL player-report image may render -- no shot-map,
+    # Touch Map, or Timeline image (raw or aggregated) anywhere.
     assert len(player_tab.image) == 1
-    assert len(player_tab.json) == 1  # only the player report's own expander, not a second one for the shot map
+    # 2 raw-data expanders, not 1: the player report's own, PLUS the
+    # Player Dashboard's match-summary table -- that panel is
+    # UNCONDITIONALLY aggregate (ADR-021: never gated, see
+    # player_report.py's own Player Dashboard section), so it renders
+    # regardless of this mismatch; shot map/Touch Map/Timeline each
+    # contribute zero expanders here since all three failed closed.
+    assert len(player_tab.json) == 2
+
+
+# ============================================================================
+# Player Dashboard (additive new feature, on top of the existing Player
+# Reports tab): match-by-match summary table (not gated), touch map + key-
+# event timeline (both ADR-021-gated, same pattern as the Shot Map panel
+# above). All four tests here select Messi's EARLIEST cached season only
+# (2004/2005), not his full career -- a deliberate, lighter real-data
+# selection (matches this repo's own memory constraints on the night this
+# feature was built; still real, non-trivial data, just smaller) rather
+# than the shot-map tests' default full-career selection.
+# ============================================================================
+
+
+def test_player_dashboard_renders_real_data_default_local_private(live_api_server):
+    at = AppTest.from_file(DASHBOARD_PATH)
+    at.run(timeout=APP_TIMEOUT_SECONDS)
+    at.sidebar.text_input[0].set_value(live_api_server)
+
+    player_tab = at.tabs[1]
+    messi_label = next(o for o in player_tab.selectbox[0].options if "(5503)" in o)
+    player_tab.selectbox[0].set_value(messi_label)
+    at.run(timeout=APP_TIMEOUT_SECONDS)
+    player_tab = at.tabs[1]
+    season_multiselect = player_tab.multiselect[0]
+    early_season_label = next(o for o in season_multiselect.options if "2004/2005" in o)
+    season_multiselect.set_value([early_season_label])
+    at.run(timeout=APP_TIMEOUT_SECONDS)
+    player_tab = at.tabs[1]
+    player_tab.button[0].click()
+    at.run(timeout=APP_TIMEOUT_SECONDS)
+    player_tab = at.tabs[1]
+
+    assert not at.exception
+    assert len(player_tab.error) == 0
+    # 4 images: player report, shot map, touch map, timeline.
+    assert len(player_tab.image) == 4
+    assert len(player_tab.dataframe) == 1  # the match summary table
+    # A second selectbox (match_id for the match-level views), alongside
+    # the player-selector selectbox.
+    assert len(player_tab.selectbox) == 2
+
+
+def test_player_dashboard_touch_map_and_timeline_render_aggregated_when_public_deployment_set(live_api_server, monkeypatch):
+    """Both flags set consistently: the touch map and timeline panels
+    must both render their AGGREGATED variant, with no raw per-touch
+    location or raw per-event timeline anywhere in their raw-data
+    expanders -- same defense-in-depth pattern as the Shot Map panel's own
+    equivalent test above."""
+    monkeypatch.setattr(api_module, "PUBLIC_DEPLOYMENT", True)
+    monkeypatch.setenv("PUBLIC_DEPLOYMENT", "true")
+    st.cache_data.clear()
+
+    at = AppTest.from_file(DASHBOARD_PATH)
+    at.run(timeout=APP_TIMEOUT_SECONDS)
+    at.sidebar.text_input[0].set_value(live_api_server)
+
+    player_tab = at.tabs[1]
+    messi_label = next(o for o in player_tab.selectbox[0].options if "(5503)" in o)
+    player_tab.selectbox[0].set_value(messi_label)
+    at.run(timeout=APP_TIMEOUT_SECONDS)
+    player_tab = at.tabs[1]
+    season_multiselect = player_tab.multiselect[0]
+    early_season_label = next(o for o in season_multiselect.options if "2004/2005" in o)
+    season_multiselect.set_value([early_season_label])
+    at.run(timeout=APP_TIMEOUT_SECONDS)
+    player_tab = at.tabs[1]
+    player_tab.button[0].click()
+    at.run(timeout=APP_TIMEOUT_SECONDS)
+    player_tab = at.tabs[1]
+
+    assert not at.exception
+    assert not any("Configuration error" in e.value for e in player_tab.error)
+    assert len(player_tab.image) == 4  # still 4: aggregated variants replace raw ones 1:1, none dropped
+
+    json_texts = [j.value for j in player_tab.json]
+    assert not any('"touches"' in t for t in json_texts)
+    assert not any('"timeline"' in t for t in json_texts)
+    assert any('"touch_density_grid"' in t for t in json_texts)
+    assert any('"buckets"' in t for t in json_texts)
+
+
+def test_player_dashboard_touch_map_and_timeline_unaffected_when_public_deployment_unset(live_api_server, monkeypatch):
+    """Explicit control for the default state: confirms the flag genuinely
+    defaults to off and the raw touch map/timeline still render, with real
+    per-touch/per-event data still present in their raw-data expanders."""
+    monkeypatch.delenv("PUBLIC_DEPLOYMENT", raising=False)
+    assert api_module.PUBLIC_DEPLOYMENT is False
+    st.cache_data.clear()
+
+    at = AppTest.from_file(DASHBOARD_PATH)
+    at.run(timeout=APP_TIMEOUT_SECONDS)
+    at.sidebar.text_input[0].set_value(live_api_server)
+
+    player_tab = at.tabs[1]
+    messi_label = next(o for o in player_tab.selectbox[0].options if "(5503)" in o)
+    player_tab.selectbox[0].set_value(messi_label)
+    at.run(timeout=APP_TIMEOUT_SECONDS)
+    player_tab = at.tabs[1]
+    season_multiselect = player_tab.multiselect[0]
+    early_season_label = next(o for o in season_multiselect.options if "2004/2005" in o)
+    season_multiselect.set_value([early_season_label])
+    at.run(timeout=APP_TIMEOUT_SECONDS)
+    player_tab = at.tabs[1]
+    player_tab.button[0].click()
+    at.run(timeout=APP_TIMEOUT_SECONDS)
+    player_tab = at.tabs[1]
+
+    assert not at.exception
+    assert len(player_tab.image) == 4
+    json_texts = [j.value for j in player_tab.json]
+    assert any('"touches"' in t for t in json_texts)
+    assert any('"timeline"' in t for t in json_texts)
+
+
+def test_player_dashboard_touch_map_and_timeline_fail_closed_on_mismatched_flags(live_api_server, monkeypatch):
+    """Dashboard says public, server says private -- both the touch map
+    and timeline panels must refuse to render/display anything, same
+    fail-closed discipline as the Shot Map panel's own equivalent test."""
+    monkeypatch.setenv("PUBLIC_DEPLOYMENT", "true")
+    assert api_module.PUBLIC_DEPLOYMENT is False
+    st.cache_data.clear()
+
+    at = AppTest.from_file(DASHBOARD_PATH)
+    at.run(timeout=APP_TIMEOUT_SECONDS)
+    at.sidebar.text_input[0].set_value(live_api_server)
+
+    player_tab = at.tabs[1]
+    messi_label = next(o for o in player_tab.selectbox[0].options if "(5503)" in o)
+    player_tab.selectbox[0].set_value(messi_label)
+    at.run(timeout=APP_TIMEOUT_SECONDS)
+    player_tab = at.tabs[1]
+    season_multiselect = player_tab.multiselect[0]
+    early_season_label = next(o for o in season_multiselect.options if "2004/2005" in o)
+    season_multiselect.set_value([early_season_label])
+    at.run(timeout=APP_TIMEOUT_SECONDS)
+    player_tab = at.tabs[1]
+    player_tab.button[0].click()
+    at.run(timeout=APP_TIMEOUT_SECONDS)
+    player_tab = at.tabs[1]
+
+    assert not at.exception
+    # 3 configuration errors: shot map, touch map, timeline all fail closed.
+    config_errors = [e.value for e in player_tab.error if "Configuration error" in e.value]
+    assert len(config_errors) == 3
+    # Only the original player-report image renders.
+    assert len(player_tab.image) == 1
 
 
 def test_team_trends_tab_disabled_when_public_deployment_set(monkeypatch):

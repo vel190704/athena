@@ -734,6 +734,114 @@ def test_pass_network_endpoint_no_data_for_unfetchable_match():
 
 
 # ============================================================================
+# Player Dashboard (additive new feature, on top of Milestone 40's Player
+# Report): match-level views. Match Summary is unconditionally aggregate
+# (ADR-021: NOT gated by PUBLIC_DEPLOYMENT). Touch Map and Timeline follow
+# the SAME shot-map/pass-network gating pattern, applied here.
+# ============================================================================
+
+PLAYER_DASHBOARD_MATCH_ID = 3857264  # Messi, Argentina vs. Poland -- 272 real tagged events
+
+
+def test_player_match_summary_endpoint_real_data_not_gated():
+    """Unconditionally aggregate -- no PUBLIC_DEPLOYMENT check needed or
+    applied; real per-match totals for Messi's Argentina/Poland match."""
+    with TestClient(app) as client:
+        response = client.get(
+            f"/reports/player/{MESSI_PLAYER_ID}/match-summary",
+            params={"match_ids": ARGENTINA_MATCH_IDS},
+        )
+    assert response.status_code == 200
+    summary = response.json()
+    assert summary["matches_player_appeared_in"] == len(ARGENTINA_MATCH_IDS)
+    match = next(m for m in summary["matches"] if m["match_id"] == PLAYER_DASHBOARD_MATCH_ID)
+    assert match["event_type_counts"]["Pass"] == 70
+
+
+def test_player_match_touch_map_endpoint_default_serves_raw_real_data():
+    """Flag unset (the default): real per-touch locations for match
+    3857264 (Argentina vs. Poland, 272 real touches)."""
+    with TestClient(app) as client:
+        response = client.get(f"/reports/player/{MESSI_PLAYER_ID}/match/{PLAYER_DASHBOARD_MATCH_ID}/touch-map")
+    assert response.status_code == 200
+    touch_map = response.json()
+    assert touch_map["total_touches"] == 272
+    assert len(touch_map["touches"]) == 272
+    assert "touch_density_grid" not in touch_map
+
+
+def test_player_match_touch_map_endpoint_public_deployment_serves_aggregated_only_no_raw_leak(monkeypatch):
+    """Same raw-HTTP-text-search discipline as the shot map's/pass
+    network's own equivalent tests: with PUBLIC_DEPLOYMENT=True, no
+    individual touch location may appear ANYWHERE in the response."""
+    monkeypatch.setattr(api_module, "PUBLIC_DEPLOYMENT", True)
+    with TestClient(app) as client:
+        response = client.get(f"/reports/player/{MESSI_PLAYER_ID}/match/{PLAYER_DASHBOARD_MATCH_ID}/touch-map")
+    assert response.status_code == 200
+    raw_body_text = response.text
+    touch_map = json.loads(raw_body_text)
+
+    assert "touches" not in touch_map
+    assert "touch_density_grid" in touch_map
+    assert touch_map["total_touches"] == 272
+    assert '"touches"' not in raw_body_text
+
+
+def test_player_match_timeline_endpoint_default_serves_raw_real_data():
+    with TestClient(app) as client:
+        response = client.get(f"/reports/player/{MESSI_PLAYER_ID}/match/{PLAYER_DASHBOARD_MATCH_ID}/timeline")
+    assert response.status_code == 200
+    timeline = response.json()
+    assert timeline["total_events"] == 272
+    assert len(timeline["timeline"]) == 272
+    assert "buckets" not in timeline
+
+
+def test_player_match_timeline_endpoint_public_deployment_serves_aggregated_only_no_raw_leak(monkeypatch):
+    """Same discipline as the touch-map test above: with
+    PUBLIC_DEPLOYMENT=True, no individually-enumerated event (exact
+    minute, outcome, body part) may appear ANYWHERE in the response --
+    condition 2 bans "an interactive table of raw events" even without a
+    location field, so this checks for the RAW SHAPE, not just a
+    location-specific substring."""
+    monkeypatch.setattr(api_module, "PUBLIC_DEPLOYMENT", True)
+    with TestClient(app) as client:
+        response = client.get(f"/reports/player/{MESSI_PLAYER_ID}/match/{PLAYER_DASHBOARD_MATCH_ID}/timeline")
+    assert response.status_code == 200
+    raw_body_text = response.text
+    timeline = json.loads(raw_body_text)
+
+    assert "timeline" not in timeline
+    assert "buckets" in timeline
+    assert timeline["total_events"] == 272
+    assert '"timeline"' not in raw_body_text
+    # No real Shot freeze_frame data either -- the aggregated path never
+    # even calls _event_detail, but this is a direct, belt-and-suspenders
+    # confirmation against the actual wire bytes.
+    assert "freeze_frame" not in raw_body_text
+
+
+def test_player_dashboard_endpoints_public_deployment_off_by_default_confirmed():
+    """Explicit control, same convention as the shot map's/pass network's
+    own equivalent tests."""
+    assert api_module.PUBLIC_DEPLOYMENT is False
+
+
+def test_player_match_touch_map_endpoint_no_data_for_unfetchable_match():
+    """generate_player_match_touch_map's own no_data shape includes an
+    EMPTY `touches: []` (a deliberate, consistently-typed response, unlike
+    the pass network's no_data shape which omits `nodes` entirely) --
+    empty, not omitted, still carries zero individual locations either
+    way."""
+    with TestClient(app) as client:
+        response = client.get(f"/reports/player/{MESSI_PLAYER_ID}/match/999999999/touch-map")
+    assert response.status_code == 200
+    touch_map = response.json()
+    assert touch_map["no_data"] is True
+    assert touch_map["touches"] == []
+
+
+# ============================================================================
 # ADR-019 (Stage 2 persistence): the alert-history store, exercised through
 # the REAL WebSocket alert flow (not alert_store.py directly -- that's
 # test_alert_store.py's job). These tests confirm the two things ADR-019

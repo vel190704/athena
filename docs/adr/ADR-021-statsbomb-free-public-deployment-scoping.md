@@ -338,3 +338,110 @@ aggregation, not a surface-level distinction — and this project's own
 standing discipline (ADR-014, ADR-020, this ADR's own original Decision
 section) is to resolve a genuine ambiguity conservatively, not by
 whichever reading is more convenient to build.
+
+## Update: Condition 2 Applied to the Player Dashboard's Match-Level Views (Step 0 Decision)
+
+A further reporting extension — a Player Dashboard adding match-level
+views on top of the existing (already-compliant) season/multi-match
+player report (`production/src/reporting/player_report.py`) — was scoped
+under the same discipline the Pass Network established above: resolve the
+condition-2 question explicitly, in writing, BEFORE implementing, for
+every NEW view, rather than assuming a "standard dashboard feature" is
+exempt just because it feels familiar. Three views were proposed; each
+was evaluated separately, since (unlike the Pass Network's single
+raw/aggregated question) they do not all resolve the same way.
+
+**1. Match-by-match summary table (minutes played, event-TYPE counts per
+match) — EXEMPT, no gating.** This is a per-match TOTAL (e.g., "67 minutes,
+2 shots, 45 passes"), never a location and never an individually-
+enumerated event. It is the exact same class of data
+`generate_player_report` already serves unconditionally today
+(`positional_distribution`, `total_minutes_played`) and the shot map's own
+already-compliant summary scalars (`total_shots`, `shots_by_body_part`) —
+a count broken out PER MATCH is not more sensitive than the SUM of those
+same counts across several matches, which this module already serves with
+no gate. `generate_player_match_summary` needed no raw/aggregated split at
+all.
+
+**2. Match-level touch map — SPLIT DECISION, resolved by which of two
+existing precedents actually applies, not by reflexively copying the Pass
+Network's stricter treatment.** On inspection, a touch map has NO
+pairwise relationship between two named individuals to reconstruct — it
+is one player's own touches, structurally the SAME shape as the season
+heatmap (already compliant) and the shot map's own grid-binned aggregated
+variant (already compliant, and — per that variant's own established
+`shot_map_used_low_sample_flag` precedent — accepted as compliant even at
+low sample sizes, flagged rather than blocked). The genuinely new risk is
+therefore not "single-match scope" in the abstract (the Pass Network's
+own precedent doesn't generalize that broadly either — see that section's
+real deciding factor, PAIRWISE edges, which does not exist here) but
+specifically whether INDIVIDUAL touch points are plotted:
+- A GRID-BINNED touch-density view (no individual point, same
+  `GRID_COLS x GRID_ROWS` convention as the season heatmap and shot map)
+  is compliant by construction, matching the existing precedent directly
+  — `generate_player_match_touch_map_aggregated` needed no additional
+  restriction beyond the grid-binning itself already established elsewhere.
+- A RAW individual-touch scatter (exact `(x, y)` per touch, like the shot
+  map's raw scatter) is the same risk class as the shot map's raw variant
+  and is gated identically: `generate_player_match_touch_map` is
+  LOCAL/PRIVATE ONLY.
+
+**3. Key-event timeline (a chronological, per-event listing for one
+player, one match) — RAW, gated, no split-decision ambiguity.** Condition
+2's own text is explicit and does not hinge on location: "no public API
+endpoint returning event-level records... no interactive table of raw
+events." A per-minute, per-event-type listing IS an event-level record on
+its own, regardless of whether a coordinate is attached.
+`generate_player_match_timeline` (LOCAL/PRIVATE ONLY) returns exactly
+that; `generate_player_match_timeline_aggregated` (public-safe) collapses
+it to event-TYPE counts per coarse (`TIMELINE_BUCKET_MINUTES`=15) time
+bucket — no individual event, exact minute, or outcome/body-part detail
+is ever enumerated in that variant's output.
+
+**A second, genuinely separate leak found and closed during
+implementation, not by the Step 0 process above but by directly reading
+real event JSON before trusting any field (the same rigor this project's
+outcome/recipient verification already applied for the Pass Network):**
+a real StatsBomb `Shot` event's own sub-dict carries a `freeze_frame` list
+of roughly 15 OTHER real, named, individually-located players (teammates
+and opponents alike) at the moment of that shot — verified directly
+against Messi's real match 3857264 data. A naive "dump this event's own
+type-specific sub-dict" implementation of the timeline's per-event detail
+field would have leaked far MORE individually-located, individually-
+attributable real player data than the touch location it was already
+being gated for. `player_report._event_detail` uses an explicit
+ALLOWLIST (`outcome.name`/`body_part.name`/`technique.name`, plus
+`statsbomb_xg` for a `Shot` specifically) rather than a wholesale sub-dict
+dump, so `freeze_frame` (and any other individually-located sub-field a
+future StatsBomb event type might add) is never read or returned by this
+function at all.
+
+**Resolution, following the shot map's/Pass Network's own established
+pattern exactly** (ADR-014's precedent: scope the constraint, do not
+remove the capability):
+- `generate_player_match_touch_map`/`generate_player_match_timeline`
+  (raw) remain fully available for LOCAL/private research use, unchanged.
+- `generate_player_match_touch_map_aggregated`/
+  `generate_player_match_timeline_aggregated` are the condition-2-
+  compliant counterparts, following this section's own reasoning above
+  (grid-binning for touches; time-bucketed type-counts for the timeline).
+- The SAME `PUBLIC_DEPLOYMENT` flag (`api.py`, already checked once at
+  startup) decides which variant each of
+  `/reports/player/{id}/match/{match_id}/touch-map` and
+  `/reports/player/{id}/match/{match_id}/timeline` serves.
+  `/reports/player/{id}/match-summary` is NOT gated by this flag at all,
+  consistent with view 1's exemption above.
+- `dashboard.py`'s Player Dashboard panel mirrors the shot map/Pass
+  Network panels' exact defense-in-depth check for both gated views:
+  inspects whether the actual API response still carries a raw
+  `touches`/`timeline` field, and fails closed (a visible configuration
+  error, nothing rendered) if its own flag says public but the response
+  says otherwise.
+
+Not chosen: gating the match summary table (view 1) "to be safe" despite
+it clearing the same test the shot map's own summary scalars already
+clear today. Rejected as over-correction — this project's discipline is
+to resolve genuine ambiguity conservatively, not to gate data that
+demonstrably is NOT raw under condition 2's own stated test, which would
+only make the working feature set unnecessarily inconsistent with what it
+already serves unconditionally elsewhere.

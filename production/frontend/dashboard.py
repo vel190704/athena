@@ -126,6 +126,10 @@ from production.src.reporting.pass_network_visualizer import (
 )
 from production.src.reporting.player_visualizer import (
     render_player_dashboard,
+    render_player_match_timeline,
+    render_player_match_timeline_aggregated,
+    render_player_match_touch_map,
+    render_player_match_touch_map_aggregated,
     render_shot_map,
     render_shot_map_aggregated,
 )
@@ -323,6 +327,94 @@ def _cached_player_shot_map_aggregated_png(shot_map_aggregated: dict) -> bytes:
         tmp_path = tmp.name
     try:
         render_shot_map_aggregated(shot_map_aggregated, tmp_path)
+        return Path(tmp_path).read_bytes()
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
+
+
+# Player Dashboard (additive new feature): match-level views extending the
+# existing Player Reports tab. Match Summary is unconditionally aggregate
+# (ADR-021: not gated -- see player_report.py's own Player Dashboard
+# section for the full Step 0 reasoning); Touch Map and Timeline each get
+# a raw + aggregated cached-PNG pair, same pattern as the shot map above.
+@st.cache_data(show_spinner=False)
+def _cached_player_match_summary(rest_base_url: str, player_id: int, match_ids: tuple[int, ...]) -> dict:
+    response = requests.get(
+        f"{rest_base_url}/reports/player/{player_id}/match-summary",
+        params={"match_ids": list(match_ids)},
+        timeout=REPORT_REQUEST_TIMEOUT_SECONDS,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+@st.cache_data(show_spinner=False)
+def _cached_player_match_touch_map(rest_base_url: str, player_id: int, match_id: int) -> dict:
+    response = requests.get(
+        f"{rest_base_url}/reports/player/{player_id}/match/{match_id}/touch-map",
+        timeout=REPORT_REQUEST_TIMEOUT_SECONDS,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+@st.cache_data(show_spinner=False)
+def _cached_player_match_touch_map_png(touch_map: dict) -> bytes:
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+        tmp_path = tmp.name
+    try:
+        render_player_match_touch_map(touch_map, tmp_path)
+        return Path(tmp_path).read_bytes()
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
+
+
+@st.cache_data(show_spinner=False)
+def _cached_player_match_touch_map_aggregated_png(touch_map_aggregated: dict) -> bytes:
+    """ADR-021 condition-2 compliance -- the PUBLIC-deployment counterpart
+    to `_cached_player_match_touch_map_png` above. Only ever called on a
+    dict already confirmed (see the touch-map panel below) to carry no
+    `"touches"` key."""
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+        tmp_path = tmp.name
+    try:
+        render_player_match_touch_map_aggregated(touch_map_aggregated, tmp_path)
+        return Path(tmp_path).read_bytes()
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
+
+
+@st.cache_data(show_spinner=False)
+def _cached_player_match_timeline(rest_base_url: str, player_id: int, match_id: int) -> dict:
+    response = requests.get(
+        f"{rest_base_url}/reports/player/{player_id}/match/{match_id}/timeline",
+        timeout=REPORT_REQUEST_TIMEOUT_SECONDS,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+@st.cache_data(show_spinner=False)
+def _cached_player_match_timeline_png(timeline: dict) -> bytes:
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+        tmp_path = tmp.name
+    try:
+        render_player_match_timeline(timeline, tmp_path)
+        return Path(tmp_path).read_bytes()
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
+
+
+@st.cache_data(show_spinner=False)
+def _cached_player_match_timeline_aggregated_png(timeline_aggregated: dict) -> bytes:
+    """ADR-021 condition-2 compliance -- the PUBLIC-deployment counterpart
+    to `_cached_player_match_timeline_png` above. Only ever called on a
+    dict already confirmed (see the timeline panel below) to carry no
+    `"timeline"` key."""
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+        tmp_path = tmp.name
+    try:
+        render_player_match_timeline_aggregated(timeline_aggregated, tmp_path)
         return Path(tmp_path).read_bytes()
     finally:
         Path(tmp_path).unlink(missing_ok=True)
@@ -975,6 +1067,125 @@ with tab_player:
                         st.image(shot_map_png, caption=f"Shot Map -- player_id={player_id}", width="stretch")
                         with st.expander("Raw shot map data"):
                             st.json(shot_map)
+
+                # --- Player Dashboard: match-level views (additive new feature) ---
+                # A THIRD section, alongside (not replacing) the positional-
+                # distribution/heatmap panels and the Shot Map above.
+                # Match Summary is unconditionally aggregate (ADR-021: not
+                # gated). Touch Map and Timeline are per-MATCH views (a
+                # touch map/timeline for the whole requested match_ids set
+                # combined would not mean anything -- same single-match-
+                # scope reasoning the Pass Network tab already established),
+                # so they get their own match_id selector, scoped to the
+                # matches already selected for this player above.
+                st.divider()
+                st.subheader("Player Dashboard: Match-by-Match Views")
+
+                with st.spinner("Generating match summary..."):
+                    match_summary = _fetch_report_safely(
+                        lambda: _cached_player_match_summary(rest_base_url, player_id, match_ids), rest_base_url
+                    )
+                if match_summary is not None:
+                    st.write(f"Appeared in {match_summary['matches_player_appeared_in']} of {match_summary['matches_requested']} requested match(es).")
+                    if match_summary["matches"]:
+                        summary_df = pd.DataFrame([
+                            {
+                                "Match ID": m["match_id"],
+                                "Team": m["team"],
+                                "Opponent": m["opponent"],
+                                "Minutes Played": round(m["minutes_played"], 1),
+                                "Total Tagged Events": m["total_tagged_events"],
+                                "Shots": m["event_type_counts"].get("Shot", 0),
+                                "Passes": m["event_type_counts"].get("Pass", 0),
+                            }
+                            for m in match_summary["matches"]
+                        ])
+                        st.dataframe(summary_df, width="stretch")
+                        with st.expander("Raw match summary data (full event-type counts per match)"):
+                            st.json(match_summary)
+                    else:
+                        st.info("No match-level data -- player did not appear in any requested match.")
+
+                    if match_ids:
+                        st.markdown("**Touch Map / Key-Event Timeline** (pick one match)")
+                        selected_match_id = st.selectbox(
+                            "Match ID for match-level views", options=list(match_ids), key="player_dashboard_match_id"
+                        )
+
+                        with st.spinner("Generating touch map..."):
+                            touch_map = _fetch_report_safely(
+                                lambda: _cached_player_match_touch_map(rest_base_url, player_id, selected_match_id),
+                                rest_base_url,
+                            )
+                        if touch_map is not None and not touch_map.get("no_data"):
+                            if touch_map.get("touch_map_used_low_sample_flag"):
+                                st.warning(
+                                    f"LOW SAMPLE: only {touch_map.get('total_touches', 0)} touch(es) in this "
+                                    "match -- treat the touch map below as illustrative, not a confident pattern."
+                                )
+                            # Same defense-in-depth PUBLIC_DEPLOYMENT check as the
+                            # Shot Map/Pass Network panels above -- reused, not
+                            # reinvented. See those panels' own comments for the
+                            # full reasoning.
+                            response_has_raw_touches = "touches" in touch_map
+                            if PUBLIC_DEPLOYMENT and response_has_raw_touches:
+                                st.error(
+                                    "Configuration error: this dashboard process has PUBLIC_DEPLOYMENT=true, "
+                                    "but the API server returned raw per-touch location data -- refusing to "
+                                    "render or display it. Set PUBLIC_DEPLOYMENT=true on the API server "
+                                    "process too (see README.md's 'Public deployment mode' section)."
+                                )
+                            elif PUBLIC_DEPLOYMENT or not response_has_raw_touches:
+                                touch_png = _cached_player_match_touch_map_aggregated_png(touch_map)
+                                st.image(
+                                    touch_png,
+                                    caption=f"Touch Map (aggregated) -- player_id={player_id}, match_id={selected_match_id}",
+                                    width="stretch",
+                                )
+                                with st.expander("Raw touch map data (aggregated grid only -- no per-touch data)"):
+                                    st.json(touch_map)
+                            else:
+                                touch_png = _cached_player_match_touch_map_png(touch_map)
+                                st.image(
+                                    touch_png,
+                                    caption=f"Touch Map -- player_id={player_id}, match_id={selected_match_id}",
+                                    width="stretch",
+                                )
+                                with st.expander("Raw touch map data"):
+                                    st.json(touch_map)
+
+                        with st.spinner("Generating key-event timeline..."):
+                            timeline = _fetch_report_safely(
+                                lambda: _cached_player_match_timeline(rest_base_url, player_id, selected_match_id),
+                                rest_base_url,
+                            )
+                        if timeline is not None and not timeline.get("no_data"):
+                            response_has_raw_timeline = "timeline" in timeline
+                            if PUBLIC_DEPLOYMENT and response_has_raw_timeline:
+                                st.error(
+                                    "Configuration error: this dashboard process has PUBLIC_DEPLOYMENT=true, "
+                                    "but the API server returned a raw per-event timeline -- refusing to "
+                                    "render or display it. Set PUBLIC_DEPLOYMENT=true on the API server "
+                                    "process too (see README.md's 'Public deployment mode' section)."
+                                )
+                            elif PUBLIC_DEPLOYMENT or not response_has_raw_timeline:
+                                timeline_png = _cached_player_match_timeline_aggregated_png(timeline)
+                                st.image(
+                                    timeline_png,
+                                    caption=f"Key-Event Timeline (aggregated) -- player_id={player_id}, match_id={selected_match_id}",
+                                    width="stretch",
+                                )
+                                with st.expander("Raw timeline data (event-type counts per time bucket only)"):
+                                    st.json(timeline)
+                            else:
+                                timeline_png = _cached_player_match_timeline_png(timeline)
+                                st.image(
+                                    timeline_png,
+                                    caption=f"Key-Event Timeline -- player_id={player_id}, match_id={selected_match_id}",
+                                    width="stretch",
+                                )
+                                with st.expander("Raw timeline data"):
+                                    st.json(timeline)
 
 # ============================================================================
 # TAB: Team Reports -- report DATA now fetched over HTTP from api.py's

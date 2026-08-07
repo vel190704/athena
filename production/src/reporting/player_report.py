@@ -497,3 +497,359 @@ def generate_player_shot_map_aggregated(player_id: int, match_ids: list[int]) ->
             "==0); mean_xg_grid cells are None where no shot landed."
         ),
     }
+
+
+# ============================================================================
+# Player Dashboard (additive new feature): match-level views extending the
+# existing season/multi-match report above. Every function below is NEW --
+# nothing above this line is modified. Same "reads statsbomb_io's existing
+# fetch functions, standalone" discipline as the rest of this module.
+#
+# ADR-021 condition-2 GATING (Step 0, resolved explicitly BEFORE writing any
+# of these functions -- see docs/adr/ADR-021's own addendum for the full
+# reasoning, verified against real data, not assumed):
+#
+#   - `generate_player_match_summary`: EXEMPT, no gating. Per-match TOTALS
+#     only (minutes, event-type counts) -- no location, no individual event
+#     enumerated. Same class of data as this module's own
+#     `positional_distribution`/`total_minutes_played` (already served
+#     unconditionally) or the shot map's own `total_shots`/`goals`/
+#     `shots_by_body_part` -- a per-match count is not more sensitive than a
+#     multi-match SUM of the same counts, which this module already serves
+#     with no gate.
+#   - `generate_player_match_touch_map`: RAW (individual touch locations,
+#     one specific match) -- gated, mirrors the shot map's raw scatter
+#     exactly. `generate_player_match_touch_map_aggregated` (grid-binned
+#     density, no individual point) is the public-safe counterpart --
+#     grid-binning is ALREADY this project's established condition-2
+#     boundary for spatial data (the season heatmap, and the shot map's own
+#     aggregated grid, are both grid-binned and already compliant,
+#     regardless of how few events back a given cell -- see
+#     `shot_map_used_low_sample_flag`'s existing precedent of flagging low
+#     sample size rather than blocking it). Unlike the Pass Network, a touch
+#     map has no PAIRWISE relationship between two named individuals to
+#     reconstruct -- it is one player's own touches, structurally the same
+#     shape as the season heatmap, just narrower in temporal scope -- so the
+#     grid-binned variant does not need the Pass Network's more severe
+#     "no location at all" treatment, only the shot map's existing
+#     raw-point-vs-grid-bin split.
+#   - `generate_player_match_timeline`: RAW (individually enumerated,
+#     timestamped events) -- gated. ADR-021 condition 2's own text bans "no
+#     interactive table of raw events" REGARDLESS of whether a location
+#     field is included -- a per-minute event listing is an event-level
+#     record on its own. `generate_player_match_timeline_aggregated`
+#     (event-TYPE counts per coarse time bucket, no individual event
+#     enumerated) is the public-safe counterpart.
+# ============================================================================
+
+# Same convention team_report.py's own GAME_PHASE_BUCKET_MINUTES already
+# established (15-minute match-report buckets) -- restated here, not
+# imported, since player_report.py does not otherwise depend on
+# team_report.py and this project's own established precedent (e.g.
+# candidate_index.py's LOW_SAMPLE_MATCH_THRESHOLD comment) is to restate a
+# plain value with the source named rather than force a new cross-module
+# import for one constant.
+TIMELINE_BUCKET_MINUTES = 15.0  # team_report.GAME_PHASE_BUCKET_MINUTES
+
+
+def _player_touch_events(events: list, player_id: int) -> list[dict]:
+    """Every event in `events` tagged to `player_id` that carries a
+    `location` -- the EXACT SAME qualifying criteria
+    `_heatmap_qualifying_event_count` (and, transitively,
+    `habit_memory.generate_player_heatmap`) already use, reused here rather
+    than re-derived, so "touch" means the same thing in this new feature as
+    it already does in the existing aggregate heatmap.
+    """
+    return [
+        e for e in events
+        if e.get("player", {}).get("id") == player_id and "location" in e
+    ]
+
+
+def _match_teams(events: list) -> tuple[str, ...]:
+    """The distinct team names appearing in this match's events -- VERIFIED
+    against real cached data (match 3857264: exactly `{"Argentina",
+    "Poland"}`) before relying on "exactly two teams per match" anywhere
+    below."""
+    return tuple(sorted({e["team"]["name"] for e in events if "team" in e}))
+
+
+def _opponent_team_name(events: list, own_team_name: str | None) -> str | None:
+    """The other team in this match, or `None` if `own_team_name` is
+    unknown or the match doesn't resolve to exactly two teams (defensive,
+    not assumed impossible)."""
+    if own_team_name is None:
+        return None
+    teams = _match_teams(events)
+    others = [t for t in teams if t != own_team_name]
+    return others[0] if len(others) == 1 else None
+
+
+def _player_on_pitch_interval(
+    events: list, player_id: int
+) -> tuple[dict | None, float | None, float | None]:
+    """`(team, on_pitch_start, on_pitch_end)` for `player_id` in this one
+    match's `events`, or `(None, None, None)` if they have no resolvable
+    Starting XI/substitution record. Factors out the SAME per-match
+    interval logic `generate_player_report`'s own loop already computes
+    inline (Step 1.3 above) into a reusable function -- that existing loop
+    is left completely untouched; this is a NEW function calling the SAME
+    existing private helpers (`_starting_team`/`_substitution_times`/
+    `_substitution_team`/`_match_final_minute`) it already relied on.
+    """
+    team = _starting_team(events, player_id)
+    started = team is not None
+    subbed_on, subbed_off = _substitution_times(events, player_id)
+
+    if not started and subbed_on is None:
+        return None, None, None
+    if not started:
+        team = _substitution_team(events, player_id)
+    if team is None:
+        return None, None, None
+
+    match_end = _match_final_minute(events)
+    on_pitch_start = 0.0 if started else subbed_on
+    on_pitch_end = subbed_off if subbed_off is not None else match_end
+    if on_pitch_end <= on_pitch_start:
+        return None, None, None
+
+    return team, on_pitch_start, on_pitch_end
+
+
+def generate_player_match_summary(player_id: int, match_ids: list[int]) -> dict:
+    """Match-by-match summary table (additive new feature, NOT gated -- see
+    this section's own ADR-021 note above): for each match `player_id`
+    actually appeared in, real per-match minutes played, team/opponent, and
+    event-TYPE counts (a `Counter`-derived dict, e.g. `{"Pass": 70, "Shot":
+    7, ...}`) -- no location, no individually-enumerated event, the same
+    "aggregate count" class of data `generate_player_report` already serves
+    unconditionally, just broken out per match instead of summed across all
+    of them.
+    """
+    matches = []
+    for match_id in match_ids:
+        events = fetch_match_events(match_id)
+        if events is None:
+            logger.warning(f"match_id={match_id}: no events data available, skipping.")
+            continue
+
+        team, on_pitch_start, on_pitch_end = _player_on_pitch_interval(events, player_id)
+        if team is None:
+            continue  # player did not appear in this match (no resolvable Starting XI/sub record)
+
+        opponent = _opponent_team_name(events, team["name"])
+        player_events = [e for e in events if e.get("player", {}).get("id") == player_id]
+        event_type_counts = dict(Counter(e["type"]["name"] for e in player_events))
+
+        matches.append({
+            "match_id": match_id,
+            "team": team["name"],
+            "opponent": opponent,
+            "minutes_played": on_pitch_end - on_pitch_start,
+            "event_type_counts": event_type_counts,
+            "total_tagged_events": len(player_events),
+        })
+
+    matches.sort(key=lambda m: m["match_id"])
+    return {
+        "player_id": player_id,
+        "matches_requested": len(match_ids),
+        "matches_player_appeared_in": len(matches),
+        "matches": matches,
+    }
+
+
+def generate_player_match_touch_map(player_id: int, match_id: int) -> dict:
+    """RAW single-match touch map (ADR-021 condition 2: LOCAL/PRIVATE USE
+    ONLY -- see this section's own gating note above;
+    `generate_player_match_touch_map_aggregated` below is the public-safe
+    counterpart). Real, individually-located touch coordinates for
+    `player_id` in ONE match -- structurally the same risk class as
+    `generate_player_shot_map`'s raw `shots` list, gated the same way.
+
+    Single `match_id`, not a `match_ids` list: unlike the season-aggregate
+    heatmap, a touch MAP is inherently a per-match view (the whole point is
+    "what did this match's involvement look like," not a career blend).
+    """
+    events = fetch_match_events(match_id)
+    if events is None:
+        logger.warning(f"match_id={match_id}: no events data available.")
+        return {"player_id": player_id, "match_id": match_id, "no_data": True, "touches": []}
+
+    touch_events = _player_touch_events(events, player_id)
+    touches = []
+    for e in touch_events:
+        location = e["location"]
+        touches.append({
+            "location": [location[0] * X_SCALE, location[1] * Y_SCALE],
+            "event_type": e["type"]["name"],
+            "minute": _match_time_minutes(e),
+        })
+
+    return {
+        "player_id": player_id,
+        "match_id": match_id,
+        "no_data": False,
+        "touches": touches,
+        "total_touches": len(touches),
+        "touch_map_used_low_sample_flag": len(touches) < MIN_SHOTS_FOR_CONFIDENT_SHOT_MAP,
+    }
+
+
+def generate_player_match_touch_map_aggregated(player_id: int, match_id: int) -> dict:
+    """ADR-021 condition-2-compliant variant of `generate_player_match_touch_map`,
+    for PUBLIC deployments -- same reuse-then-pop-then-summarize pattern
+    `generate_player_shot_map_aggregated` already established: reuses
+    `generate_player_match_touch_map` internally, bins its raw `touches`
+    into the SAME `GRID_COLS x GRID_ROWS` grid `habit_memory`'s positional
+    heatmap and the shot map's own aggregated variant already use, and
+    NEVER returns the per-touch list (popped, local-only, before this
+    function's own return dict is built).
+    """
+    full = generate_player_match_touch_map(player_id, match_id)
+    if full.get("no_data"):
+        return full
+    touches = full.pop("touches")
+
+    touch_count_grid = [[0] * GRID_ROWS for _ in range(GRID_COLS)]
+    for touch in touches:
+        x, y = touch["location"]
+        col = min(max(int(x // CELL_WIDTH_METERS), 0), GRID_COLS - 1)
+        row = min(max(int(y // CELL_HEIGHT_METERS), 0), GRID_ROWS - 1)
+        touch_count_grid[col][row] += 1
+
+    total_touches = full["total_touches"]
+    touch_density_grid = [
+        [(touch_count_grid[col][row] / total_touches) if total_touches > 0 else 0.0 for row in range(GRID_ROWS)]
+        for col in range(GRID_COLS)
+    ]
+
+    return {
+        **full,
+        "touch_density_grid": touch_density_grid,
+        "touch_grid_shape": (
+            f"{GRID_COLS} cols (x, {CELL_WIDTH_METERS}m/cell) x {GRID_ROWS} rows "
+            f"(y, {CELL_HEIGHT_METERS:.2f}m/cell); same convention as habit_memory's positional "
+            "heatmap. touch_density_grid cells sum to 1.0 across the whole grid (0.0 if "
+            "total_touches==0)."
+        ),
+    }
+
+
+# Allowlisted scalar sub-fields pulled into a timeline entry's `detail`
+# dict, per StatsBomb event type -- deliberately NOT a wholesale dump of
+# the event's own type-specific sub-dict. VERIFIED against real cached
+# data (Messi, match 3857264) before relying on this: a real `Shot`
+# event's own sub-dict carries a `freeze_frame` list of ~15 OTHER real
+# named players' own individually-located positions at that moment --
+# dumping that sub-dict wholesale would leak far MORE individually-located,
+# individually-attributable real player data than anything condition 2 was
+# ever evaluated against in this project. This allowlist is what keeps
+# `generate_player_match_timeline` (RAW, gated, see below) from ever
+# accidentally becoming a bigger compliance problem than the raw touch
+# location it is already gated for.
+_TIMELINE_DETAIL_KEYS = ("outcome", "body_part", "technique")
+
+
+def _event_type_subdict_key(type_name: str) -> str:
+    """StatsBomb's own convention -- VERIFIED against real cached data:
+    the event's type-specific sub-dict key is the lowercased, underscore-
+    joined, `*`-stripped type name (e.g. "Ball Receipt*" -> "ball_receipt",
+    "Foul Committed" -> "foul_committed", "Pass" -> "pass")."""
+    return type_name.lower().replace(" ", "_").replace("*", "")
+
+
+def _event_detail(event: dict) -> dict:
+    """A SAFE, allowlisted detail dict for one event -- only plain scalar
+    strings (`outcome.name`/`body_part.name`/`technique.name` where
+    present) plus, for a `Shot` specifically, StatsBomb's own real
+    `statsbomb_xg` (already served, unmodified, elsewhere in this exact
+    module -- see `generate_player_shot_map`'s own docstring for why this
+    is StatsBomb's value, not this project's DeepHit model's). Never reads
+    or returns `freeze_frame`, `end_location`, or any other individually-
+    located sub-field -- see `_TIMELINE_DETAIL_KEYS`'s own comment for why.
+    """
+    type_name = event["type"]["name"]
+    subdict = event.get(_event_type_subdict_key(type_name), {})
+    detail = {}
+    for key in _TIMELINE_DETAIL_KEYS:
+        value = subdict.get(key, {}).get("name") if isinstance(subdict.get(key), dict) else None
+        if value is not None:
+            detail[key] = value
+    if type_name == "Shot" and "statsbomb_xg" in subdict:
+        detail["statsbomb_xg"] = subdict["statsbomb_xg"]
+    return detail
+
+
+def generate_player_match_timeline(player_id: int, match_id: int) -> dict:
+    """RAW single-match key-event timeline (ADR-021 condition 2: LOCAL/
+    PRIVATE USE ONLY -- see this section's own gating note above;
+    `generate_player_match_timeline_aggregated` below is the public-safe
+    counterpart). A chronological, per-event listing (minute, event type,
+    an allowlisted safe detail -- see `_event_detail`) of every tagged
+    event for `player_id` in ONE match -- condition 2 bans "an interactive
+    table of raw events" regardless of whether a location field is
+    included, so this is gated even though no `location` key appears
+    anywhere in this function's own output.
+    """
+    events = fetch_match_events(match_id)
+    if events is None:
+        logger.warning(f"match_id={match_id}: no events data available.")
+        return {"player_id": player_id, "match_id": match_id, "no_data": True, "timeline": []}
+
+    player_events = [e for e in events if e.get("player", {}).get("id") == player_id]
+    player_events.sort(key=lambda e: (e["period"], e["index"]))
+
+    timeline = [
+        {
+            "minute": _match_time_minutes(e),
+            "event_type": e["type"]["name"],
+            "detail": _event_detail(e),
+        }
+        for e in player_events
+    ]
+
+    return {
+        "player_id": player_id,
+        "match_id": match_id,
+        "no_data": False,
+        "timeline": timeline,
+        "total_events": len(timeline),
+    }
+
+
+def generate_player_match_timeline_aggregated(player_id: int, match_id: int) -> dict:
+    """ADR-021 condition-2-compliant variant of `generate_player_match_timeline`,
+    for PUBLIC deployments -- same reuse-then-pop-then-summarize pattern as
+    every other aggregated variant in this module. Bins the raw,
+    individually-enumerated `timeline` into `TIMELINE_BUCKET_MINUTES`-wide
+    time buckets and returns ONLY event-TYPE counts per bucket -- no
+    individual event (no exact minute, no outcome/body-part detail) is
+    ever enumerated in this function's return value.
+    """
+    full = generate_player_match_timeline(player_id, match_id)
+    if full.get("no_data"):
+        return full
+    timeline = full.pop("timeline")
+
+    bucket_counts: dict[int, dict] = {}
+    for entry in timeline:
+        bucket = int(entry["minute"] // TIMELINE_BUCKET_MINUTES)
+        counts = bucket_counts.setdefault(bucket, {})
+        counts[entry["event_type"]] = counts.get(entry["event_type"], 0) + 1
+
+    buckets = [
+        {
+            "bucket_start_minute": bucket * TIMELINE_BUCKET_MINUTES,
+            "bucket_end_minute": (bucket + 1) * TIMELINE_BUCKET_MINUTES,
+            "event_type_counts": counts,
+        }
+        for bucket, counts in sorted(bucket_counts.items())
+    ]
+
+    return {
+        **full,
+        "buckets": buckets,
+        "bucket_size_minutes": TIMELINE_BUCKET_MINUTES,
+    }
