@@ -14,7 +14,12 @@ dependency -- entirely independent of ADR-013 through ADR-016.
 import logging
 from collections import Counter
 
-from production.src.ingestion.statsbomb_io import X_SCALE, Y_SCALE, fetch_match_events
+from production.src.ingestion.statsbomb_io import (
+    X_SCALE,
+    Y_SCALE,
+    event_is_under_pressure,
+    fetch_match_events,
+)
 from production.src.pipeline.habit_memory import (
     CELL_HEIGHT_METERS,
     CELL_WIDTH_METERS,
@@ -852,4 +857,179 @@ def generate_player_match_timeline_aggregated(player_id: int, match_id: int) -> 
         **full,
         "buckets": buckets,
         "bucket_size_minutes": TIMELINE_BUCKET_MINUTES,
+    }
+
+
+# Press Resistance Index (additive new feature): "successful action while
+# under pressure" per player, using StatsBomb's real `under_pressure` flag
+# (`statsbomb_io.event_is_under_pressure` -- see that function's own
+# docstring for the real key-presence-only verification against match
+# 3857264's 4,052 real cached events). Reuses the SAME
+# MIN_HISTORICAL_EVENTS-based low-sample threshold value as
+# MIN_SHOTS_FOR_CONFIDENT_SHOT_MAP above, following that constant's own
+# naming precedent (a new, descriptively-named constant set equal to
+# MIN_HISTORICAL_EVENTS, not a bare reuse of the generic name) -- a player
+# with only a handful of real under-pressure actions deserves the same
+# honest low-sample flag a low-shot-count player already gets from
+# MIN_SHOTS_FOR_CONFIDENT_SHOT_MAP.
+MIN_UNDER_PRESSURE_EVENTS_FOR_CONFIDENT_PRI = MIN_HISTORICAL_EVENTS
+
+# The three event types this feature scores. VERIFIED against real cached
+# data (match 3857264) before deciding this list: these are the event
+# types that actually carry an `under_pressure` key in meaningful numbers
+# AND have some real, checkable notion of "successful" outcome (Carry,
+# Duel, Clearance, Ball Receipt*, etc. also carry `under_pressure` but have
+# no analogous single-event success/failure signal worth scoring here).
+PRESS_RESISTANCE_EVENT_TYPES = ("Pass", "Dribble", "Shot")
+
+_ON_TARGET_SHOT_OUTCOMES = {"Goal", "Saved", "Saved to Post"}
+
+
+def _is_successful_pass_under_pressure(event: dict) -> bool:
+    """Pass success: reuses the EXACT existing completion convention from
+    `chain_builder._is_incomplete_reception` (outcome-key ABSENCE = complete)
+    -- reimplemented locally rather than imported, per this project's own
+    established convention against importing another module's
+    leading-underscore, module-private helper across file boundaries (see
+    e.g. `team_report._build_pitch_grid`'s own docstring for the same
+    convention). Deliberately narrower than the broader "any outcome value
+    at all = not complete" definition `pass_network.py` uses for a
+    different purpose (recipient inference) -- this feature calls for the
+    ORIGINAL chain_builder convention specifically, not a reinvention of it.
+    """
+    return event.get("pass", {}).get("outcome", {}).get("name") != "Incomplete"
+
+
+def _is_successful_dribble_under_pressure(event: dict) -> bool:
+    """Dribble success: VERIFIED against real cached data (match 3857264,
+    24 real Dribble events) to be a GENUINELY DIFFERENT convention from
+    Pass -- every single one of those 24 events carries a `dribble.outcome`
+    key (24/24, no absent case observed), with an EXPLICIT
+    `outcome.name` of either "Complete" or "Incomplete" (14 Complete, 10
+    Incomplete). Blindly reusing Pass's key-absence-means-complete
+    convention here would incorrectly score 100% of dribbles as successful
+    (the key is never absent for this event type) -- this was checked
+    directly rather than assumed to work the same way as Pass.
+    """
+    return event.get("dribble", {}).get("outcome", {}).get("name") == "Complete"
+
+
+def _is_successful_shot_under_pressure(event: dict) -> bool:
+    """Shot success: a genuine judgment call (StatsBomb's `shot.outcome`
+    has no single true/false "success" bit the way Pass/Dribble do), decided
+    here as ON TARGET -- outcome.name in {"Goal", "Saved", "Saved to Post"}.
+
+    Chosen over "goal only" (too outcome/luck-dependent -- a well-struck shot
+    saved by a great goalkeeper reflects the SHOOTER's execution under
+    pressure just as much as a scored one; scoring is also downstream of
+    finishing luck this metric isn't trying to measure) and over "not
+    blocked" (a Blocked outcome is largely determined by a DEFENDER's own
+    positioning/interception, not the shooter's execution quality --
+    counting it as a shooter "success" would reward outcomes outside the
+    shooter's control). Explicitly EXCLUDES "Saved Off Target" (StatsBomb's
+    real, confusingly-named category for a shot that was NOT on a goalward
+    trajectory but the keeper touched anyway -- verified this is a distinct
+    real outcome string, not a synonym for "Saved").
+
+    Real outcome distribution checked before choosing this definition
+    (match 3857264, 28 real cached Shot events): Saved=11, Blocked=6,
+    Off T=6, Wayward=3, Goal=2.
+    """
+    return event.get("shot", {}).get("outcome", {}).get("name") in _ON_TARGET_SHOT_OUTCOMES
+
+
+_PRESS_RESISTANCE_SUCCESS_CHECKS = {
+    "Pass": _is_successful_pass_under_pressure,
+    "Dribble": _is_successful_dribble_under_pressure,
+    "Shot": _is_successful_shot_under_pressure,
+}
+
+
+def generate_player_press_resistance_index(player_id: int, match_ids: list[int]) -> dict:
+    """Press Resistance Index (additive new feature): per-player rate of
+    "successful action while under pressure" -- `successful_under_pressure /
+    under_pressure_attempts` -- broken down per event type (Pass, Dribble,
+    Shot; see `PRESS_RESISTANCE_EVENT_TYPES`) plus one overall combined
+    rate, across `match_ids`.
+
+    ADR-021 condition 2 (StatsBomb licensing -- no raw/individually-
+    recoverable event data exposed publicly): EXEMPT, not gated. This
+    function's return value is pure per-event-type/overall COUNTS and
+    RATES, matching the same aggregate-count class of data this module's
+    own `positional_distribution`-style panels and `generate_player_
+    match_summary`'s per-match event-type counts already serve
+    unconditionally -- no `location`, no `minute`, no event `id`, and no
+    individual event is ever enumerated in this return value, so there is
+    no way to reconstruct which specific action(s) drove a given rate.
+    This is a DIFFERENT shape of aggregation from Pass Network's edges
+    (the case that originally motivated gating a "just a count/rate"-
+    looking view): a Pass Network edge pairs a count with the two nodes'
+    average LOCATIONS, making a low-weight edge individually
+    reconstructible into an approximate real event; a press-resistance
+    rate carries no spatial or temporal context at all, at any sample
+    size, so it never crosses into that "recoverable" territory. The
+    adjacent, genuinely real concern -- a rate computed from a very small
+    N can look identical in shape to a well-supported one and silently
+    over-state confidence -- is handled the way this project's own
+    Milestone 44 precedent already handles it (TRANSPARENCY via the
+    `press_resistance_index_used_low_sample_flag` below, matching
+    `shot_map_used_low_sample_flag`'s exact convention), not by gating or
+    hiding the data.
+
+    Real counts are returned alongside every rate (never rate-only) so a
+    viewer can judge sample size directly, per this feature's own
+    requirement.
+    """
+    attempts = {event_type: 0 for event_type in PRESS_RESISTANCE_EVENT_TYPES}
+    successes = {event_type: 0 for event_type in PRESS_RESISTANCE_EVENT_TYPES}
+    matches_with_data = 0
+
+    for match_id in match_ids:
+        events = fetch_match_events(match_id)
+        if events is None:
+            logger.warning(f"match_id={match_id}: no events data available, skipping.")
+            continue
+        matches_with_data += 1
+
+        for event in events:
+            if not event_is_under_pressure(event):
+                continue
+            player = event.get("player")
+            if player is None or player.get("id") != player_id:
+                continue
+            event_type = event.get("type", {}).get("name")
+            success_check = _PRESS_RESISTANCE_SUCCESS_CHECKS.get(event_type)
+            if success_check is None:
+                continue
+
+            attempts[event_type] += 1
+            if success_check(event):
+                successes[event_type] += 1
+
+    event_type_breakdown = {}
+    for event_type in PRESS_RESISTANCE_EVENT_TYPES:
+        type_attempts = attempts[event_type]
+        type_successes = successes[event_type]
+        event_type_breakdown[event_type.lower()] = {
+            "under_pressure_attempts": type_attempts,
+            "successful_under_pressure": type_successes,
+            "success_rate": (type_successes / type_attempts) if type_attempts > 0 else None,
+        }
+
+    total_attempts = sum(attempts.values())
+    total_successes = sum(successes.values())
+
+    return {
+        "player_id": player_id,
+        "matches_requested": len(match_ids),
+        "matches_with_data": matches_with_data,
+        "event_types": event_type_breakdown,
+        "overall": {
+            "under_pressure_attempts": total_attempts,
+            "successful_under_pressure": total_successes,
+            "success_rate": (total_successes / total_attempts) if total_attempts > 0 else None,
+        },
+        "press_resistance_index_used_low_sample_flag": (
+            total_attempts < MIN_UNDER_PRESSURE_EVENTS_FOR_CONFIDENT_PRI
+        ),
     }

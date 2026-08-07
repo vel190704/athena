@@ -286,3 +286,30 @@ def parse_360_frame(event_data: dict, frame_data: dict) -> dict:
         # inferred per team.
         "team": event_data["team"]["name"],
     }
+
+
+def event_is_under_pressure(event: dict) -> bool:
+    """StatsBomb's real `under_pressure` flag (Press Resistance Index
+    feature, additive -- not currently read anywhere else in this
+    codebase before this function). Reads a RAW event dict directly (the
+    same shape `fetch_match_events` returns and `player_report.py`
+    already iterates over) -- this is a standalone field-access helper,
+    not a frame-parsing function like `parse_360_frame` above, so it
+    lives here as its own small addition rather than folded into that
+    function's differently-shaped return contract.
+
+    VERIFIED against real cached data (match 3857264, 4,052 total events)
+    before trusting `event.get("under_pressure", False)` as a safe
+    default rather than assuming it: the key is present on 468 events
+    (~11.5%), and every single one of those 468 has the value `True` --
+    zero observed cases of an explicit `False`. The key is simply ABSENT
+    on the other 3,584 events (implicit "not under pressure"), not set to
+    `False`. `event.get("under_pressure", False)` is therefore a
+    genuinely correct read here, but only because this project confirmed
+    directly that "absent" and "explicitly False" are never both real,
+    distinct states for this field -- the same "don't assume, verify"
+    discipline `chain_builder._is_incomplete_reception` already
+    established for `pass.outcome`'s own key-presence convention (a
+    different field, a structurally similar gotcha).
+    """
+    return event.get("under_pressure", False)

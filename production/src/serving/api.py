@@ -59,6 +59,7 @@ from production.src.reporting.player_report import (
     generate_player_match_timeline_aggregated,
     generate_player_match_touch_map,
     generate_player_match_touch_map_aggregated,
+    generate_player_press_resistance_index,
     generate_player_report,
     generate_player_shot_map,
     generate_player_shot_map_aggregated,
@@ -876,6 +877,22 @@ async def get_player_match_summary(player_id: int, match_ids: list[int] = Query(
     reasoning.
     """
     return await asyncio.to_thread(generate_player_match_summary, player_id, match_ids)
+
+
+@app.get("/reports/player/{player_id}/press-resistance", dependencies=[Depends(_require_api_key)])
+async def get_player_press_resistance_index(player_id: int, match_ids: list[int] = Query(...)):
+    """Wraps player_report.generate_player_press_resistance_index, unmodified.
+
+    ADR-021 condition 2: NOT gated by PUBLIC_DEPLOYMENT -- pure per-event-type/
+    overall COUNTS and RATES (no location, no minute, no event id, no
+    individual event ever enumerated), the same aggregate-count class of
+    data /reports/player/{player_id}/match-summary already serves
+    unconditionally. See generate_player_press_resistance_index's own
+    docstring in player_report.py for the full exemption reasoning, and
+    docs/adr/ADR-021-statsbomb-free-public-deployment-scoping.md for the
+    addendum recording this decision.
+    """
+    return await asyncio.to_thread(generate_player_press_resistance_index, player_id, match_ids)
 
 
 @app.get("/reports/player/{player_id}/match/{match_id}/touch-map", dependencies=[Depends(_require_api_key)])

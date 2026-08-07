@@ -348,6 +348,22 @@ def _cached_player_match_summary(rest_base_url: str, player_id: int, match_ids: 
     return response.json()
 
 
+# Press Resistance Index (additive new feature): season/multi-match
+# aggregate rate, same ADR-021-unconditional class as match summary above
+# -- not gated behind PUBLIC_DEPLOYMENT (see the endpoint's own docstring
+# in api.py and generate_player_press_resistance_index's docstring in
+# player_report.py for the full exemption reasoning).
+@st.cache_data(show_spinner=False)
+def _cached_player_press_resistance_index(rest_base_url: str, player_id: int, match_ids: tuple[int, ...]) -> dict:
+    response = requests.get(
+        f"{rest_base_url}/reports/player/{player_id}/press-resistance",
+        params={"match_ids": list(match_ids)},
+        timeout=REPORT_REQUEST_TIMEOUT_SECONDS,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
 @st.cache_data(show_spinner=False)
 def _cached_player_match_touch_map(rest_base_url: str, player_id: int, match_id: int) -> dict:
     response = requests.get(
@@ -1105,6 +1121,43 @@ with tab_player:
                             st.json(match_summary)
                     else:
                         st.info("No match-level data -- player did not appear in any requested match.")
+
+                    st.markdown("**Press Resistance Index** (successful action while under pressure)")
+                    with st.spinner("Generating Press Resistance Index..."):
+                        pri = _fetch_report_safely(
+                            lambda: _cached_player_press_resistance_index(rest_base_url, player_id, match_ids),
+                            rest_base_url,
+                        )
+                    if pri is not None:
+                        if pri["press_resistance_index_used_low_sample_flag"]:
+                            st.warning(
+                                f"LOW SAMPLE: only {pri['overall']['under_pressure_attempts']} under-pressure "
+                                "action(s) across the requested match(es) -- treat the rate(s) below as "
+                                "illustrative, not a confident finding."
+                            )
+                        overall = pri["overall"]
+                        overall_rate = overall["success_rate"]
+                        st.metric(
+                            "Overall Press Resistance Rate",
+                            f"{overall_rate:.1%}" if overall_rate is not None else "N/A",
+                            help=(
+                                f"{overall['successful_under_pressure']} successful / "
+                                f"{overall['under_pressure_attempts']} total under-pressure actions "
+                                "(Pass, Dribble, Shot combined)."
+                            ),
+                        )
+                        pri_df = pd.DataFrame([
+                            {
+                                "Event Type": event_type.capitalize(),
+                                "Under-Pressure Attempts": stats["under_pressure_attempts"],
+                                "Successful": stats["successful_under_pressure"],
+                                "Success Rate": f"{stats['success_rate']:.1%}" if stats["success_rate"] is not None else "N/A",
+                            }
+                            for event_type, stats in pri["event_types"].items()
+                        ])
+                        st.dataframe(pri_df, width="stretch")
+                        with st.expander("Raw Press Resistance Index data"):
+                            st.json(pri)
 
                     if match_ids:
                         st.markdown("**Touch Map / Key-Event Timeline** (pick one match)")

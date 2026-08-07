@@ -303,13 +303,14 @@ def test_player_reports_shot_map_panel_fails_closed_on_mismatched_flags(live_api
     # Only the ORIGINAL player-report image may render -- no shot-map,
     # Touch Map, or Timeline image (raw or aggregated) anywhere.
     assert len(player_tab.image) == 1
-    # 2 raw-data expanders, not 1: the player report's own, PLUS the
-    # Player Dashboard's match-summary table -- that panel is
-    # UNCONDITIONALLY aggregate (ADR-021: never gated, see
-    # player_report.py's own Player Dashboard section), so it renders
-    # regardless of this mismatch; shot map/Touch Map/Timeline each
-    # contribute zero expanders here since all three failed closed.
-    assert len(player_tab.json) == 2
+    # 3 raw-data expanders, not 1: the player report's own, PLUS the
+    # Player Dashboard's match-summary table, PLUS the Press Resistance
+    # Index panel -- both of those are UNCONDITIONALLY aggregate (ADR-021:
+    # never gated, see player_report.py's own Player Dashboard / Press
+    # Resistance Index sections), so they render regardless of this
+    # mismatch; shot map/Touch Map/Timeline each contribute zero
+    # expanders here since all three failed closed.
+    assert len(player_tab.json) == 3
 
 
 # ============================================================================
@@ -347,7 +348,10 @@ def test_player_dashboard_renders_real_data_default_local_private(live_api_serve
     assert len(player_tab.error) == 0
     # 4 images: player report, shot map, touch map, timeline.
     assert len(player_tab.image) == 4
-    assert len(player_tab.dataframe) == 1  # the match summary table
+    # 2 dataframes: the match summary table, PLUS the Press Resistance
+    # Index's per-event-type table (both unconditionally aggregate, see
+    # ADR-021 -- neither is gated behind PUBLIC_DEPLOYMENT).
+    assert len(player_tab.dataframe) == 2
     # A second selectbox (match_id for the match-level views), alongside
     # the player-selector selectbox.
     assert len(player_tab.selectbox) == 2

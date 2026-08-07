@@ -445,3 +445,78 @@ to resolve genuine ambiguity conservatively, not to gate data that
 demonstrably is NOT raw under condition 2's own stated test, which would
 only make the working feature set unnecessarily inconsistent with what it
 already serves unconditionally elsewhere.
+
+## Addendum: Press Resistance Index (per-player, season/multi-match
+aggregate rate of "successful action while under pressure")
+
+Resolved EXEMPT from condition 2 — not gated by `PUBLIC_DEPLOYMENT` —
+reasoned through explicitly rather than assumed, per this project's own
+standing discipline that every new view gets this check even when the
+answer looks obvious (the Pass Network section above is the reason this
+discipline exists at all: an "obviously fine, it's just a count" view
+turned out to hide a real leak on closer inspection).
+
+`generate_player_press_resistance_index`'s return value is, in full:
+per-event-type (Pass/Dribble/Shot) `under_pressure_attempts` /
+`successful_under_pressure` counts and a derived `success_rate`, plus one
+`overall` combined count/rate, plus a `matches_requested`/
+`matches_with_data` count and the `press_resistance_index_used_low_sample_flag`
+boolean. Checked directly against condition 2's own test (no individual
+event, no location, no timestamp, no way to reconstruct which specific
+action(s) drove a given number):
+
+- **No `location`** is read or returned anywhere in this function —
+  `event_is_under_pressure` and the three per-type success checks
+  (`_is_successful_pass_under_pressure`, `_is_successful_dribble_under_pressure`,
+  `_is_successful_shot_under_pressure`) each read only a boolean/outcome-name
+  field, never `event["location"]`.
+- **No `minute`/timestamp** is read or returned — unlike the timeline
+  view above, there is no per-event chronological ordering in this
+  feature's output at all.
+- **No individual event is ever enumerated** — every event this function
+  touches is immediately folded into one of six running integer counters
+  (three types × attempts/successes); no per-event dict, id, or record
+  survives into the return value the way the timeline's raw `timeline`
+  list or the shot map's raw `shots` list do.
+- **Aggregated across an entire requested match set** (season-scale, by
+  this feature's own design), not scoped to one match the way the touch
+  map/timeline are — if anything a HIGHER floor of aggregation than the
+  touch map's already-compliant grid-binned variant, not a lower one.
+
+**Why this is a different shape of aggregate than the Pass Network edges
+that motivated gating in the first place, not merely a shorter list of
+fields:** a Pass Network edge pairs a count/weight with the two
+endpoints' average LOCATIONS (via the graph's nodes), which is what made
+a low-weight edge individually reconstructible into an approximate real
+passing event — the leak was never "it's a count," it was "the count is
+attached to spatial context that narrows down which real event(s)
+produced it." A Press Resistance Index rate carries no spatial or
+temporal context at all, at any sample size — a rate of `1/1` (successes/
+attempts) still only says "one pass happened under pressure and it was
+complete," with no way to know WHICH pass, WHEN, or WHERE. This places it
+in the same class as view 1 above (the match summary table) and the
+season heatmap/positional distribution, not in the Pass Network's or the
+raw touch/timeline views' class.
+
+**The adjacent, genuinely real concern this exemption does NOT wave away:**
+a rate computed from a very small N (e.g. a player with exactly one
+real under-pressure pass in the requested match set) can look identical
+in shape to a well-supported one and silently overstate confidence to a
+viewer. This is a STATISTICAL confidence problem, not a condition-2 raw-
+data-exposure problem, and this project already has an established
+mechanism for exactly this class of concern (Milestone 44's low-sample
+flagging, reused verbatim by the shot map's `shot_map_used_low_sample_flag`
+and the touch map's `touch_map_used_low_sample_flag`): transparency via a
+flag, not gating or hiding the underlying number. `generate_player_press_resistance_index`
+follows this same convention (`press_resistance_index_used_low_sample_flag`,
+threshold `MIN_UNDER_PRESSURE_EVENTS_FOR_CONFIDENT_PRI = MIN_HISTORICAL_EVENTS`,
+same value habit_memory.py and `MIN_SHOTS_FOR_CONFIDENT_SHOT_MAP` already
+use) rather than inventing a new threshold or route.
+
+**Resolution:** `generate_player_press_resistance_index` and its
+`/reports/player/{player_id}/press-resistance` endpoint are served
+UNCONDITIONALLY (not behind the `PUBLIC_DEPLOYMENT` flag), consistent
+with view 1's match-summary exemption above — there is no raw/aggregated
+split for this feature the way the touch map/timeline/shot map each have,
+because there is no raw variant of this feature to begin with (its output
+is a rate by construction, not a downsampling of a richer raw view).
