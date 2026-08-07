@@ -8,6 +8,24 @@ Streamlit integration: Project Athena's dashboard, now five tabs wide.
      Fast, request/response, no blocking loop.
   2. "Live Tactical Threat Monitor" (Milestone 17) -- a WebSocket stream,
      triggered by "Start Stream". See the ARCHITECTURAL DECISION below.
+     Extended (additive) with Tactical Momentum: a rolling-window
+     smoothing + trend indicator computed CLIENT-SIDE over the same
+     `threat_buffer` this panel already accumulates -- see
+     `_compute_tactical_momentum`'s own docstring for the exact
+     definitions (window sizes, thresholds, classification labels).
+     Deliberately NOT persisted anywhere (no new `alert_store.py` table,
+     no new endpoint) -- a live, ephemeral, per-connection computation,
+     the same scope the existing threat chart itself already has; there
+     is no reason to persist a client-side smoothing of an already-
+     ephemeral live number. ADR-021 condition 2: inherits the compliance
+     audit's existing "StatsBomb-sourced live tactical stream... already
+     condition-2-compliant by construction" finding (see ADR-021's Update
+     section) for BOTH `source=statsbomb` and `source=cv` -- this feature
+     reads ONLY the already-compliant `threat_15s` scalar out of each
+     message (never the `players`/`ball` fields `source=cv` messages also
+     carry) and reduces it further (an average, then a difference of two
+     averages), so it can only carry LESS information than the signal
+     already found compliant, never more. No new gating needed.
 
 The four new tabs ("Player Reports", "Team Reports", "Team Trends",
 "Team Comparison") are a pure UI WIRING layer over the existing reporting
@@ -140,6 +158,14 @@ from production.src.reporting.team_trend_data import (
 from production.src.reporting.team_trend_visualizer import render_team_trend_comparison
 from production.src.reporting.team_visualizer import render_team_dashboard
 
+from production.frontend.tactical_momentum import (
+    MOMENTUM_MIN_MESSAGES_FOR_TREND,
+    MOMENTUM_SMOOTHING_WINDOW_MESSAGES,
+    MOMENTUM_TREND_LOOKBACK_MESSAGES,
+    MOMENTUM_TREND_THRESHOLD,
+    _compute_tactical_momentum,
+)
+
 # ADR-021 condition-2 / Team Trends serving-contradiction compliance fix:
 # this dashboard process's OWN copy of the same flag api.py checks (see
 # that file's own comment for the full reasoning). Read ONCE at import
@@ -173,6 +199,16 @@ MAX_THREAT_BUFFER_LEN = 60
 MAX_ALERT_BUFFER_LEN = 20
 RECV_TIMEOUT_SECONDS = 60.0  # how long to wait for a single message before treating the stream as stalled
 SIMULATE_REQUEST_TIMEOUT_SECONDS = 5.0  # mandatory -- see What-If section below
+
+# Tactical Momentum (additive new feature): rolling-window smoothing +
+# trend indicator computed CLIENT-SIDE over the same `threat_buffer` the
+# existing line chart already accumulates (see MAX_THREAT_BUFFER_LEN
+# above) -- no new WebSocket field, no api.py change. The pure computation
+# itself lives in the separate `tactical_momentum.py` module (plain
+# Python, no `streamlit` import) specifically so it can be unit-tested via
+# a normal `import`, since this script cannot safely be imported directly
+# -- see that module's own docstring for the full Step 0 definition of
+# what these constants mean and why these exact values were chosen.
 TACTICAL_ACTIONS = ["high_press", "drop_deep", "force_wide", "no_change"]
 # ADR-018: report endpoints do real network fetches (StatsBomb), MLflow
 # artifact loads, and pitch-control physics across potentially many chains --
@@ -780,6 +816,11 @@ with tab_cv:
     with chart_col:
         st.subheader("Live Threat Probability (rolling window)")
         chart_placeholder = st.empty()
+        st.caption("Tactical Momentum (rolling smoothing + trend over the same buffer above)")
+        momentum_placeholder = st.empty()
+        momentum_placeholder.info(
+            f"Momentum: warming up (0/{MOMENTUM_MIN_MESSAGES_FOR_TREND} messages)"
+        )
 
     with alerts_col:
         st.subheader("Tactical Alerts")
@@ -796,6 +837,34 @@ with tab_cv:
             alerts_placeholder.write("No alerts yet.")
             return
         alerts_placeholder.markdown("\n\n".join(f"- {text}" for text in alerts_buffer))
+
+    def _render_momentum(momentum: dict) -> None:
+        """Renders `_compute_tactical_momentum`'s return value. Uses the
+        SAME `delta_color="inverse"` convention the What-If Simulator's
+        own delta metric above already established (a rising number here
+        means rising THREAT, which is bad news, not good news -- default
+        st.metric coloring has that backwards)."""
+        if momentum["status"] == "warming_up":
+            momentum_placeholder.info(
+                f"Momentum: warming up ({momentum['messages_so_far']}/"
+                f"{momentum['messages_needed']} messages)"
+            )
+            return
+        with momentum_placeholder.container():
+            st.metric(
+                "Tactical Momentum",
+                momentum["classification"],
+                delta=(
+                    f"{momentum['trend'] * 100:+.2f} pp smoothed "
+                    f"(last {MOMENTUM_TREND_LOOKBACK_MESSAGES} messages)"
+                ),
+                delta_color="inverse",
+                help=(
+                    f"Smoothed threat_15s (last {MOMENTUM_SMOOTHING_WINDOW_MESSAGES} messages): "
+                    f"{momentum['smoothed_now'] * 100:.2f}%. Classification threshold: "
+                    f"+/-{MOMENTUM_TREND_THRESHOLD * 100:.1f} pp trend."
+                ),
+            )
 
     if start_clicked:
         # Milestone 33: which data source's query params to build depends on
@@ -864,6 +933,7 @@ with tab_cv:
                         if len(threat_buffer) > MAX_THREAT_BUFFER_LEN:
                             threat_buffer.pop(0)
                         chart_placeholder.line_chart(pd.DataFrame({"threat_15s": threat_buffer}))
+                        _render_momentum(_compute_tactical_momentum(threat_buffer))
                         # real_time_lag_sec (Milestone 33, CV source only): how
                         # far behind real video time the stream currently is.
                         # Surfaced honestly rather than silently either

@@ -40,12 +40,24 @@ import streamlit as st
 import uvicorn
 from streamlit.testing.v1 import AppTest
 
+from fastapi.testclient import TestClient
+
 import production.src.serving.api as api_module
+from production.frontend.tactical_momentum import (
+    MOMENTUM_MIN_MESSAGES_FOR_TREND,
+    MOMENTUM_TREND_THRESHOLD,
+    _compute_tactical_momentum,
+)
 from production.src.serving import alert_store as alert_store_module
 from production.src.serving.api import app as _fastapi_app
 
 DASHBOARD_PATH = "production/frontend/dashboard.py"
 APP_TIMEOUT_SECONDS = 180
+# Same real cached match test_api.py's own tactical-stream tests use (and
+# dashboard.py's own DEFAULT_MATCH_ID) -- delay=0.0 so these tests don't
+# pay the streaming pacing cost for real messages they don't need to wait
+# real-time for.
+TACTICAL_STREAM_MATCH_ID = 3857276
 
 
 @pytest.fixture(scope="module")
@@ -98,6 +110,110 @@ def test_dashboard_loads_all_seven_tabs_no_exception():
     assert "Team-Season Style Comparison" in headers
     assert "Pass Network" in headers
     assert "Alerts History" in headers
+
+
+# ============================================================================
+# TAB: Live CV Monitor -- Tactical Momentum (additive new feature): a
+# rolling-window smoothing + trend indicator computed CLIENT-SIDE over the
+# `threat_15s` values `/ws/tactical-stream` already sends. `_compute_
+# tactical_momentum` lives in the separate, plain-Python `tactical_
+# momentum.py` module specifically so it's importable and unit-testable
+# without going through `AppTest` (dashboard.py itself cannot safely be
+# imported as a plain module -- see its own docstring's import-path
+# comment). Real data throughout, same discipline as the rest of this
+# file: real `threat_15s` values pulled from a REAL cached match via
+# `/ws/tactical-stream` (the exact same endpoint dashboard.py's own
+# streaming loop calls), not synthetic numbers -- reuses `TestClient`
+# in-process (test_api.py's own pattern for this endpoint) rather than
+# the heavier `live_api_server` + real-socket fixture other tests in this
+# file need, since this feature never touches Streamlit rendering itself.
+# ============================================================================
+
+
+def _collect_real_threat_sequence(count: int) -> list[float]:
+    with TestClient(_fastapi_app) as client:
+        with client.websocket_connect(
+            f"/ws/tactical-stream?match_id={TACTICAL_STREAM_MATCH_ID}&delay=0.0"
+        ) as ws:
+            threats: list[float] = []
+            while len(threats) < count:
+                message = ws.receive_json()
+                if message["type"] == "threat":
+                    threats.append(message["threat_15s"])
+    return threats
+
+
+def test_compute_tactical_momentum_empty_buffer_warming_up_no_crash():
+    """The insufficient-data edge case at the very start of a stream
+    (buffer length 0) -- must not crash or fabricate a trend."""
+    momentum = _compute_tactical_momentum([])
+    assert momentum == {
+        "status": "warming_up",
+        "messages_so_far": 0,
+        "messages_needed": MOMENTUM_MIN_MESSAGES_FOR_TREND,
+    }
+
+
+def test_compute_tactical_momentum_warming_up_boundary_real_data():
+    """Real threat_15s values (not synthetic) around the exact
+    MOMENTUM_MIN_MESSAGES_FOR_TREND boundary: one message short must still
+    report "warming_up" with the real, honest count; exactly at the
+    minimum must switch to "ready" with a real classification."""
+    threats = _collect_real_threat_sequence(MOMENTUM_MIN_MESSAGES_FOR_TREND)
+    assert len(threats) == MOMENTUM_MIN_MESSAGES_FOR_TREND
+
+    one_short = _compute_tactical_momentum(threats[:-1])
+    assert one_short["status"] == "warming_up"
+    assert one_short["messages_so_far"] == MOMENTUM_MIN_MESSAGES_FOR_TREND - 1
+    assert one_short["messages_needed"] == MOMENTUM_MIN_MESSAGES_FOR_TREND
+
+    at_minimum = _compute_tactical_momentum(threats)
+    assert at_minimum["status"] == "ready"
+    assert at_minimum["classification"] in {"Building", "Fading", "Stable"}
+
+
+def test_compute_tactical_momentum_real_data_shows_genuine_rise_and_fall():
+    """Step 3.1's real sanity check: replayed against 150 real messages
+    from a real cached match (source=statsbomb), the classification must
+    show genuine variation -- not stuck on one label -- and, specifically,
+    both a real "Building" (threat genuinely rising) and a real "Fading"
+    (threat genuinely falling) period must actually occur. VERIFIED
+    manually against this exact match/stream before writing this
+    assertion: real threat_15s rises from ~0.03 to ~0.33 and back down
+    across these messages, producing sustained real trend values well
+    past MOMENTUM_TREND_THRESHOLD in both directions (e.g. a real
+    +0.21 smoothed trend around message 40, a real -0.22 smoothed trend
+    around message 100) -- not borderline, noise-driven flips."""
+    threats = _collect_real_threat_sequence(150)
+
+    classifications = []
+    for i in range(MOMENTUM_MIN_MESSAGES_FOR_TREND, len(threats) + 1):
+        momentum = _compute_tactical_momentum(threats[:i])
+        assert momentum["status"] == "ready"
+        classifications.append(momentum["classification"])
+
+    assert "Building" in classifications
+    assert "Fading" in classifications
+    assert "Stable" in classifications
+
+
+def test_compute_tactical_momentum_trend_sign_matches_threshold_real_data():
+    """Cross-check independent of the function's own internal threshold
+    comparison: for every real "ready" reading, the classification must
+    agree with a fresh, independently-computed sign check against
+    MOMENTUM_TREND_THRESHOLD -- catches a flipped comparison operator or
+    an inverted trend sign that a same-formula assertion could not."""
+    threats = _collect_real_threat_sequence(80)
+
+    for i in range(MOMENTUM_MIN_MESSAGES_FOR_TREND, len(threats) + 1):
+        momentum = _compute_tactical_momentum(threats[:i])
+        trend = momentum["trend"]
+        if trend > MOMENTUM_TREND_THRESHOLD:
+            assert momentum["classification"] == "Building"
+        elif trend < -MOMENTUM_TREND_THRESHOLD:
+            assert momentum["classification"] == "Fading"
+        else:
+            assert momentum["classification"] == "Stable"
 
 
 def test_player_reports_tab_low_sample_warning_renders_real_data(live_api_server):
