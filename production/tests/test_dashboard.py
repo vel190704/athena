@@ -715,7 +715,11 @@ def test_team_reports_tab_renders_real_data(live_api_server):
     team_tab = at.tabs[2]
 
     assert not at.exception
-    assert len(team_tab.image) == 1
+    # 2 images, not 1: the pitch-control Team Report's own image, PLUS
+    # the Passing Lane Visualizer's raw image (an additive new panel in
+    # this same tab, PUBLIC_DEPLOYMENT unset by default in this test so
+    # the raw, not aggregated, variant renders).
+    assert len(team_tab.image) == 2
     assert any("Built from" in i.value for i in team_tab.info)
     assert not any("LOW SAMPLE" in w.value for w in team_tab.warning)
 
@@ -746,7 +750,11 @@ def test_team_reports_tab_low_sample_warning_fires_for_real_low_sample_team_real
     team_tab = at.tabs[2]
 
     assert not at.exception
-    assert len(team_tab.image) == 1
+    # 2 images, not 1: the pitch-control Team Report's own image, PLUS
+    # the Passing Lane Visualizer's raw image (an additive new panel in
+    # this same tab, PUBLIC_DEPLOYMENT unset by default in this test so
+    # the raw, not aggregated, variant renders).
+    assert len(team_tab.image) == 2
     assert len(team_tab.warning) >= 1
     assert any("LOW SAMPLE" in w.value for w in team_tab.warning)
 
@@ -853,7 +861,11 @@ def test_team_reports_tab_reproduces_and_fixes_timeout_incident_real_data(live_a
 
     assert not at.exception
     assert elapsed < 30.0, f"took {elapsed:.1f}s -- the whole point of this fix was to make this fast, not just not-timeout"
-    assert len(team_tab.image) == 1
+    # 2 images, not 1: the pitch-control Team Report's own image, PLUS
+    # the Passing Lane Visualizer's raw image (an additive new panel in
+    # this same tab, PUBLIC_DEPLOYMENT unset by default in this test so
+    # the raw, not aggregated, variant renders).
+    assert len(team_tab.image) == 2
     assert any("Built from 2 matches" in i.value for i in team_tab.info), (
         "the pre-filter should have sent exactly the 2 known 360-covered matches, not all 68"
     )
@@ -891,7 +903,11 @@ def test_team_reports_tab_caps_large_valid_selection_real_data(live_api_server):
     team_tab = at.tabs[2]
 
     assert not at.exception
-    assert len(team_tab.image) == 1
+    # 2 images, not 1: the pitch-control Team Report's own image, PLUS
+    # the Passing Lane Visualizer's raw image (an additive new panel in
+    # this same tab, PUBLIC_DEPLOYMENT unset by default in this test so
+    # the raw, not aggregated, variant renders).
+    assert len(team_tab.image) == 2
     assert any("Built from 25 matches (of 25 requested)" in i.value for i in team_tab.info), (
         "the request actually sent must be capped to 25, not the full 51"
     )

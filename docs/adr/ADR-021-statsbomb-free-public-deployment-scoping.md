@@ -672,3 +672,98 @@ one conceptual feature area. No raw/aggregated split exists for this
 feature, for the same reason none exists for Press Resistance Index or
 Tactical Entropy: its output is a many-to-one grid aggregate by
 construction, not a downsampling of a richer per-event view.
+
+## Addendum: Passing Lane Visualizer (`generate_team_passing_lanes` /
+`generate_team_passing_lanes_aggregated`)
+
+**This is NOT simply exempt "because it feels like Session/Match
+Comparison" -- checked explicitly, and the two features turn out to need
+OPPOSITE treatments for different parts of the same output.** Session/
+Match Comparison's 10x7 grid carries NO player identity anywhere; Passing
+Lane's own `lanes` field (a named passer/recipient PAIR with a scalar
+openness score) is structurally similar to that precedent, but this
+feature's `nodes` field (each named player's own precise AVERAGE
+LOCATION, needed to actually draw a lane on a pitch diagram) reintroduces
+the EXACT ingredient combination — a named individual + a precise average
+location + a real, non-trivial score attached to it — that already got
+Pass Network's raw edges gated. Verified this directly by re-reading
+Pass Network's own gating reasoning above rather than assuming the newer
+feature automatically inherits either precedent.
+
+**1. `lanes` (passer_id/name, recipient_id/name, `mean_lane_openness`,
+`n_pass_samples`) — EXEMPT, same reasoning as Press Resistance Index.**
+No location anywhere in this field. A named pair with a scalar (here,
+averaged across real per-pass openness scores rather than a rate over
+event-type counts) is the same shape already found exempt for a single
+named entity — extending it to a named PAIR does not introduce location
+or timing precision, the actual things condition 2 cares about. Knowing
+"Piqué → Lenglet: 0.845 mean openness across 22 real passes" reveals no
+single pass's exact trajectory, minute, or outcome.
+
+**2. `nodes` (player_id, name, `avg_location`) — NOT exempt, same
+reasoning as Pass Network's raw edges, gated the SAME way.** This is a
+real per-player AVERAGE location (the mean of each player's own
+`event.location`/`pass.end_location` across every real pass sample used),
+individually attributable to a named player — structurally identical to
+Pass Network's own node convention, which the existing "Condition 2
+Applied to the Pass Network" Update section above already resolved must
+be LOCAL/PRIVATE ONLY. There is no reason a location that was risky when
+attached to a completed-pass COUNT becomes safe when attached to an
+openness SCORE instead — the risky ingredient (a named individual's own
+precise average position) is identical either way.
+
+**3. Resolution, mirroring Pass Network's own raw/aggregated split
+exactly (ADR-014's precedent: scope the constraint, do not remove the
+capability):**
+- `generate_team_passing_lanes` (raw, `nodes` + `lanes` both present) is
+  LOCAL/PRIVATE USE ONLY.
+- `generate_team_passing_lanes_aggregated` pops `nodes` before returning
+  — `lanes` (the condition-2-EXEMPT field, per point 1) passes through
+  UNCHANGED, keeping player names on each pair (matching
+  `generate_pass_network_aggregated`'s own precedent of keeping
+  per-player names in `player_summary` while stripping only location and
+  pairwise edges).
+- `/reports/team/{team_name}/passing-lanes` follows the SAME
+  `PUBLIC_DEPLOYMENT` branching pattern the shot map / Pass Network /
+  Player Dashboard touch-map endpoints already established: the raw
+  variant is served only when `PUBLIC_DEPLOYMENT` is unset; the
+  aggregated variant (no `nodes`) otherwise. `render_passing_lanes`
+  (needs `nodes` to plot lines at real coordinates) is therefore also
+  LOCAL/PRIVATE ONLY, exactly like `render_pass_network`; a
+  location-free bar-chart renderer
+  (`render_passing_lanes_aggregated`, ranking named pairs by openness
+  with no pitch/location involved) is the public-safe counterpart,
+  mirroring `render_pass_network_aggregated`'s own bar-chart fallback.
+
+## Addendum: Opposition Analysis (`generate_team_opposition_analysis`)
+
+Resolved EXEMPT from condition 2, checked per-metric rather than assumed
+as a bundle, since this feature deliberately combines one REUSED
+pre-existing field with two genuinely NEW ones.
+
+**1. Weak-zone pitch control** — not a new gating question at all. This
+is `generate_team_report`'s own EXISTING `weakest_control_zones` field,
+unmodified, un-recomputed — already covered by the original compliance
+audit's own finding above ("the aggregate heatmap... already
+condition-2-compliant by construction"). Re-labeling it "opposition
+scouting: where to attack this team" in the UI changes nothing about
+the underlying data or its computation, so nothing new to resolve here.
+
+**2. `build_up_tendency`** (`total_buildup_passes`, `long_passes`,
+`long_pass_share`) — a plain aggregate rate/count pair, the same shape
+already found exempt for Press Resistance Index/Tactical Entropy. No
+location (only a pass's LENGTH is used, a derived scalar distance, never
+the pass's own coordinates), no player, no minute anywhere in the
+output.
+
+**3. `set_piece_reliance`** (`total_shots`, `set_piece_shots`,
+`set_piece_shot_share`) — same shape, same reasoning: an aggregate
+count/rate over real `play_pattern` categories, no individual shot's
+location, player, or minute exposed.
+
+**Resolution:** `generate_team_opposition_analysis` and its
+`/reports/team/{team_name}/opposition-analysis` endpoint are served
+UNCONDITIONALLY, not gated by `PUBLIC_DEPLOYMENT` — consistent with
+Press Resistance Index and Tactical Entropy's own exemptions, for the
+same reason: pure aggregate counts/rates, nothing individually
+recoverable at any sample size.

@@ -15,11 +15,13 @@ through ADR-016.
 
 import logging
 import math
+from collections import defaultdict
 
 import torch
 
 from production.src.ingestion.statsbomb_io import (
     X_SCALE,
+    Y_SCALE,
     fetch_match_360,
     fetch_match_events,
     parse_360_frame,
@@ -565,4 +567,465 @@ def generate_team_pass_entropy(team_name: str, match_ids: list[int]) -> dict:
         "pass_entropy_used_low_sample_flag": (
             total_transitions < MIN_TRANSITIONS_FOR_CONFIDENT_PASS_ENTROPY
         ),
+    }
+
+
+# ============================================================================
+# Passing Lane Visualizer (additive new feature): the SAME
+# BiomechanicalPitchControl pitch-control field this module's own
+# control_heatmap_grid already computes, sampled specifically along
+# candidate PASSING LANES (the straight-line segment between a real
+# passer and a real recipient) rather than binned into a full-pitch grid.
+#
+# OPPORTUNITY, NOT HISTORY -- explicitly distinct from pass_network.py's
+# edges: Pass Network counts whether/how often a pass was actually
+# COMPLETED (a real outcome). This feature instead scores how CONTESTED
+# the space along a given real pass's trajectory was, independent of
+# whether that pass succeeded -- a genuinely different signal (e.g. a
+# skilled pass through heavy traffic that still succeeds scores LOW
+# openness despite a good outcome; an intercepted pass through a
+# genuinely open lane -- rare, but real -- would score HIGH openness
+# despite a bad outcome).
+#
+# A REAL, LOAD-BEARING DATA-STRUCTURE FINDING THAT SHAPES THIS FEATURE'S
+# ACTUAL ACHIEVABLE SCOPE (checked directly before building anything, not
+# assumed): `parse_360_frame`'s own docstring already establishes that a
+# 360 freeze-frame entry carries NO player id/name for anyone except the
+# event's own ACTING player -- "there is NO way to know who any of the
+# other ~21 visible players are" (verified against 21,273 real
+# freeze-frames, Milestone 22). This means a SPECIFIC NAMED teammate
+# pair's positions can NEVER both be read directly from one freeze-frame
+# (only the acting player -- the passer -- has a known identity in that
+# frame). The roadmap's own suggested framing ("mean lane-openness
+# between each pair of teammates who actually played together, across
+# ALL FRAMES where both were on the pitch") is therefore NOT achievable
+# from this data at all -- it would require identifying a specific named
+# teammate's own anonymous dot in an arbitrary frame, which nothing in
+# this codebase (and no field in this data) supports.
+#
+# What IS achievable, and what this feature actually builds instead: for
+# each real Pass EVENT (the ball's actual attempted trajectory, from a
+# NAMED passer via `event.player` to a NAMED recipient via
+# `event.pass.recipient` -- both real, known identities straight from the
+# event's own metadata, no freeze-frame identity-matching needed), sample
+# pitch control along that event's own real straight-line trajectory
+# (`event.location` -> `event.pass.end_location`), using the SAME
+# freeze-frame's DEFENDING team positions -- which need NO individual
+# identity at all, only the `is_teammate` flag `parse_360_frame` already
+# exposes. Aggregated per NAMED (passer, recipient) pair across every
+# usable real pass in the given match_ids. This is anchored to passes
+# that were actually ATTEMPTED (a hybrid of opportunity -- the lane's
+# real geometric openness, independent of outcome -- and history -- only
+# pairs a pass was actually tried between get sampled at all), not a
+# survey of every conceivable teammate pair at every frame; stated
+# plainly here as a genuine, real scope limitation, not implied to be
+# broader than it is.
+# ============================================================================
+
+# Step 0.1: 11 evenly-spaced points (inclusive of both ends) along a
+# pass's own real straight-line trajectory -- a reasonable, explicit
+# choice (not proven-optimal): real median pass distance in a 360-covered
+# sample match (3773386) was 12.0m, so 11 points gives ~1.2m spacing at
+# the median, comparable to a player's own body/positioning scale.
+LANE_SAMPLE_POINTS = 11
+
+# BiomechanicalPitchControl only evaluates control within `mask_radius`
+# (30.0m default) of the BALL -- verified directly (control.py's own
+# sparse-masking, ADR-005) before relying on it, not assumed to cover an
+# arbitrary lane end to end. VERIFIED against real data before deciding
+# how to handle this: 92.9% of match 3773386's 1,060 real passes (with a
+# named recipient) were fully within 30m of their own passer end to end,
+# so most real lanes are ENTIRELY covered; requiring a STRICT MAJORITY
+# (> half) of LANE_SAMPLE_POINTS to remain in-mask handles the remaining
+# ~7% (long diagonal switches) by using only the ball-proximal portion of
+# the lane, rather than fabricating a value for the unmeasured far
+# portion or silently discarding every long pass outright.
+LANE_MIN_COVERED_SAMPLES = 6
+
+# Step 1 low-sample threshold: reuses MIN_HISTORICAL_EVENTS (20) directly
+# (not recalibrated, unlike Session/Match Comparison's threshold) --
+# VERIFIED this is a MEANINGFUL bar here, not a vacuous one: real
+# per-(passer,recipient)-pair attempt counts in ONE 360-covered match
+# (3773386) ranged min=1, median=4, max=22 across 150 distinct real
+# pairs -- 20 real, multi-match-aggregated attempts is a genuine,
+# discriminating confidence bar for a SPECIFIC pair, unlike match-level
+# comparison's own located-event counts (which never dipped below 896 in
+# this project's whole cache, making 20 meaningless there).
+MIN_PASS_SAMPLES_FOR_CONFIDENT_LANE_OPENNESS = MIN_HISTORICAL_EVENTS
+
+
+def _lane_sample_points(start: torch.Tensor, end: torch.Tensor, n: int) -> torch.Tensor:
+    """`n` evenly-spaced points (inclusive of both ends) along the
+    straight-line segment from `start` to `end`, in the SAME 100x68m
+    rescaled space `parse_360_frame`'s own `player_pos`/`ball_pos`
+    already use. Passed directly as the `pitch_grid` argument to
+    `BiomechanicalPitchControl` -- REUSING that engine's own existing,
+    general-purpose query-point interface exactly as designed (it
+    already accepts an arbitrary `[N_total, 2]` tensor of query points,
+    not hardcoded to the dense 100x68 grid `_build_pitch_grid` happens to
+    construct for the full heatmap above) -- not a new sampling
+    convention invented for this feature.
+    """
+    t = torch.linspace(0.0, 1.0, n).unsqueeze(1)  # [n, 1]
+    return start.unsqueeze(0) * (1.0 - t) + end.unsqueeze(0) * t  # [n, 2]
+
+
+def _lane_openness_for_pass(event: dict, frame_data: dict, engine: BiomechanicalPitchControl) -> float | None:
+    """Real lane-openness score for ONE real Pass event with a matched
+    360 frame: `1.0 - max(defending-team control along the sampled
+    segment)`. Two DISTINCT reductions, deliberately not conflated:
+
+    1. Per sample point, `control_probabilities.max(dim=0).values` --
+       the SAME per-cell reduction `generate_team_report`'s own
+       `control_heatmap_grid` above already uses (the highest INDIVIDUAL
+       defending player's control probability at that point) -- reused
+       exactly, not reinvented.
+    2. Across the lane's own sample points, `.max()` -- Step 0.1's own
+       NEW choice for THIS feature specifically: a single point of high
+       defensive control anywhere along the lane can kill it even if the
+       rest is open, so MAX (not mean) is the conservative, realistic
+       reduction for "was this lane genuinely open," matching the
+       roadmap's own stated reasoning for preferring max here.
+
+    Returns `None` (skip, don't fabricate) if `location`/`end_location`
+    are missing, no defending players are visible in this freeze-frame,
+    or fewer than `LANE_MIN_COVERED_SAMPLES` of the lane's own sample
+    points fall within the engine's `mask_radius` of the ball (Step 0.1).
+    """
+    location = event.get("location")
+    end_location = event.get("pass", {}).get("end_location")
+    if location is None or end_location is None:
+        return None
+
+    parsed = parse_360_frame(event, frame_data)
+    defending_mask = ~parsed["is_teammate"]
+    defending_pos = parsed["player_pos"][defending_mask]
+    defending_vel = parsed["player_vel"][defending_mask]
+    defending_fatigue = parsed["fatigue_mod"][defending_mask]
+    if defending_pos.shape[0] == 0:
+        return None
+
+    start = torch.tensor([location[0] * X_SCALE, location[1] * Y_SCALE], dtype=torch.float32)
+    end = torch.tensor([end_location[0] * X_SCALE, end_location[1] * Y_SCALE], dtype=torch.float32)
+    lane_points = _lane_sample_points(start, end, LANE_SAMPLE_POINTS)
+
+    _, control_probabilities, _ = engine(defending_pos, defending_vel, defending_fatigue, lane_points, parsed["ball_pos"])
+    if control_probabilities.shape[1] < LANE_MIN_COVERED_SAMPLES:
+        return None
+
+    defending_control_per_sample = control_probabilities.max(dim=0).values
+    return 1.0 - defending_control_per_sample.max().item()
+
+
+def _team_passing_lane_samples(match_id: int, team_name: str, engine: BiomechanicalPitchControl) -> list[dict]:
+    """Real per-pass lane-openness samples for `team_name`'s own passes
+    in ONE match -- one dict per usable real pass event (a NAMED
+    recipient AND a matched 360 frame; VERIFIED against match 3773386:
+    985 of 1,118 real Pass events, 88%, cleared both). NOT filtered by
+    completion (see this section's own header comment, Step 0.3) --
+    reuses the exact same "an attempted pass's own trajectory is real
+    information regardless of outcome" reasoning `generate_team_pass_entropy`
+    already established for a different purpose.
+    """
+    events = fetch_match_events(match_id)
+    frames = fetch_match_360(match_id)
+    if events is None or frames is None:
+        return []
+    frames_by_uuid = {f["event_uuid"]: f for f in frames}
+
+    samples = []
+    for event in events:
+        if event.get("type", {}).get("name") != "Pass":
+            continue
+        if event.get("team", {}).get("name") != team_name:
+            continue
+        passer = event.get("player")
+        recipient = event.get("pass", {}).get("recipient")
+        if passer is None or passer.get("id") is None or recipient is None or recipient.get("id") is None:
+            continue
+        frame_data = frames_by_uuid.get(event["id"])
+        if frame_data is None:
+            continue
+
+        openness = _lane_openness_for_pass(event, frame_data, engine)
+        if openness is None:
+            continue
+
+        location, end_location = event["location"], event["pass"]["end_location"]
+        samples.append({
+            "passer_id": passer["id"],
+            "passer_name": passer["name"],
+            "recipient_id": recipient["id"],
+            "recipient_name": recipient["name"],
+            "passer_location": [location[0] * X_SCALE, location[1] * Y_SCALE],
+            "recipient_location": [end_location[0] * X_SCALE, end_location[1] * Y_SCALE],
+            "lane_openness": openness,
+        })
+    return samples
+
+
+def generate_team_passing_lanes(team_name: str, match_ids: list[int]) -> dict:
+    """RAW Passing Lane data for `team_name` -- LOCAL/PRIVATE USE ONLY
+    (ADR-021 condition 2: see this feature's own addendum;
+    `generate_team_passing_lanes_aggregated` below is the public-safe
+    counterpart). Real per-player average location (`nodes`) PLUS real
+    per-(passer, recipient)-pair mean lane-openness (`lanes`),
+    individually attributable to named players -- structurally the SAME
+    risk class `pass_network.py`'s raw edges already established (a
+    named pair + a precise average location + a real score), gated the
+    exact same way, NOT the Session/Match Comparison precedent (which
+    has no location anywhere in its own output at all).
+
+    `matches_used` counts a match toward the total only if `team_name`
+    played in it AND at least one usable real pass sample was found
+    there (360-covered, named recipient) -- matches
+    `generate_team_report`'s own `matches_used` semantics.
+    """
+    engine = BiomechanicalPitchControl()
+
+    all_samples: list[dict] = []
+    matches_used = 0
+    for match_id in match_ids:
+        teams = _teams_in_match(match_id)
+        if team_name not in teams:
+            logger.info(f"match_id={match_id}: {team_name!r} did not play, skipping.")
+            continue
+        samples = _team_passing_lane_samples(match_id, team_name, engine)
+        if samples:
+            matches_used += 1
+        all_samples.extend(samples)
+
+    pair_openness: dict[tuple[int, int], list[float]] = defaultdict(list)
+    pair_names: dict[tuple[int, int], tuple[str, str]] = {}
+    location_sum: dict[int, list[float]] = defaultdict(lambda: [0.0, 0.0])
+    location_count: dict[int, int] = defaultdict(int)
+    player_names: dict[int, str] = {}
+
+    for s in all_samples:
+        key = (s["passer_id"], s["recipient_id"])
+        pair_openness[key].append(s["lane_openness"])
+        pair_names[key] = (s["passer_name"], s["recipient_name"])
+        for role_id, role_name, role_loc in (
+            (s["passer_id"], s["passer_name"], s["passer_location"]),
+            (s["recipient_id"], s["recipient_name"], s["recipient_location"]),
+        ):
+            location_sum[role_id][0] += role_loc[0]
+            location_sum[role_id][1] += role_loc[1]
+            location_count[role_id] += 1
+            player_names[role_id] = role_name
+
+    nodes = [
+        {
+            "player_id": player_id,
+            "name": player_names[player_id],
+            "avg_location": [
+                location_sum[player_id][0] / location_count[player_id],
+                location_sum[player_id][1] / location_count[player_id],
+            ],
+        }
+        for player_id in location_count
+    ]
+
+    lanes = []
+    for (passer_id, recipient_id), values in pair_openness.items():
+        passer_name, recipient_name = pair_names[(passer_id, recipient_id)]
+        n = len(values)
+        lanes.append({
+            "passer_id": passer_id,
+            "passer_name": passer_name,
+            "recipient_id": recipient_id,
+            "recipient_name": recipient_name,
+            "mean_lane_openness": sum(values) / n,
+            "n_pass_samples": n,
+            "passing_lane_used_low_sample_flag": n < MIN_PASS_SAMPLES_FOR_CONFIDENT_LANE_OPENNESS,
+        })
+    lanes.sort(key=lambda lane: -lane["mean_lane_openness"])
+
+    return {
+        "team_name": team_name,
+        "matches_requested": len(match_ids),
+        "matches_used": matches_used,
+        "total_pass_samples_used": len(all_samples),
+        "nodes": nodes,
+        "lanes": lanes,
+    }
+
+
+def generate_team_passing_lanes_aggregated(team_name: str, match_ids: list[int]) -> dict:
+    """ADR-021 condition-2-compliant variant of `generate_team_passing_lanes`,
+    for PUBLIC deployments -- mirrors `pass_network.generate_pass_network_aggregated`'s
+    own raw-pop-then-summarize pattern exactly (reuses `generate_team_passing_lanes`
+    internally rather than re-implementing its fetch/sampling logic; the
+    raw `nodes` list -- the ONLY field carrying a player's precise
+    average LOCATION -- is a LOCAL variable of this function only, popped
+    via `dict.pop`, never left on the returned dict).
+
+    `lanes` (named pairs + mean openness + real sample counts) is kept
+    UNCHANGED from the raw variant: per this feature's own ADR-021
+    addendum, a named pair with a scalar score and no location is its own
+    genuinely different, lower-risk shape from `nodes` -- the same
+    reasoning that already keeps `pass_network_aggregated`'s per-player
+    names in its `player_summary` while stripping only location/edges.
+    """
+    full = generate_team_passing_lanes(team_name, match_ids)
+    full.pop("nodes")
+    return full
+
+
+# ============================================================================
+# Opposition Analysis (additive new feature): 3 SPECIFIC, computable
+# opposition-scouting metrics for `team_name` -- deliberately NOT a vague
+# "insights" dump (Step 0's own explicit scoping discipline). Each
+# answers a genuinely different real scouting question:
+#   1. Weak-zone pitch control (where is this team spatially weak
+#      defensively) -- REUSED, NOT RECOMPUTED, from generate_team_report's
+#      EXISTING `weakest_control_zones` field. Deliberately NOT
+#      re-derived here: dashboard.py's Opposition Analysis panel reads
+#      the ALREADY-FETCHED team_report_dict the SAME tab's own pitch-
+#      control panel already requested, and re-presents that one field
+#      under an "opposition scouting: where to attack this team" label,
+#      at the PRESENTATION layer, with ZERO additional backend
+#      computation -- no wrapper function for this metric exists in this
+#      module at all, since one would either recompute (forbidden) or
+#      just re-export a field callers can already read directly.
+#   2. Build-up length tendency (`generate_team_opposition_analysis`
+#      below) -- does this team build up short/patient or long/direct;
+#      shapes whether a high press or a compact mid-block is the better
+#      counter.
+#   3. Set-piece shot reliance (`generate_team_opposition_analysis`
+#      below) -- how much of this team's shot volume comes from
+#      manufactured dead-ball situations vs open play; shapes whether
+#      restart marking discipline matters more than open-play defending
+#      against them.
+# A fourth or fifth metric (counter-attack frequency, high-press
+# resistance, ...) would be a real, defensible addition but was
+# deliberately NOT built here -- 3 specific, justified metrics, not an
+# open-ended feature dump, per Step 0's own explicit instruction.
+# ============================================================================
+
+# Step 0.2's length threshold, scoped to defensive/middle-third passes
+# only (build-up phase, not attacking-third passes which are naturally
+# shorter/more incisive and answer a different question). VERIFIED
+# against real data before choosing 25.0m: match 3773386's 532 real
+# Barcelona build-up passes (defensive + middle third) had median 13.2m,
+# p75 18.8m -- 25.0m sits comfortably above the bulk of the real
+# distribution, isolating a genuinely distinct minority (9.8% of this
+# real sample) as "long," rather than a threshold so loose it captures a
+# fifth of all passes (20m -> 21.1%) or so strict it captures almost
+# none (30m -> 4.7%). A reasonable, stated choice, not a provably
+# optimal one -- same discipline as every prior length/distance judgment
+# call this project has made explicit (Press Resistance Index's shot
+# definition, Tactical Entropy's direction threshold).
+BUILDUP_LONG_PASS_THRESHOLD_METERS = 25.0
+
+# Step 0.3's set-piece definition. VERIFIED real StatsBomb `play_pattern`
+# values against match 3773386 before choosing which ones count (9
+# distinct real values observed: "Regular Play", "From Throw In", "From
+# Free Kick", "From Corner", "From Kick Off", "From Goal Kick", "From
+# Keeper", "Other", "From Counter"). Deliberately scoped to
+# {"From Corner", "From Free Kick"} only -- the two patterns real
+# football scouting conventionally means by "set piece" (a manufactured,
+# rehearsed attacking situation) -- NOT "From Throw In"/"From Kick Off"/
+# "From Goal Kick"/"From Keeper", which are also technically dead-ball
+# restarts but are not what "set-piece reliance" colloquially asks about
+# in a scouting context (a throw-in is not a rehearsed goal-threat
+# situation the way a corner or free kick routine is).
+SET_PIECE_PLAY_PATTERNS = frozenset({"From Corner", "From Free Kick"})
+
+MIN_BUILDUP_PASSES_FOR_CONFIDENT_LENGTH_TENDENCY = MIN_HISTORICAL_EVENTS
+MIN_SHOTS_FOR_CONFIDENT_SET_PIECE_RELIANCE = MIN_HISTORICAL_EVENTS
+
+
+def generate_team_opposition_analysis(team_name: str, match_ids: list[int]) -> dict:
+    """Opposition Analysis (additive new feature): `team_name`'s
+    build-up-length tendency and set-piece shot reliance, aggregated
+    across `match_ids` -- see this section's own header comment for the
+    3-metric scoping (this function computes metrics 2 and 3; metric 1,
+    the pitch-control weak zones, is reused directly from
+    `generate_team_report`'s existing output, not recomputed here).
+
+    Event-data only -- no 360 freeze-frame coverage needed (unlike
+    Passing Lanes above), same class as Tactical Entropy/Press Resistance
+    Index.
+
+    `build_up_tendency`: `long_pass_share` among this team's own
+    defensive-and-middle-third passes only (Step 0.2) -- the attacking
+    third is deliberately excluded, since final-third passes answer a
+    different question (incisiveness, not build-up shape).
+
+    `set_piece_reliance`: `set_piece_shot_share` -- what fraction of this
+    team's real shots (any outcome, not just goals) originated from a
+    real `play_pattern` in `SET_PIECE_PLAY_PATTERNS` (Step 0.3).
+
+    Both sub-metrics carry their OWN low-sample flag (reusing
+    MIN_HISTORICAL_EVENTS, same convention as every prior feature this
+    session), since they are independent real-data counts that can be
+    thin even when the other one isn't (e.g. a low-shot match can still
+    have plenty of real build-up passes).
+    """
+    total_buildup_passes = 0
+    long_buildup_passes = 0
+    total_shots = 0
+    set_piece_shots = 0
+    matches_used = 0
+
+    for match_id in match_ids:
+        teams = _teams_in_match(match_id)
+        if team_name not in teams:
+            logger.info(f"match_id={match_id}: {team_name!r} did not play, skipping.")
+            continue
+        events = fetch_match_events(match_id)
+        if events is None:
+            continue
+        matches_used += 1
+
+        for event in events:
+            if event.get("team", {}).get("name") != team_name:
+                continue
+            type_name = event.get("type", {}).get("name")
+
+            if type_name == "Pass":
+                location = event.get("location")
+                end_location = event.get("pass", {}).get("end_location")
+                if location is None or end_location is None:
+                    continue
+                if location[0] * X_SCALE >= FINAL_THIRD_X:
+                    continue  # attacking-third pass -- not build-up (Step 0.2)
+                dx = (end_location[0] - location[0]) * X_SCALE
+                dy = (end_location[1] - location[1]) * Y_SCALE
+                distance = (dx * dx + dy * dy) ** 0.5
+                total_buildup_passes += 1
+                if distance > BUILDUP_LONG_PASS_THRESHOLD_METERS:
+                    long_buildup_passes += 1
+
+            elif type_name == "Shot":
+                total_shots += 1
+                play_pattern = event.get("play_pattern", {}).get("name")
+                if play_pattern in SET_PIECE_PLAY_PATTERNS:
+                    set_piece_shots += 1
+
+    return {
+        "team_name": team_name,
+        "matches_requested": len(match_ids),
+        "matches_used": matches_used,
+        "build_up_tendency": {
+            "total_buildup_passes": total_buildup_passes,
+            "long_passes": long_buildup_passes,
+            "long_pass_share": (
+                long_buildup_passes / total_buildup_passes if total_buildup_passes > 0 else None
+            ),
+            "long_pass_threshold_meters": BUILDUP_LONG_PASS_THRESHOLD_METERS,
+            "build_up_tendency_used_low_sample_flag": (
+                total_buildup_passes < MIN_BUILDUP_PASSES_FOR_CONFIDENT_LENGTH_TENDENCY
+            ),
+        },
+        "set_piece_reliance": {
+            "total_shots": total_shots,
+            "set_piece_shots": set_piece_shots,
+            "set_piece_shot_share": (set_piece_shots / total_shots) if total_shots > 0 else None,
+            "set_piece_play_patterns": sorted(SET_PIECE_PLAY_PATTERNS),
+            "set_piece_reliance_used_low_sample_flag": (
+                total_shots < MIN_SHOTS_FOR_CONFIDENT_SET_PIECE_RELIANCE
+            ),
+        },
     }

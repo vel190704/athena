@@ -65,7 +65,13 @@ from production.src.reporting.player_report import (
     generate_player_shot_map_aggregated,
 )
 from production.src.reporting.team_comparison import compare_team_matches, compare_team_seasons
-from production.src.reporting.team_report import generate_team_pass_entropy, generate_team_report
+from production.src.reporting.team_report import (
+    generate_team_opposition_analysis,
+    generate_team_pass_entropy,
+    generate_team_passing_lanes,
+    generate_team_passing_lanes_aggregated,
+    generate_team_report,
+)
 from production.src.serving.alert_store import DB_PATH as ALERT_DB_PATH
 from production.src.serving.alert_store import count_alerts, fetch_alerts, init_db, log_alert
 from production.src.serving.simulator import live_match_stream
@@ -207,6 +213,12 @@ async def lifespan(app: FastAPI):
            "location, no individually-enumerated event)." if PUBLIC_DEPLOYMENT
            else "raw per-touch location / per-event timeline data (local/private mode). Match "
            "summary is unaffected -- it is unconditionally aggregate, never gated.")
+    )
+    logger.info(
+        f"PUBLIC_DEPLOYMENT={PUBLIC_DEPLOYMENT} -- passing-lanes endpoint will serve "
+        + ("the AGGREGATED (ADR-021 condition-2-compliant) variant only (no player location, named "
+           "pairs/scores unaffected)." if PUBLIC_DEPLOYMENT
+           else "raw per-player location data (local/private mode).")
     )
     logger.info(
         f"API_KEY {'is set -- protected endpoints now require a matching X-API-Key header.' if API_KEY else 'is unset -- no auth check, local/private default behavior (see ADR-022).'}"
@@ -1010,6 +1022,55 @@ async def get_team_pass_entropy(team_name: str, match_ids: list[int] = Query(def
     the full exemption reasoning.
     """
     return await asyncio.to_thread(generate_team_pass_entropy, team_name, match_ids)
+
+
+@app.get("/reports/team/{team_name}/passing-lanes", dependencies=[Depends(_require_api_key)])
+async def get_team_passing_lanes(team_name: str, match_ids: list[int] = Query(default=[])):
+    """Wraps team_report.generate_team_passing_lanes (or, in
+    PUBLIC_DEPLOYMENT mode, generate_team_passing_lanes_aggregated),
+    unmodified. `match_ids` OPTIONAL (default empty list), same
+    caller-friendliness fix as the team-report/pass-entropy endpoints
+    above -- this feature DOES need 360 freeze-frame coverage (unlike
+    Tactical Entropy), matching generate_team_report's own requirement.
+
+    ADR-021 condition-2 compliance (SAME gating decision and pattern as
+    the shot-map/pass-network endpoints above, decided ONCE from the
+    module-level PUBLIC_DEPLOYMENT flag): PUBLIC_DEPLOYMENT=false
+    (default) returns generate_team_passing_lanes's real per-player
+    average location (`nodes`) plus real per-pair mean lane-openness
+    (`lanes`). PUBLIC_DEPLOYMENT=true returns
+    generate_team_passing_lanes_aggregated's `nodes`-free variant instead
+    -- `lanes` (named pairs + scores, no location) is NOT gated, per this
+    feature's own ADR-021 addendum: only `nodes`'s precise per-player
+    average location is the risky ingredient. See that addendum for the
+    full two-part reasoning (why `lanes` and `nodes` needed opposite
+    treatments).
+    """
+    if PUBLIC_DEPLOYMENT:
+        return await asyncio.to_thread(generate_team_passing_lanes_aggregated, team_name, match_ids)
+    return await asyncio.to_thread(generate_team_passing_lanes, team_name, match_ids)
+
+
+@app.get("/reports/team/{team_name}/opposition-analysis", dependencies=[Depends(_require_api_key)])
+async def get_team_opposition_analysis(team_name: str, match_ids: list[int] = Query(default=[])):
+    """Wraps team_report.generate_team_opposition_analysis, unmodified.
+
+    `match_ids` OPTIONAL (default empty list), same caller-friendliness
+    fix as the pass-entropy/passing-lanes endpoints above. Event data
+    only -- no 360 freeze-frame coverage needed (unlike passing-lanes).
+
+    ADR-021 condition 2: NOT gated by PUBLIC_DEPLOYMENT -- plain
+    aggregate counts/rates (build-up pass-length share, set-piece shot
+    share), never an individual event's location/player/minute. See
+    generate_team_opposition_analysis's own docstring in team_report.py
+    for the full Step 0 scoping (3 specific metrics, one of them --
+    pitch-control weak zones -- deliberately NOT duplicated here; it is
+    already served, unmodified, by the existing
+    /reports/team/{team_name} endpoint's own `weakest_control_zones`
+    field), and ADR-021's Opposition Analysis addendum for the full
+    exemption reasoning.
+    """
+    return await asyncio.to_thread(generate_team_opposition_analysis, team_name, match_ids)
 
 
 @app.get("/reports/team-comparison", dependencies=[Depends(_require_api_key)])

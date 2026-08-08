@@ -142,6 +142,10 @@ from production.src.reporting.pass_network_visualizer import (
     render_pass_network,
     render_pass_network_aggregated,
 )
+from production.src.reporting.passing_lane_visualizer import (
+    render_passing_lanes,
+    render_passing_lanes_aggregated,
+)
 from production.src.reporting.player_visualizer import (
     render_player_dashboard,
     render_player_match_timeline,
@@ -530,6 +534,65 @@ def _cached_team_png(report: dict) -> bytes:
         return Path(tmp_path).read_bytes()
     finally:
         Path(tmp_path).unlink(missing_ok=True)
+
+
+# Passing Lane Visualizer (additive new feature): unlike Tactical
+# Entropy, this DOES need 360 freeze-frame coverage (it reuses
+# BiomechanicalPitchControl, same requirement as the pitch-control report
+# above) -- fetched against `_variant_to_match_ids_360` (the SAME
+# 360-covered, already-capped match list the pitch-control report itself
+# uses), not the raw uncapped list.
+@st.cache_data(show_spinner=False)
+def _cached_team_passing_lanes(rest_base_url: str, team_name: str, match_ids: tuple[int, ...]) -> dict:
+    response = requests.get(
+        f"{rest_base_url}/reports/team/{requests.utils.quote(team_name, safe='')}/passing-lanes",
+        params={"match_ids": list(match_ids)},
+        timeout=REPORT_REQUEST_TIMEOUT_SECONDS,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+@st.cache_data(show_spinner=False)
+def _cached_passing_lanes_png(passing_lanes: dict) -> bytes:
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+        tmp_path = tmp.name
+    try:
+        render_passing_lanes(passing_lanes, tmp_path)
+        return Path(tmp_path).read_bytes()
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
+
+
+@st.cache_data(show_spinner=False)
+def _cached_passing_lanes_aggregated_png(passing_lanes_aggregated: dict) -> bytes:
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+        tmp_path = tmp.name
+    try:
+        render_passing_lanes_aggregated(passing_lanes_aggregated, tmp_path)
+        return Path(tmp_path).read_bytes()
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
+
+
+# Opposition Analysis (additive new feature): event-data only, like
+# Tactical Entropy -- fetched against `_variant_to_match_ids` (the RAW,
+# un-360-filtered match selection), not `_variant_to_match_ids_360`. The
+# THIRD metric (pitch-control weak zones) is deliberately NOT fetched
+# here at all -- dashboard.py's own Opposition Analysis panel re-presents
+# the ALREADY-FETCHED team_report_dict's own `weakest_control_zones`
+# field (the SAME dict the pitch-control panel above already requested
+# in this same tab), with zero additional backend computation. See
+# generate_team_opposition_analysis's own docstring in team_report.py.
+@st.cache_data(show_spinner=False)
+def _cached_team_opposition_analysis(rest_base_url: str, team_name: str, match_ids: tuple[int, ...]) -> dict:
+    response = requests.get(
+        f"{rest_base_url}/reports/team/{requests.utils.quote(team_name, safe='')}/opposition-analysis",
+        params={"match_ids": list(match_ids)},
+        timeout=REPORT_REQUEST_TIMEOUT_SECONDS,
+    )
+    response.raise_for_status()
+    return response.json()
 
 
 # team_trend_data.py is a deliberate, NAMED EXCEPTION to ADR-018's
@@ -1723,6 +1786,150 @@ with tab_team:
 
                 with st.expander(f"Raw Tactical Entropy data ({_entropy_variant!r})"):
                     st.json(entropy_report)
+
+        # Passing Lane Visualizer (additive new feature): unlike Tactical
+        # Entropy, this DOES need 360 coverage -- fetched against
+        # `_variant_to_match_ids_360` (the SAME 360-covered, already-
+        # capped match list the pitch-control report above uses), not
+        # the raw uncapped `_variant_to_match_ids`.
+        if team_name and _variant_to_match_ids_360:
+            st.divider()
+            st.subheader("Passing Lane Visualizer (pitch-control-based lane openness)")
+            for _lane_variant, _lane_match_ids in _variant_to_match_ids_360.items():
+                with st.spinner(f"Computing passing lanes for {_lane_variant!r}..."):
+                    lanes_report = _fetch_report_safely(
+                        lambda _v=_lane_variant, _i=_lane_match_ids: _cached_team_passing_lanes(
+                            rest_base_url, _v, _i
+                        ),
+                        rest_base_url,
+                    )
+                if lanes_report is None:
+                    continue
+
+                st.markdown(f"**{_lane_variant}** -- {lanes_report['matches_used']} of "
+                            f"{lanes_report['matches_requested']} 360-covered match(es) used, "
+                            f"{lanes_report['total_pass_samples_used']} real pass samples")
+
+                # ADR-021 condition-2 compliance fix. DEFENSE IN DEPTH,
+                # same pattern as the Shot Map / Pass Network panels
+                # above -- see those panels' own comments for the full
+                # reasoning; mirrored here unchanged. Only `nodes`
+                # (per-player average location) is the gated field --
+                # `lanes` (named pairs + scores) is present either way,
+                # per this feature's own ADR-021 addendum.
+                response_has_raw_lanes = "nodes" in lanes_report
+
+                if PUBLIC_DEPLOYMENT and response_has_raw_lanes:
+                    st.error(
+                        "Configuration error: this dashboard process has PUBLIC_DEPLOYMENT=true, "
+                        "but the API server returned raw per-player location data -- refusing to "
+                        "render or display it. Set PUBLIC_DEPLOYMENT=true on the API server process "
+                        "too (see README.md's 'Public deployment mode' section)."
+                    )
+                elif PUBLIC_DEPLOYMENT or not response_has_raw_lanes:
+                    lanes_png = _cached_passing_lanes_aggregated_png(lanes_report)
+                    st.image(
+                        lanes_png,
+                        caption=f"Passing Lane Openness (aggregated, no location) -- {_lane_variant}",
+                        width="stretch",
+                    )
+                    with st.expander(f"Raw passing-lane data ({_lane_variant!r}, no location)"):
+                        st.json(lanes_report)
+                else:
+                    lanes_png = _cached_passing_lanes_png(lanes_report)
+                    st.image(lanes_png, caption=f"Passing Lane Openness -- {_lane_variant}", width="stretch")
+                    with st.expander(f"Raw passing-lane data ({_lane_variant!r})"):
+                        st.json(lanes_report)
+
+                low_sample_lanes = [
+                    lane for lane in lanes_report.get("lanes", []) if lane["passing_lane_used_low_sample_flag"]
+                ]
+                if low_sample_lanes:
+                    st.caption(
+                        f"{len(low_sample_lanes)} of {len(lanes_report.get('lanes', []))} pairs are "
+                        "LOW SAMPLE (fewer than the confidence threshold's real pass samples) -- "
+                        "treat those specific pairs' openness scores as illustrative, not confident."
+                    )
+
+        # Opposition Analysis (additive new feature): 3 specific
+        # opposition-scouting metrics. Metrics 2/3 (build-up tendency,
+        # set-piece reliance) are event-data-only, fetched against
+        # `_variant_to_match_ids` like Tactical Entropy. Metric 1
+        # (pitch-control weak zones) re-presents `_cached_team_report`'s
+        # own `weakest_control_zones` field -- called again here
+        # deliberately (not passed down from the panel above, which may
+        # not have run in this exact shape for every variant in
+        # multi-variant mode), but this hits `st.cache_data`'s cache for
+        # any (variant, match_ids) pair already fetched above, so no
+        # REAL additional backend computation happens for that part.
+        if team_name and _variant_to_match_ids:
+            st.divider()
+            st.subheader("Opposition Analysis (scouting: how to play against this team)")
+            for _opp_variant, _opp_match_ids in _variant_to_match_ids.items():
+                with st.spinner(f"Computing opposition analysis for {_opp_variant!r}..."):
+                    opp_report = _fetch_report_safely(
+                        lambda _v=_opp_variant, _i=_opp_match_ids: _cached_team_opposition_analysis(
+                            rest_base_url, _v, _i
+                        ),
+                        rest_base_url,
+                    )
+                if opp_report is None:
+                    continue
+
+                st.markdown(f"**{_opp_variant}** -- {opp_report['matches_used']} of "
+                            f"{opp_report['matches_requested']} requested match(es) used")
+
+                opp_cols = st.columns(2)
+                with opp_cols[0]:
+                    st.markdown("**Build-up tendency**")
+                    bt = opp_report["build_up_tendency"]
+                    if bt["long_pass_share"] is None:
+                        st.info("No real build-up (defensive/middle-third) passes available.")
+                    else:
+                        st.metric(
+                            f"Long pass share (>{bt['long_pass_threshold_meters']:.0f}m)",
+                            f"{bt['long_pass_share'] * 100:.1f}%",
+                            help=f"{bt['long_passes']} long of {bt['total_buildup_passes']} real build-up passes.",
+                        )
+                        if bt["build_up_tendency_used_low_sample_flag"]:
+                            st.caption(
+                                f"LOW SAMPLE: only {bt['total_buildup_passes']} real build-up passes."
+                            )
+                with opp_cols[1]:
+                    st.markdown("**Set-piece reliance**")
+                    sp = opp_report["set_piece_reliance"]
+                    if sp["set_piece_shot_share"] is None:
+                        st.info("No real shots available.")
+                    else:
+                        st.metric(
+                            "Shots from set pieces",
+                            f"{sp['set_piece_shot_share'] * 100:.1f}%",
+                            help=f"{sp['set_piece_shots']} set-piece of {sp['total_shots']} real shots "
+                                 f"({', '.join(sp['set_piece_play_patterns'])}).",
+                        )
+                        if sp["set_piece_reliance_used_low_sample_flag"]:
+                            st.caption(f"LOW SAMPLE: only {sp['total_shots']} real shots.")
+
+                st.markdown("**Pitch-control weak zones (where to attack this team)**")
+                _opp_360_ids = _variant_to_match_ids_360.get(_opp_variant, ())
+                if not _opp_360_ids:
+                    st.info("No 360-covered matches for this selection -- weak-zone data unavailable.")
+                else:
+                    _opp_team_report = _fetch_report_safely(
+                        lambda _v=_opp_variant, _i=_opp_360_ids: _cached_team_report(rest_base_url, _v, _i),
+                        rest_base_url,
+                    )
+                    if _opp_team_report is not None and _opp_team_report.get("weakest_control_zones"):
+                        st.caption(
+                            "Lowest mean pitch-control cells for this team (col/row grid indices, "
+                            "10x7 -- reused, unmodified, from the Team Report panel above)."
+                        )
+                        st.dataframe(pd.DataFrame(_opp_team_report["weakest_control_zones"]), width="stretch")
+                    else:
+                        st.info("No weak-zone data available for this selection.")
+
+                with st.expander(f"Raw opposition analysis data ({_opp_variant!r})"):
+                    st.json(opp_report)
 
 # ============================================================================
 # TAB: Team Trends -- UI wiring over team_trend_data.py, unmodified. A
