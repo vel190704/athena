@@ -65,7 +65,7 @@ from production.src.reporting.player_report import (
     generate_player_shot_map_aggregated,
 )
 from production.src.reporting.team_comparison import compare_team_seasons
-from production.src.reporting.team_report import generate_team_report
+from production.src.reporting.team_report import generate_team_pass_entropy, generate_team_report
 from production.src.serving.alert_store import DB_PATH as ALERT_DB_PATH
 from production.src.serving.alert_store import count_alerts, fetch_alerts, init_db, log_alert
 from production.src.serving.simulator import live_match_stream
@@ -987,6 +987,29 @@ async def get_team_report(team_name: str, match_ids: list[int] = Query(default=[
         report["no_data"] = True
         report["reason"] = "No match_ids provided -- select a team/season with at least one 360-covered match."
     return report
+
+
+@app.get("/reports/team/{team_name}/pass-entropy", dependencies=[Depends(_require_api_key)])
+async def get_team_pass_entropy(team_name: str, match_ids: list[int] = Query(default=[])):
+    """Wraps team_report.generate_team_pass_entropy, unmodified.
+
+    `match_ids` OPTIONAL (default empty list), same fix as the team-report
+    endpoint above -- `generate_team_pass_entropy` already handles an
+    empty list gracefully (`matches_used=0`, `total_transitions=0`,
+    `conditional_entropy_bits=None`, `pass_entropy_used_low_sample_flag=True`,
+    no crash), unlike `generate_team_report` this feature needs no 360
+    freeze-frame coverage at all (event data only), so it is not affected
+    by that same zero-360-matches gap, but the parameter is kept optional
+    regardless for the same caller-friendliness reason.
+
+    ADR-021 condition 2: NOT gated by PUBLIC_DEPLOYMENT -- a many-to-one
+    category-transition count matrix and derived entropy scalars, never
+    an individual pass's location/player/minute. See
+    generate_team_pass_entropy's own docstring in team_report.py for the
+    full Step 0 definitions, and ADR-021's Tactical Entropy addendum for
+    the full exemption reasoning.
+    """
+    return await asyncio.to_thread(generate_team_pass_entropy, team_name, match_ids)
 
 
 @app.get("/reports/team-comparison", dependencies=[Depends(_require_api_key)])

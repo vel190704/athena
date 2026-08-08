@@ -483,6 +483,29 @@ def _cached_team_report(rest_base_url: str, team_name: str, match_ids: tuple[int
     return response.json()
 
 
+# Tactical Entropy (additive new feature): unlike generate_team_report
+# above, this needs no 360 freeze-frame coverage at all (event data only)
+# -- so it is fetched against `_variant_to_match_ids` (every raw cached
+# match in the selection), NOT `_variant_to_match_ids_360` (the smaller
+# 360-covered subset the pitch-control report needs). ADR-021: NOT gated
+# behind PUBLIC_DEPLOYMENT (see the endpoint's own docstring in api.py and
+# generate_team_pass_entropy's docstring in team_report.py). Measured
+# directly before skipping a request-size cap here (same discipline as
+# the Team Report timeout incident): 300 requested match_ids (174 real
+# Barcelona matches used) completed in ~8.5s, a pure event-scan/dict-count
+# cost with no physics/ML inference -- far cheaper than team_report's own
+# per-match pitch-control cost, so no separate cap constant was added.
+@st.cache_data(show_spinner=False)
+def _cached_team_pass_entropy(rest_base_url: str, team_name: str, match_ids: tuple[int, ...]) -> dict:
+    response = requests.get(
+        f"{rest_base_url}/reports/team/{requests.utils.quote(team_name, safe='')}/pass-entropy",
+        params={"match_ids": list(match_ids)},
+        timeout=REPORT_REQUEST_TIMEOUT_SECONDS,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
 @st.cache_data(show_spinner=False)
 def _cached_team_png(report: dict) -> bytes:
     with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
@@ -1580,6 +1603,66 @@ with tab_team:
 
                 with st.expander("Raw report data"):
                     st.json(team_report_dict)
+
+        # Tactical Entropy (additive new feature): rendered for EVERY
+        # variant in `_variant_to_match_ids` (the RAW, un-360-filtered
+        # match selection -- see `_cached_team_pass_entropy`'s own
+        # comment for why), independent of the single/multi-variant
+        # 360-report branching above -- this feature needs no 360
+        # coverage at all, so it always runs once per variant regardless
+        # of which branch the pitch-control report itself took.
+        if team_name and _variant_to_match_ids:
+            st.divider()
+            st.subheader("Tactical Entropy (pass-direction predictability)")
+            for _entropy_variant, _entropy_match_ids in _variant_to_match_ids.items():
+                with st.spinner(f"Computing Tactical Entropy for {_entropy_variant!r}..."):
+                    entropy_report = _fetch_report_safely(
+                        lambda _v=_entropy_variant, _i=_entropy_match_ids: _cached_team_pass_entropy(
+                            rest_base_url, _v, _i
+                        ),
+                        rest_base_url,
+                    )
+                if entropy_report is None:
+                    continue
+
+                st.markdown(f"**{_entropy_variant}** -- {entropy_report['matches_used']} of "
+                            f"{entropy_report['matches_requested']} requested match(es) used")
+
+                if entropy_report["pass_entropy_used_low_sample_flag"]:
+                    st.warning(
+                        f"LOW SAMPLE: only {entropy_report['total_transitions']} real pass-to-pass "
+                        "transition(s) observed -- treat the entropy value below as illustrative, "
+                        "not a confident finding."
+                    )
+
+                if entropy_report["conditional_entropy_bits"] is None:
+                    st.info("No pass-to-pass transitions available for this selection.")
+                else:
+                    entropy_cols = st.columns(3)
+                    entropy_cols[0].metric(
+                        "Conditional Entropy",
+                        f"{entropy_report['conditional_entropy_bits']:.3f} bits",
+                        help=(
+                            f"Max possible (uniform over {len(entropy_report['pass_type_categories'])} "
+                            f"categories): {entropy_report['max_possible_entropy_bits']:.3f} bits."
+                        ),
+                    )
+                    entropy_cols[1].metric(
+                        "Normalized (0=predictable, 1=random)",
+                        f"{entropy_report['normalized_entropy']:.3f}",
+                    )
+                    entropy_cols[2].metric(
+                        "Real Transitions Observed", entropy_report["total_transitions"],
+                    )
+
+                    _entropy_cats = entropy_report["pass_type_categories"]
+                    transition_df = pd.DataFrame(entropy_report["transition_probabilities"]).T
+                    transition_df = transition_df.reindex(index=_entropy_cats, columns=_entropy_cats)
+                    st.caption("Transition probability matrix: P(next pass type = column | current pass type = row)")
+                    st.dataframe(transition_df.style.format("{:.2f}", na_rep="n/a"), width="stretch")
+
+                with st.expander(f"Raw Tactical Entropy data ({_entropy_variant!r})"):
+                    st.json(entropy_report)
 
 # ============================================================================
 # TAB: Team Trends -- UI wiring over team_trend_data.py, unmodified. A

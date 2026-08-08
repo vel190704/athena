@@ -520,3 +520,69 @@ with view 1's match-summary exemption above — there is no raw/aggregated
 split for this feature the way the touch map/timeline/shot map each have,
 because there is no raw variant of this feature to begin with (its output
 is a rate by construction, not a downsampling of a richer raw view).
+
+## Addendum: Tactical Entropy (per-team, season/multi-match Shannon
+conditional entropy over pass-DIRECTION transitions)
+
+Resolved EXEMPT from condition 2 — not gated by `PUBLIC_DEPLOYMENT` —
+checked explicitly against condition 2's own test rather than assumed
+because it "sounds like" the Press Resistance Index precedent above; the
+Pass Network section further above is exactly the cautionary example for
+why an "obviously just a count" view can't be waved through without
+looking.
+
+**1. Scope, confirmed:** `generate_team_pass_entropy(team_name, match_ids)`
+is a per-TEAM, season/multi-match AGGREGATE, the same shape as the Press
+Resistance Index — one result per call, computed by pooling every
+requested match's transitions together, never a per-match or per-pass
+return value. There is no finer granularity anywhere in this feature
+(unlike the Pass Network, which is inherently single-match and needed the
+raw/aggregated split specifically because of that).
+
+**2. Output, checked field-by-field against condition 2's own test (no
+individual pass's location, player, or minute; nothing individually
+recoverable):**
+- `transition_counts`/`transition_probabilities`: a 3×3 matrix of INTEGER
+  COUNTS / row-normalized PROBABILITIES between three abstract CATEGORY
+  labels (`Forward`/`Backward`/`Sideways`) — never a player name, a
+  location, or a minute. This is a step FURTHER removed from any single
+  event than the Press Resistance Index's own per-event-type counts:
+  there, each count bucket corresponded to one StatsBomb event TYPE
+  (Pass/Dribble/Shot); here, each of the 9 matrix cells is itself the sum
+  of potentially hundreds of individual real passes that all happened to
+  land in the same category pair, pooled across every requested match.
+  Knowing "Forward→Sideways occurred 214 times this season" gives no way
+  to identify which 214 specific passes, on which pitch coordinates, by
+  which players, in which matches — the categorization is many-to-one by
+  construction (every real pass with a `end_location[0]-location[0]`
+  delta anywhere in, e.g., the open interval (-5m, +5m) collapses into
+  the same "Sideways" count), which is a stronger, not weaker, guarantee
+  of non-recoverability than an average location (a mean CAN in principle
+  be inverted with enough side information about N; a many-to-one integer
+  bucket count cannot be inverted into its constituent events at all).
+- `total_transitions`/`total_pass_attempts_considered`/
+  `completed_pass_attempts_considered`: plain aggregate integers, the same
+  class of data `generate_player_match_summary`'s per-match event-type
+  counts (already exempt, view 1 above) already serve unconditionally.
+- `conditional_entropy_bits`/`normalized_entropy`/
+  `max_possible_entropy_bits`: derived scalars computed FROM the count
+  matrix above — strictly less information than the matrix itself (an
+  entropy value cannot be inverted back into the matrix that produced it,
+  let alone into any individual pass), so if the matrix clears condition
+  2 (it does, per the above), the entropy scalars trivially do too.
+- `pass_entropy_used_low_sample_flag`: a boolean, no data content beyond
+  itself.
+
+Nothing else is returned. No `location`, no `player`/`player_id`, no
+`minute`, and no per-match breakdown appears anywhere in this function's
+return value.
+
+**3. Resolution:** `generate_team_pass_entropy` and its
+`/reports/team/{team_name}/pass-entropy` endpoint are served
+UNCONDITIONALLY (not behind `PUBLIC_DEPLOYMENT`), consistent with the
+Press Resistance Index and match-summary exemptions above. As with the
+Press Resistance Index, there is no raw variant of this feature to begin
+with — its output is a many-to-one category-transition tally by
+construction, not a downsampling of a richer per-pass view — so there is
+no raw/aggregated split to design here, unlike the Pass Network or the
+Player Dashboard's touch map/timeline.
