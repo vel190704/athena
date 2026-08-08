@@ -64,7 +64,7 @@ from production.src.reporting.player_report import (
     generate_player_shot_map,
     generate_player_shot_map_aggregated,
 )
-from production.src.reporting.team_comparison import compare_team_seasons
+from production.src.reporting.team_comparison import compare_team_matches, compare_team_seasons
 from production.src.reporting.team_report import generate_team_pass_entropy, generate_team_report
 from production.src.serving.alert_store import DB_PATH as ALERT_DB_PATH
 from production.src.serving.alert_store import count_alerts, fetch_alerts, init_db, log_alert
@@ -1016,6 +1016,24 @@ async def get_team_pass_entropy(team_name: str, match_ids: list[int] = Query(def
 async def get_team_comparison(team_a: str, season_a: int, team_b: str, season_b: int):
     """Wraps team_comparison.compare_team_seasons, unmodified."""
     return await asyncio.to_thread(compare_team_seasons, team_a, season_a, team_b, season_b)
+
+
+@app.get("/reports/team-comparison/match", dependencies=[Depends(_require_api_key)])
+async def get_team_match_comparison(team_name: str, match_id_a: int, match_id_b: int):
+    """Wraps team_comparison.compare_team_matches, unmodified.
+
+    A NEW, dedicated endpoint rather than optional match-level parameters
+    bolted onto /reports/team-comparison above -- `compare_team_seasons`
+    and `compare_team_matches` take genuinely different, non-overlapping
+    parameter shapes, and every other feature added this session (Press
+    Resistance Index, Tactical Entropy, the Player Dashboard's
+    touch-map/timeline endpoints) got its own dedicated endpoint with an
+    unambiguous, fully-required parameter contract rather than being
+    folded into an existing endpoint. See ADR-021's "Session/Match
+    Comparison" addendum for the full reasoning, including why this
+    remains unconditional (not gated by PUBLIC_DEPLOYMENT).
+    """
+    return await asyncio.to_thread(compare_team_matches, team_name, match_id_a, match_id_b)
 
 
 # ============================================================================

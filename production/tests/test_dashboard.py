@@ -112,6 +112,28 @@ def test_dashboard_loads_all_seven_tabs_no_exception():
     assert "Alerts History" in headers
 
 
+def test_team_reports_tab_data_tiering_note_renders_statically_no_backend_needed():
+    """Cross-panel context note (UI walkthrough follow-up): a static,
+    always-visible clarification that Team Report needs 360 freeze-frame
+    coverage while Tactical Entropy (and every other report on this
+    dashboard except Team Report) only needs event data -- so one panel
+    succeeding while another fails on the identical team/season selection
+    is expected, not a bug. Renders unconditionally at the top of the
+    Team Reports tab, before any button click or API call -- confirmed
+    here by NOT using `live_api_server` at all (no backend needed for
+    this specific assertion), which itself proves the note is static
+    (reacting to no request outcome) rather than conditional logic.
+    """
+    at = AppTest.from_file(DASHBOARD_PATH)
+    at.run(timeout=APP_TIMEOUT_SECONDS)
+
+    assert not at.exception
+    team_tab = at.tabs[2]
+    info_texts = [i.value for i in team_tab.info]
+    assert any("360 freeze-frame coverage" in t and "Tactical Entropy" in t for t in info_texts)
+    assert any("event-data-only" in t for t in info_texts)
+
+
 # ============================================================================
 # TAB: Live CV Monitor -- Tactical Momentum (additive new feature): a
 # rolling-window smoothing + trend indicator computed CLIENT-SIDE over the

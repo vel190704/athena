@@ -586,3 +586,89 @@ with — its output is a many-to-one category-transition tally by
 construction, not a downsampling of a richer per-pass view — so there is
 no raw/aggregated split to design here, unlike the Pass Network or the
 Player Dashboard's touch map/timeline.
+
+## Addendum: Session/Match Comparison (`compare_team_matches`, a
+finer-granularity extension of `compare_team_seasons`)
+
+Resolved EXEMPT from condition 2 — not gated by `PUBLIC_DEPLOYMENT` —
+checked explicitly at this NEW, FINER granularity rather than assumed to
+inherit `compare_team_seasons`'s own already-settled exemption
+automatically. The concern raised before building this (Step 0, this
+project's own standing discipline): a single match has meaningfully fewer
+located events than a full season, so the SAME 10×7 zone-share grid
+`compare_team_seasons`'s `event_location_activity_map` mode already uses
+is now built from far fewer underlying events per comparison — is this
+still safely aggregate, or does the smaller N start resembling the Pass
+Network's individually-recoverable-edge problem rather than the safely-
+aggregate season case?
+
+**1. Real-data check, not assumed.** Every real cached `(team, match)`
+combination's located-event count was checked before answering this (a
+full scan of this project's whole `data/raw/` cache, 1,868 real
+`(team, match)` pairs): minimum 896, 5th percentile 1,147, median 1,788,
+mean 1,851, maximum 3,472. Spread across a 70-cell (10×7) grid, even the
+THINNEST real match in this entire cache still averages ~12.8 located
+events per cell. There is no genuinely sparse real case in this project's
+cache at match granularity — the honest finding is that the concern
+motivating this check (a low-event match producing near-empty, more
+"individually traceable" cells) does not materialize in practice here,
+though the reasoning below holds independently of that empirical
+comfort margin.
+
+**2. The actual deciding factor (reasoned from first principles, the
+same test applied to every prior gating decision), independent of how
+comfortable the real numbers above are:** Pass Network's raw edges were
+gated because a count was paired with a NAMED, individually-attributable
+player's own precise average `(x, y)` location — that combination is what
+made a specific real pass event's approximate reconstruction possible.
+`compare_team_matches`'s grid carries neither of those two ingredients,
+at ANY sample size: no player name or ID anywhere in its output (this is
+a TEAM-level aggregate, exactly like the season-level grid), and no
+location finer than one ~10m×9.7m cell. A cell holding exactly 1 event
+(hypothetically, in some future thinner match this cache doesn't
+currently contain) still reveals nothing about WHICH real event produced
+it — not its exact coordinate, not the player who made it, not its
+minute, not even its StatsBomb event TYPE (`_build_location_activity_grid`
+pools every located event type into one count, a coarser aggregation
+than even Pass Network's own Pass-only edges). Sparsity changes
+CONFIDENCE (how much a viewer should trust the resulting picture), not
+RECOVERABILITY (whether a specific real event can be identified from the
+output) — and confidence is exactly what Step 1's low-sample flag below
+is built to signal transparently, the same "flag, don't gate" resolution
+this project already applied to Press Resistance Index's and Tactical
+Entropy's own small-N concerns, not a reason to gate this feature the way
+Pass Network's edges were.
+
+**3. Per-match 360 detection carries over correctly.** `_match_360_available`
+checks each of the two SPECIFIC `match_id`s directly (a real
+`fetch_match_360` call, treating a `None` result as unavailable) — the
+SAME verify-via-a-real-fetch discipline `team_report.py`'s own chain-frame
+builder already uses, not the season-level `match_available_360` flag on
+`competitions.json` (which `compare_team_seasons`'s own
+`_resolve_team_season_matches` already documented as unreliable at
+anything finer than "some matches in this season have it"). Both
+match_ids must independently have real 360 coverage for
+`pitch_control_360` mode to be used; either one missing it falls back to
+`event_location_activity_map` for BOTH sides, mirroring
+`compare_team_seasons`'s own "never compare the two sides on different
+footings" rule exactly.
+
+**4. Resolution:** `compare_team_matches` reuses `_compare_360`/
+`_compare_location` UNCHANGED (parameterized with single-match_id lists
+instead of a season's full list) and is served UNCONDITIONALLY, via a
+NEW, dedicated `/reports/team-comparison/match` endpoint rather than
+optional parameters bolted onto `/reports/team-comparison` — chosen
+because every other feature added this session (Press Resistance Index,
+Tactical Entropy, the Player Dashboard's touch-map/timeline endpoints)
+got its own dedicated endpoint with an unambiguous, fully-required
+parameter contract rather than being folded into an existing endpoint via
+optional/mutually-exclusive query parameters; `compare_team_seasons` and
+`compare_team_matches` take genuinely different, non-overlapping
+parameter shapes (`team_a`/`season_a`/`team_b`/`season_b` vs.
+`team_name`/`match_id_a`/`match_id_b`), and ADR-018's own established
+pattern is one endpoint per distinct report SHAPE, not one per UI tab —
+Player Reports alone already spans half a dozen separate endpoints under
+one conceptual feature area. No raw/aggregated split exists for this
+feature, for the same reason none exists for Press Resistance Index or
+Tactical Entropy: its output is a many-to-one grid aggregate by
+construction, not a downsampling of a richer per-event view.

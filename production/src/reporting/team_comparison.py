@@ -44,6 +44,7 @@ from production.src.ingestion.statsbomb_io import (
     Y_SCALE,
     fetch_competition_matches,
     fetch_competitions_index,
+    fetch_match_360,
     fetch_match_events,
 )
 from production.src.pipeline.feature_extractor import FINAL_THIRD_X, PITCH_WIDTH
@@ -403,5 +404,177 @@ def compare_team_seasons(team_a: str, season_a: int, team_b: str, season_b: int)
         "data_richness": data_richness,
         "reliability_caveat": _reliability_caveat(data_richness),
         "competitions_used": {"team_a": info_a["competitions"], "team_b": info_b["competitions"]},
+        **result,
+    }
+
+
+# ============================================================================
+# Session/Match Comparison (additive extension): the SAME tool as
+# compare_team_seasons above, at a finer granularity -- one team, two
+# SPECIFIC matches, not two seasons. compare_team_seasons itself is
+# untouched; this reuses `_compare_360`/`_compare_location` directly
+# (both already generic over an arbitrary match_ids list -- neither cares
+# whether that list represents a whole season or a single match), just
+# parameterized with single-match_id lists and a match-level richness/
+# 360-detection basis instead of a season-level one. See ADR-021's
+# "Session/Match Comparison" addendum for the full Step 0 gating
+# reasoning (aggregating one match's several-hundred-plus located events
+# into the same 10x7 grid remains safely AGGREGATE under condition 2 --
+# verified against this project's real cache, not assumed).
+# ============================================================================
+
+# Step 1: match-level richness cannot reuse LOW_SAMPLE_MATCH_THRESHOLD's
+# match-COUNT convention -- there is always exactly 1 match per side at
+# this granularity by definition, so a count-based threshold is
+# meaningless here. Flagged instead by real located-EVENT count within
+# that one match.
+#
+# VERIFIED against real data before picking a number (not reused
+# verbatim from MIN_HISTORICAL_EVENTS=20, which sits so far below this
+# specific real distribution's floor it would be a meaningless gate at
+# THIS granularity): a full scan of every real (team, match) combination
+# in this project's whole data/raw/ cache (1,868 pairs) found
+# min=896, p5=1,147, median=1,788, mean=1,851, max=3,472 located events.
+# 500 sits comfortably below the real observed FLOOR (896) -- no real
+# match in this cache would ever be flagged -- while still being a
+# meaningful gate against a genuinely degenerate case (an abandoned
+# match, partial event coverage, or a team-name typo yielding
+# near-zero matched events), the same "named, explicit,
+# real-data-verified constant" convention this project's own
+# MIN_HISTORICAL_EVENTS/MIN_UNDER_PRESSURE_EVENTS_FOR_CONFIDENT_PRI/
+# MIN_TRANSITIONS_FOR_CONFIDENT_PASS_ENTROPY already established,
+# recalibrated to match-level comparison's own real distribution.
+MIN_LOCATED_EVENTS_FOR_CONFIDENT_MATCH_COMPARISON = 500
+
+
+def _match_located_event_count(match_id: int, team_name: str) -> int:
+    """Real located-event count for `team_name` in ONE specific match --
+    the Step 1 basis for match-level richness/low-sample flagging.
+    Computed independently of analysis mode (used for the richness check
+    regardless of whether `pitch_control_360` or
+    `event_location_activity_map` ends up being selected for the
+    comparison itself), since a thin real event count is a genuine
+    signal-scarcity concern in EITHER mode, not just the location-grid
+    one."""
+    events = fetch_match_events(match_id)
+    if events is None:
+        return 0
+    return sum(
+        1 for e in events
+        if e.get("team", {}).get("name") == team_name and e.get("location") is not None
+    )
+
+
+def _match_360_available(match_id: int) -> bool:
+    """Whether a SPECIFIC match_id has real, fetchable 360 freeze-frame
+    data -- checked via a real `fetch_match_360` call, treating a `None`
+    result as unavailable, the SAME verify-via-a-real-fetch discipline
+    `team_report.py`'s own chain-frame builder already uses (Step 0.2).
+    Deliberately NOT this module's own `_resolve_team_season_matches`
+    `match_status_360`-from-the-matches-list approach: that requires
+    first resolving which competition/season a match_id belongs to,
+    extra work this function's caller (two already-known match_ids)
+    doesn't need -- a direct fetch is simpler here and matches
+    `team_report.py`'s own established pattern exactly."""
+    return fetch_match_360(match_id) is not None
+
+
+def _match_richness_flag(located_events: int) -> str:
+    return (
+        "LOW SAMPLE -- too thin for match-level claims"
+        if located_events < MIN_LOCATED_EVENTS_FOR_CONFIDENT_MATCH_COMPARISON
+        else "well-supported"
+    )
+
+
+def _match_reliability_caveat(data_richness: dict) -> str | None:
+    """Match-level analog of `_reliability_caveat` above -- SAME
+    plain-language, always-visible warning discipline, using
+    MIN_LOCATED_EVENTS_FOR_CONFIDENT_MATCH_COMPARISON (event-count-based,
+    per Step 1) rather than LOW_SAMPLE_MATCH_THRESHOLD (match-count-based,
+    which cannot apply at this granularity). A new, separate function --
+    not a modification of `_reliability_caveat` -- since the two operate
+    on differently-shaped richness dicts (`located_events` vs `matches`).
+    """
+    a, b = data_richness["team_a"], data_richness["team_b"]
+    a_low = a["located_events"] < MIN_LOCATED_EVENTS_FOR_CONFIDENT_MATCH_COMPARISON
+    b_low = b["located_events"] < MIN_LOCATED_EVENTS_FOR_CONFIDENT_MATCH_COMPARISON
+    if not a_low and not b_low:
+        return None
+
+    low_side, other_side = (a, b) if a_low else (b, a)
+    ratio = (
+        (other_side["located_events"] / low_side["located_events"])
+        if low_side["located_events"] > 0 else float("inf")
+    )
+    return (
+        f"CAVEAT: {low_side['team']}'s match {low_side['match_id']} side of this comparison has "
+        f"only {low_side['located_events']} real located event(s), while match "
+        f"{other_side['match_id']}'s side has {other_side['located_events']} ({ratio:.0f}x more). "
+        f"This comparison is NOT equally reliable on both sides -- treat match "
+        f"{low_side['match_id']}'s numbers as illustrative at best, not a confident "
+        "match-level characterization."
+    )
+
+
+def compare_team_matches(team_name: str, match_id_a: int, match_id_b: int) -> dict:
+    """Session/Match Comparison: the SAME general-purpose style-comparison
+    tool as `compare_team_seasons`, at a finer granularity -- one team,
+    two SPECIFIC matches, not two (team, season) pairs.
+
+    Reuses `_compare_360`/`_compare_location` UNCHANGED
+    (parameterized with single-match_id lists instead of a season's full
+    list) -- `compare_team_seasons` itself is not modified. Match-level
+    labels (`"{team_name} (match {match_id})"`) disambiguate the two
+    sides the same way `compare_team_seasons`'s season-qualified labels
+    do, since `match_id_a`/`match_id_b` for the SAME team is the expected
+    use case (comparing one team's own two different matches), not an
+    edge case.
+
+    See ADR-021's "Session/Match Comparison" addendum for the full Step 0
+    gating reasoning (this remains condition-2-EXEMPT, unconditional, at
+    this finer granularity) and Step 1's real-data-verified
+    MIN_LOCATED_EVENTS_FOR_CONFIDENT_MATCH_COMPARISON threshold.
+    """
+    n_a = _match_located_event_count(match_id_a, team_name)
+    n_b = _match_located_event_count(match_id_b, team_name)
+
+    data_richness = {
+        "team_a": {
+            "team": team_name, "match_id": match_id_a, "located_events": n_a,
+            "flag": _match_richness_flag(n_a),
+        },
+        "team_b": {
+            "team": team_name, "match_id": match_id_b, "located_events": n_b,
+            "flag": _match_richness_flag(n_b),
+        },
+    }
+
+    use_360 = _match_360_available(match_id_a) and _match_360_available(match_id_b)
+    analysis_mode = "pitch_control_360" if use_360 else "event_location_activity_map"
+    mode_reason = (
+        "Both specific matches have real 360 freeze-frame coverage -- full BiomechanicalPitchControl "
+        "weak/strong-zone analysis (team_report.generate_team_report) used for both sides."
+        if use_360 else
+        "At least one of the two specific matches has NO 360 coverage. Falling back to event-LOCATION "
+        "activity maps (no pitch-control physics) for BOTH matches, so the two are never compared on "
+        "different footings -- same discipline compare_team_seasons already applies at season level."
+    )
+
+    label_a = f"{team_name} (match {match_id_a})"
+    label_b = f"{team_name} (match {match_id_b})"
+    if use_360:
+        result = _compare_360(label_a, [match_id_a], team_name, label_b, [match_id_b], team_name)
+    else:
+        result = _compare_location(label_a, [match_id_a], team_name, label_b, [match_id_b], team_name)
+
+    return {
+        "team_name": team_name,
+        "match_id_a": match_id_a,
+        "match_id_b": match_id_b,
+        "analysis_mode": analysis_mode,
+        "mode_reason": mode_reason,
+        "data_richness": data_richness,
+        "reliability_caveat": _match_reliability_caveat(data_richness),
         **result,
     }

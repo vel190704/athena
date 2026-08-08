@@ -187,13 +187,28 @@ DEFAULT_WS_URL = "ws://127.0.0.1:8000/ws/tactical-stream"
 DEFAULT_MATCH_ID = "3857276"
 # Milestone 33: server-side default for the CV data source -- MUST resolve
 # inside the backend's data/raw/ directory (ALLOWED_CV_VIDEO_DIRECTORY in
-# api.py); this is just a plausible-looking placeholder, not a file
-# guaranteed to exist. Every CV milestone since 25 has noted no persistent
-# real footage lives under this path in this environment -- "StatsBomb
-# Replay" (below) is therefore the data source actually usable out of the
-# box, and stays the default `st.radio` selection (index 0) for exactly
-# that reason. Left here, unchanged, as a plausible path for anyone who
-# DOES have a real local clip to point this at deliberately.
+# api.py). `data/raw/` is entirely gitignored (see .gitignore), so this is
+# NOT guaranteed to exist in a fresh clone or a different machine -- a
+# plausible path, not a committed asset.
+#
+# STALE-COMMENT CORRECTION (verified directly, not assumed, during a UI
+# walkthrough follow-up after this comment was originally written): this
+# used to say "every CV milestone since 25 has noted no persistent real
+# footage lives under this path in THIS environment." That is no longer
+# true HERE -- a real file genuinely exists at this exact path in this
+# environment (11,356,053 bytes, a valid MP4 container, confirmed via
+# cv2.VideoCapture: 1284x728, 28fps, 970 frames, and a decoded frame shows
+# real Premier League broadcast footage, not a blank/placeholder image).
+# This is the SAME private, unannotated local clip Milestone 34B's "First
+# Real-Footage Validation" already used and documented (see
+# docs/CV_PIPELINE_FINDINGS.md and docs/FULL_PROJECT_REPORT.md's
+# Milestone 34B entry -- identical specs), not a new or unexplained file.
+# "StatsBomb Replay" (below) remains the default `st.radio` selection
+# (index 0) regardless -- it needs no local file at all and is therefore
+# the more broadly reproducible out-of-the-box path across environments,
+# even though this specific environment does have real CV footage
+# available. Left here as a plausible path for anyone who DOES have (or,
+# as in this environment, already has) a real local clip to point this at.
 DEFAULT_CV_VIDEO_PATH = "data/raw/test_match.mp4"
 MAX_THREAT_BUFFER_LEN = 60
 MAX_ALERT_BUFFER_LEN = 20
@@ -562,6 +577,24 @@ def _cached_team_comparison(
     return response.json()
 
 
+# Session/Match Comparison (additive extension of the Team-Season Style
+# Comparison tool above, at a finer granularity -- one team, two SPECIFIC
+# matches, not two seasons). ADR-021: unconditional, same as the
+# season-level comparison above -- see ADR-021's "Session/Match
+# Comparison" addendum for the full reasoning.
+@st.cache_data(show_spinner=False)
+def _cached_team_match_comparison(
+    rest_base_url: str, team_name: str, match_id_a: int, match_id_b: int
+) -> dict:
+    response = requests.get(
+        f"{rest_base_url}/reports/team-comparison/match",
+        params={"team_name": team_name, "match_id_a": match_id_a, "match_id_b": match_id_b},
+        timeout=REPORT_REQUEST_TIMEOUT_SECONDS,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
 @st.cache_data(show_spinner=False)
 def _cached_pass_network(rest_base_url: str, match_id: int) -> dict:
     response = requests.get(
@@ -746,8 +779,11 @@ with tab_cv:
                     "Server-side file path -- must resolve INSIDE the backend's data/raw/ directory. "
                     "The backend rejects (with a clean error, not a crash) any path that resolves "
                     "outside it, so don't point this at an arbitrary location on disk. The Match ID "
-                    "field above is ignored for this data source. NOTE: no real footage ships with "
-                    "this project by default -- you must point this at your own local clip."
+                    "field above is ignored for this data source. NOTE: no video ships with this "
+                    "project's git history -- data/raw/ is gitignored, so a fresh clone/different "
+                    "machine has none by default and you'd need to point this at your own local clip. "
+                    "This specific environment happens to already have one at the default path above "
+                    "(verified: real Premier League broadcast footage, not a placeholder)."
                 ),
             )
         max_duration_seconds = st.number_input(
@@ -1343,6 +1379,30 @@ with tab_player:
 with tab_team:
     st.header("Team Report")
 
+    # Cross-panel data-tiering note (static, always visible -- not
+    # conditional on any one request's outcome): different report types
+    # on this tab have genuinely different real-data requirements, so it
+    # is expected and correct -- not a bug -- for one panel to succeed
+    # while another fails on the IDENTICAL team/season selection. Added
+    # after a real reproduced case (Arsenal, Premier League 2003/04: Team
+    # Report correctly shows "no 360-covered matches, widen your
+    # selection" while Tactical Entropy correctly succeeds with real
+    # numbers on that same selection) left no on-page explanation for why.
+    st.info(
+        "This tab mixes two different kinds of report, with different real-data requirements: "
+        "**Team Report** (pitch-control heatmap, threat-by-zone) is the one report in this entire "
+        "dashboard built on 360 freeze-frame coverage (via `BiomechanicalPitchControl`), which is far "
+        "rarer than plain event data -- a team/season with 0 360-covered matches will correctly show "
+        "a 'no 360-covered matches' message. **Tactical Entropy** (pass-direction predictability) only "
+        "needs event data, no 360 coverage required, so it can succeed on the same selection even when "
+        "Team Report can't. Seeing one panel work and the other not for the identical selection is "
+        "expected behavior, not an error. Verified directly, not assumed: every OTHER report in this "
+        "dashboard -- Player Reports (season report, shot map, touch map, timeline, Press Resistance "
+        "Index, match summary), Pass Network (both raw and aggregated), and Tactical Entropy here -- "
+        "is event-data-only too, same tier as Tactical Entropy; Team Report's pitch-control panel is "
+        "the sole exception, not one of several."
+    )
+
     _cached_teams, _ = _cached_candidate_index(st.session_state.candidate_cache_bust)
 
     # Post-audit correction: label now reflects `total_matches_360` (the
@@ -1828,19 +1888,55 @@ with tab_trends:
 with tab_compare:
     st.header("Team-Season Style Comparison")
 
-    compare_col_a, compare_col_b = st.columns(2)
-    with compare_col_a:
-        st.subheader("Team A")
-        compare_team_a = st.text_input("Team A name (StatsBomb team name)", value="Barcelona")
-        compare_season_a = st.number_input("Team A season (start year)", min_value=1990, max_value=2100, value=2008, step=1)
-    with compare_col_b:
-        st.subheader("Team B")
-        compare_team_b = st.text_input("Team B name (StatsBomb team name)", value="Barcelona")
-        compare_season_b = st.number_input("Team B season (start year)", min_value=1990, max_value=2100, value=2015, step=1)
+    # Session/Match Comparison (additive extension, same tool at a finer
+    # granularity -- one team, two SPECIFIC matches, not two seasons; see
+    # ADR-021's own addendum). A mode toggle, not a new tab, per the
+    # roadmap's own "extends" framing: reuses this tab's existing
+    # rendering structure below (analysis mode header, richness columns,
+    # reliability caveat, summary, zone table/threat diff, raw JSON
+    # expander) almost verbatim -- the two granularities' `data_richness`
+    # sub-dicts genuinely differ in UNITS (match count vs. real located-
+    # event count within one match, per Step 1), so the richness columns
+    # branch on `comparison_granularity` below rather than assuming
+    # identical field names would be honest to reuse unchanged.
+    comparison_granularity = st.radio("Comparison Granularity", ["Season-level", "Match-level"], index=0)
+
+    if comparison_granularity == "Season-level":
+        compare_col_a, compare_col_b = st.columns(2)
+        with compare_col_a:
+            st.subheader("Team A")
+            compare_team_a = st.text_input("Team A name (StatsBomb team name)", value="Barcelona")
+            compare_season_a = st.number_input("Team A season (start year)", min_value=1990, max_value=2100, value=2008, step=1)
+        with compare_col_b:
+            st.subheader("Team B")
+            compare_team_b = st.text_input("Team B name (StatsBomb team name)", value="Barcelona")
+            compare_season_b = st.number_input("Team B season (start year)", min_value=1990, max_value=2100, value=2015, step=1)
+    else:
+        compare_match_team = st.text_input("Team name (StatsBomb team name)", value="Barcelona", key="compare_match_team")
+        compare_match_col_a, compare_match_col_b = st.columns(2)
+        with compare_match_col_a:
+            compare_match_id_a = st.text_input("Match A (StatsBomb match_id)", value=DEFAULT_MATCH_ID, key="compare_match_id_a")
+        with compare_match_col_b:
+            compare_match_id_b = st.text_input("Match B (StatsBomb match_id)", value=DEFAULT_MATCH_ID, key="compare_match_id_b")
 
     generate_comparison_clicked = st.button("Compare")
 
-    if generate_comparison_clicked:
+    if generate_comparison_clicked and comparison_granularity == "Match-level":
+        try:
+            _match_id_a_int = int(compare_match_id_a.strip())
+            _match_id_b_int = int(compare_match_id_b.strip())
+        except ValueError:
+            st.error("Match A/B must both be whole numbers.")
+            comparison = None
+        else:
+            with st.spinner("Fetching match data and computing comparison..."):
+                comparison = _fetch_report_safely(
+                    lambda: _cached_team_match_comparison(
+                        rest_base_url, compare_match_team.strip(), _match_id_a_int, _match_id_b_int
+                    ),
+                    rest_base_url,
+                )
+    elif generate_comparison_clicked:
         with st.spinner("Fetching match data and computing comparison..."):
             comparison = _fetch_report_safely(
                 lambda: _cached_team_comparison(
@@ -1850,20 +1946,33 @@ with tab_compare:
                 ),
                 rest_base_url,
             )
+    else:
+        comparison = None
 
+    if generate_comparison_clicked:
         if comparison is not None:
             st.subheader(f"Analysis mode: `{comparison['analysis_mode']}`")
             st.caption(comparison["mode_reason"])
 
             richness_col_a, richness_col_b = st.columns(2)
-            with richness_col_a:
-                ra = comparison["data_richness"]["team_a"]
-                st.metric(f"{ra['team']} {ra['season']} matches", ra["matches"])
-                st.caption(ra["flag"])
-            with richness_col_b:
-                rb = comparison["data_richness"]["team_b"]
-                st.metric(f"{rb['team']} {rb['season']} matches", rb["matches"])
-                st.caption(rb["flag"])
+            if comparison_granularity == "Season-level":
+                with richness_col_a:
+                    ra = comparison["data_richness"]["team_a"]
+                    st.metric(f"{ra['team']} {ra['season']} matches", ra["matches"])
+                    st.caption(ra["flag"])
+                with richness_col_b:
+                    rb = comparison["data_richness"]["team_b"]
+                    st.metric(f"{rb['team']} {rb['season']} matches", rb["matches"])
+                    st.caption(rb["flag"])
+            else:
+                with richness_col_a:
+                    ra = comparison["data_richness"]["team_a"]
+                    st.metric(f"{ra['team']} (match {ra['match_id']}) located events", ra["located_events"])
+                    st.caption(ra["flag"])
+                with richness_col_b:
+                    rb = comparison["data_richness"]["team_b"]
+                    st.metric(f"{rb['team']} (match {rb['match_id']}) located events", rb["located_events"])
+                    st.caption(rb["flag"])
 
             # THE critical requirement for this tab: a low-sample side's
             # reliability caveat must be a prominent, impossible-to-miss
