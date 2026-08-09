@@ -767,3 +767,63 @@ UNCONDITIONALLY, not gated by `PUBLIC_DEPLOYMENT` — consistent with
 Press Resistance Index and Tactical Entropy's own exemptions, for the
 same reason: pure aggregate counts/rates, nothing individually
 recoverable at any sample size.
+
+## Addendum: Player Similarity Search (`find_similar_players`)
+
+Resolved EXEMPT from condition 2 — checked explicitly (not assumed
+exempt just because it "feels like" the existing per-player scalar
+aggregates), since this is the first feature in this project to combine
+TWO named individuals' data into one derived output, a genuinely new
+shape worth its own full pass rather than a pattern-match to precedent.
+
+**The question, stated plainly:** does "player X is similar to player Y,
+similarity score 0.87, driven by press resistance and shot volume"
+expose anything individually-recoverable beyond what
+`generate_player_press_resistance_index`/`generate_player_shot_map_aggregated`/
+`generate_player_report`'s own `positional_distribution` already safely
+expose on their own, today, unconditionally?
+
+**No — and the reasoning holds regardless of how the score was
+computed, not just because the inputs happen to already be exempt.** The
+15-dimension feature vector a similarity score is derived from is built
+ENTIRELY from scalars this project has ALREADY resolved condition-2-exempt
+individually: `positional_distribution` shares (season-aggregate,
+unconditional today), Press Resistance Index's overall/per-event-type
+rates (EXEMPT, own addendum above), and the shot map's own AGGREGATED
+summary scalars (`total_shots`/`goals`/`xg_per_shot`/`shots_by_body_part`
+— `generate_player_shot_map_aggregated`'s own docstring: "ADR-021's own
+reasoning already treats a count/sum/share as condition-2-compliant").
+A cosine similarity score is a further reduction of these already-exempt
+scalars — like Tactical Entropy's own entropy value relative to its
+transition matrix, a derived scalar computed FROM an aggregate cannot
+carry MORE individually-recoverable information than the aggregate
+itself; it can only carry less (the raw feature values of either player
+are not recoverable from the similarity score alone, and the score
+itself is bounded to [-1, 1] with no location, minute, or event-level
+content at any point in its computation).
+
+**The one genuinely new ingredient — pairing two named individuals in a
+single output — does not change this.** Both players' own underlying
+aggregate profiles are ALREADY independently, unconditionally public
+today, via their own existing endpoints; computing a distance between
+two already-public vectors reveals nothing about either player's own
+individual raw events (no location, no minute, no specific match) that
+querying each player's own existing report wouldn't already reveal
+separately. The `matched_features` explanation field returned alongside
+each result is even more restrictive: only coarse GROUP LABEL STRINGS
+(e.g. `"press resistance"`, `"shot volume"`), never a raw feature value,
+a z-score, or either player's own underlying number.
+
+**Resolution:** `find_similar_players` and its
+`GET /reports/player/{player_id}/similar` endpoint are served
+UNCONDITIONALLY, not gated by `PUBLIC_DEPLOYMENT` — the same class of
+exemption as Press Resistance Index/Tactical Entropy/Opposition
+Analysis, extended (for the first time) to a two-player comparison
+rather than a single-player aggregate, for the reasoning above. The
+offline precompute index (`data/app_state/player_similarity_index.json`)
+does store each searchable player's own RAW feature values (needed to
+compute `matched_features` at query time) — this file is locally-generated
+application state on the SERVER, never returned to a caller in full; only
+the query player's own already-exempt raw values and the coarse group
+labels described above ever leave `find_similar_players`'s own return
+value.

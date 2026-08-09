@@ -57,6 +57,13 @@ roboflow           # pitch_keypoint_detector.py's _get_model() -- a deliberately
 matplotlib
 scipy
 
+# --- Player Similarity Search (new ML work) -- player_similarity.py's own
+# batched-precompute memory check (psutil.virtual_memory().available,
+# tonight's own repeated OOM history). Already present as a transitive
+# dependency (see requirements-lock.txt) but not previously imported
+# directly by any of this project's own code -- now a genuine direct one. ---
+psutil
+
 # --- Real LLM integration (ADR-006 Update) -- explainer.py's real Gemini
 # Flash-Lite executor. `google-genai` is Google's current, GA-recommended
 # SDK (verified against real, current docs, not assumed) -- the older

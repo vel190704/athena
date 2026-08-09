@@ -235,6 +235,15 @@ TACTICAL_ACTIONS = ["high_press", "drop_deep", "force_wide", "no_change"]
 # file's own RECV_TIMEOUT_SECONDS as a "generous but bounded" convention.
 REPORT_REQUEST_TIMEOUT_SECONDS = 60.0
 
+# Player Similarity Search's own precompute rebuild -- a genuinely slow,
+# manually-triggered operation (MEASURED against this project's real full
+# searchable population, ~5,000 players: see player_similarity.py's own
+# docstring for the exact real timing), so it needs a much longer client
+# timeout than every other report request in this file rather than
+# sharing REPORT_REQUEST_TIMEOUT_SECONDS's 60s "generous but bounded"
+# budget, which this operation would blow through by design, not by bug.
+SIMILARITY_INDEX_REBUILD_TIMEOUT_SECONDS = 1800.0
+
 # Timeout-incident fix, MEASURED (not guessed) directly against this
 # project's own real cached data before being chosen -- see the task that
 # added this constant for the full breakdown. Real Madrid's 68-match
@@ -414,6 +423,39 @@ def _cached_player_press_resistance_index(rest_base_url: str, player_id: int, ma
         f"{rest_base_url}/reports/player/{player_id}/press-resistance",
         params={"match_ids": list(match_ids)},
         timeout=REPORT_REQUEST_TIMEOUT_SECONDS,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+# Player Similarity Search (new ML work, additive, its own feature --
+# see docs/adr/ADR-021's own addendum for the exemption reasoning). The
+# LIVE query is a fast lookup against an ALREADY-PRECOMPUTED index --
+# cached here too (st.cache_data) purely to avoid a redundant HTTP round
+# trip on an unrelated widget rerun within the same session, NOT because
+# the query itself is slow. Rebuilding the index itself (below) is
+# deliberately NOT cached -- every click must trigger a real rebuild.
+@st.cache_data(show_spinner=False)
+def _cached_similar_players(rest_base_url: str, player_id: int, top_k: int) -> dict:
+    response = requests.get(
+        f"{rest_base_url}/reports/player/{player_id}/similar",
+        params={"top_k": top_k},
+        timeout=REPORT_REQUEST_TIMEOUT_SECONDS,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def _rebuild_similarity_index(rest_base_url: str) -> dict:
+    """NOT `@st.cache_data` -- Step 3.3's own explicit "manual trigger,
+    no automatic staleness/TTL" discipline means every real button click
+    must genuinely re-POST, never silently return a cached prior result.
+    Uses SIMILARITY_INDEX_REBUILD_TIMEOUT_SECONDS, not the shared
+    REPORT_REQUEST_TIMEOUT_SECONDS every other report request uses (see
+    that constant's own comment for why)."""
+    response = requests.post(
+        f"{rest_base_url}/reports/player-similarity/rebuild",
+        timeout=SIMILARITY_INDEX_REBUILD_TIMEOUT_SECONDS,
     )
     response.raise_for_status()
     return response.json()
@@ -1431,6 +1473,75 @@ with tab_player:
                                 )
                                 with st.expander("Raw timeline data"):
                                     st.json(timeline)
+
+                st.divider()
+                st.subheader("Player Similarity Search")
+                st.caption(
+                    "Cosine similarity over a 15-feature style profile (positional role, Press "
+                    "Resistance Index, shot volume/quality/technique) -- searches for similar TYPE "
+                    "of player, not similar overall activity level. Reads an offline-precomputed "
+                    "index; does not recompute the population live. See ADR-021's own addendum for "
+                    "why this is unconditional (not gated behind PUBLIC_DEPLOYMENT)."
+                )
+
+                rebuild_col, _ = st.columns([1, 3])
+                with rebuild_col:
+                    if st.button("Rebuild similarity index", help=(
+                        "A real, slow (measured ~16 minutes across this project's full real "
+                        "population) operation, manually triggered ONLY -- there is no automatic "
+                        "rebuild. Run this once after fetching new player data, not on every visit."
+                    )):
+                        with st.spinner("Rebuilding similarity index (this genuinely takes a while)..."):
+                            try:
+                                rebuild_result = _rebuild_similarity_index(rest_base_url)
+                            except requests.exceptions.RequestException as exc:
+                                st.error(f"Rebuild failed: {exc}")
+                            else:
+                                st.success(
+                                    f"Indexed {rebuild_result['searchable_population_size']} of "
+                                    f"{rebuild_result['total_cached_population_size']} cached players "
+                                    f"in {rebuild_result['build_duration_seconds']:.1f}s."
+                                )
+                                st.cache_data.clear()
+
+                top_k = st.number_input("Top-K similar players", min_value=1, max_value=20, value=5, step=1)
+                if st.button("Find Similar Players"):
+                    with st.spinner("Querying similarity index..."):
+                        try:
+                            similar = _cached_similar_players(rest_base_url, player_id, int(top_k))
+                        except requests.exceptions.HTTPError as exc:
+                            if exc.response is not None and exc.response.status_code == 404:
+                                st.info(
+                                    "No similarity index found yet -- click 'Rebuild similarity index' "
+                                    "above first."
+                                )
+                            else:
+                                st.error(f"Request failed: {exc}")
+                            similar = None
+                        except requests.exceptions.RequestException as exc:
+                            st.error(f"Request failed: {exc}")
+                            similar = None
+
+                    if similar is not None:
+                        if similar.get("no_data"):
+                            st.info(similar.get("reason", "This player is not in the searchable population."))
+                        else:
+                            st.write(
+                                f"Players most similar to **{similar['name']}** (player_id={player_id}), "
+                                f"out of {similar['searchable_population_size']} searchable players:"
+                            )
+                            similar_df = pd.DataFrame([
+                                {
+                                    "Player": s["name"],
+                                    "Player ID": s["player_id"],
+                                    "Similarity": f"{s['similarity']:.3f}",
+                                    "Driven by": ", ".join(s["matched_features"]),
+                                }
+                                for s in similar["similar_players"]
+                            ])
+                            st.dataframe(similar_df, width="stretch")
+                            with st.expander("Raw player similarity data"):
+                                st.json(similar)
 
 # ============================================================================
 # TAB: Team Reports -- report DATA now fetched over HTTP from api.py's

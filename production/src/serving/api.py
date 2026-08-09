@@ -64,6 +64,10 @@ from production.src.reporting.player_report import (
     generate_player_shot_map,
     generate_player_shot_map_aggregated,
 )
+from production.src.reporting.player_similarity import (
+    build_player_similarity_index,
+    find_similar_players,
+)
 from production.src.reporting.team_comparison import compare_team_matches, compare_team_seasons
 from production.src.reporting.team_report import (
     generate_team_opposition_analysis,
@@ -905,6 +909,51 @@ async def get_player_press_resistance_index(player_id: int, match_ids: list[int]
     addendum recording this decision.
     """
     return await asyncio.to_thread(generate_player_press_resistance_index, player_id, match_ids)
+
+
+@app.get("/reports/player/{player_id}/similar", dependencies=[Depends(_require_api_key)])
+async def get_similar_players(player_id: int, top_k: int = 5):
+    """Wraps player_similarity.find_similar_players, unmodified -- a fast
+    lookup against the ALREADY-PRECOMPUTED, disk-cached similarity index
+    (see POST /reports/player-similarity/rebuild below for how that index
+    is built). Never recomputes the searchable population live.
+
+    Returns HTTP 404 (a clean, real error, not a 500) if the index hasn't
+    been built yet -- `find_similar_players` raises `FileNotFoundError`
+    in that case, which this endpoint translates explicitly rather than
+    letting FastAPI's own generic 500 handler obscure the real cause.
+
+    ADR-021 condition 2: NOT gated by PUBLIC_DEPLOYMENT -- see
+    find_similar_players's own docstring in player_similarity.py for the
+    full Step 0-2 definitions, and ADR-021's Player Similarity Search
+    addendum for the full exemption reasoning (a derived similarity
+    score over already-exempt per-player scalar aggregates, plus only
+    coarse feature-GROUP labels -- never a raw feature value, a
+    location, or a minute).
+    """
+    try:
+        return await asyncio.to_thread(find_similar_players, player_id, top_k)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/reports/player-similarity/rebuild", dependencies=[Depends(_require_api_key)])
+async def rebuild_player_similarity_index():
+    """Wraps player_similarity.build_player_similarity_index, unmodified.
+
+    MANUALLY triggered ONLY (Step 3.3) -- no automatic TTL/staleness
+    check anywhere in this codebase ever calls this. A real, measured
+    ~16-minute operation across this project's full ~5,000-player
+    searchable population (see the task report for the exact real
+    timing/memory-behavior numbers) -- this endpoint deliberately blocks
+    (via asyncio.to_thread, so it does not block the event loop for
+    OTHER connections, but DOES block the calling HTTP request itself)
+    rather than returning a job id / polling contract, matching this
+    project's existing "reuse the simplest pattern that fits" discipline
+    -- see dashboard.py's own "Rebuild similarity index" button for the
+    long, explicit client-side timeout this requires.
+    """
+    return await asyncio.to_thread(build_player_similarity_index)
 
 
 @app.get("/reports/player/{player_id}/match/{match_id}/touch-map", dependencies=[Depends(_require_api_key)])
