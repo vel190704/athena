@@ -29,7 +29,7 @@ from typing import Literal
 os.environ.setdefault("MLFLOW_ALLOW_FILE_STORE", "true")
 
 import torch
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from ultralytics import YOLO
 
 from production.src.constants import TIME_BIN
@@ -176,6 +176,202 @@ async def _require_api_key(x_api_key: str | None = Header(default=None)) -> None
         raise HTTPException(status_code=401, detail="Missing or invalid X-API-Key header")
 
 
+# ============================================================================
+# ADR-022 Update: rate limiting (Phase 2 -- the half ADR-022 itself left
+# explicitly unresolved). Hand-rolled, not `slowapi` -- see ADR-022's own
+# Update section for the full reasoning (checked directly, not assumed:
+# slowapi + its own `limits` dependency together are genuinely lightweight
+# for the default in-memory backend -- no heavy transitive deps -- but
+# slowapi's OWN documentation states "websocket endpoints are not
+# supported yet," meaning the WebSocket connection-rate check below would
+# need a hand-rolled mechanism regardless. Rather than run TWO different
+# rate-limiting implementations side by side, ONE simple, uniform,
+# in-memory token bucket is applied consistently to both REST and
+# WebSocket -- matching this project's own established "smallest real
+# step up" precedent, ADR-019's SQLite-over-Postgres call and ADR-022's
+# own API-key-over-full-auth-system call).
+#
+# Correct for THIS project's deployment model specifically (single
+# uvicorn process, ADR-022's own stated context: one operator, no
+# multi-worker/shared-state need) -- an in-memory, per-process dict is
+# sufficient; a real multi-instance deployment would need a shared
+# backend (Redis, matching what `limits` itself would have needed too),
+# explicitly out of scope for the same reason a full auth system was.
+# ============================================================================
+
+
+class _TokenBucket:
+    __slots__ = ("tokens", "last_refill")
+
+    def __init__(self, tokens: float, last_refill: float):
+        self.tokens = tokens
+        self.last_refill = last_refill
+
+
+class _RateLimiter:
+    """One token bucket per rate-limit KEY (Step 0.2: an API key value or
+    a client IP -- see `_rate_limit_key` below), refilling continuously
+    at `capacity / 60` tokens/second so a caller can burst up to
+    `capacity` requests immediately and then sustains `capacity`
+    requests/minute thereafter -- the standard token-bucket shape ADR-022's
+    own roadmap note already named ("a simple in-memory token-bucket
+    keyed by API key") as the expected mechanism, not a fixed window
+    (which has a real, known boundary-doubling artifact a token bucket
+    avoids for barely more implementation cost).
+
+    A single `asyncio.Lock` guards all buckets in this limiter -- the
+    check-and-update itself is a handful of dict/float operations with no
+    `await` in between, so lock contention is negligible even under real
+    concurrent traffic; this is not a hot inner loop the way the physics
+    engine or DeepHit inference are.
+    """
+
+    def __init__(self, capacity: float):
+        self.capacity = capacity
+        self.refill_per_second = capacity / 60.0
+        self._buckets: dict[str, _TokenBucket] = {}
+        self._lock = asyncio.Lock()
+
+    async def check(self, key: str) -> float | None:
+        """Consumes one token and returns `None` (allowed) if available;
+        otherwise returns the real number of seconds until the next
+        token will be available (for a `Retry-After` header/close
+        reason), consuming nothing."""
+        async with self._lock:
+            now = time.monotonic()
+            bucket = self._buckets.get(key)
+            if bucket is None:
+                bucket = _TokenBucket(tokens=self.capacity, last_refill=now)
+                self._buckets[key] = bucket
+            else:
+                elapsed = now - bucket.last_refill
+                bucket.tokens = min(self.capacity, bucket.tokens + elapsed * self.refill_per_second)
+                bucket.last_refill = now
+
+            if bucket.tokens >= 1.0:
+                bucket.tokens -= 1.0
+                return None
+            return (1.0 - bucket.tokens) / self.refill_per_second
+
+
+# Step 0.3: per-tier limits, each independently justified against a real
+# measured or stated cost -- not one blanket number. All are
+# requests-per-minute (== token-bucket capacity, per `_RateLimiter`'s own
+# docstring); the one exception (`similarity_rebuild`) is stated in its
+# own comment since "per minute" would misrepresent a limit tighter than
+# 1/minute.
+#
+#   metrics (300/min): "effectively unlimited" per Step 1 -- a real
+#     monitoring poller checks every 10-60s; 300/min (5/s) is far above
+#     any real polling cadence while still nominally bounded against a
+#     genuine flood. `/health` itself gets NO limiter at all (see the
+#     endpoint below) -- the same full exemption ADR-022 already gives it
+#     from the API-key check, not merely a high number.
+#   standard (30/min): single-player/single-match report endpoints that
+#     do one bounded linear scan over already-cached files (player
+#     report/shot-map/press-resistance/match-summary/touch-map/timeline,
+#     pass-network, Tactical Entropy, Opposition Analysis, /simulate,
+#     /alerts/history) -- real dashboard usage fires ~6-8 of these per
+#     "Generate Report" click; 30/min gives comfortable headroom for a
+#     legitimate multi-panel session while still bounding a scripted loop
+#     to a modest, sustainable rate.
+#   heavy (6/min): endpoints that run real BiomechanicalPitchControl
+#     computation (/reports/team/{name}, its own passing-lanes panel,
+#     both team-comparison endpoints when 360 data is used) -- ADR-022's
+#     own text already measured /reports/team/{name} at "up to ~100s for
+#     a well-supported team"; 6/min (1 per 10s) keeps even sustained
+#     hammering from stacking concurrent/queued heavy work, while still
+#     letting a real user explore a handful of teams/comparisons per
+#     minute. /reports/player/{id}/similar is ALSO placed in this tier
+#     (a deliberate, conservative choice, not because its own live query
+#     is slow -- it is a fast index lookup -- but matching this scope's
+#     own explicit instruction to treat it as compute-heavy).
+#   websocket_connect (10/min): NEW-CONNECTION rate, not per-message
+#     throttling (a connected stream legitimately sends many messages;
+#     see the WebSocket endpoint's own check for why this is a separate
+#     concern) -- each new connection does real setup work (a fresh
+#     CVPipeline instance for source=cv, or a live_match_stream
+#     generator), so this bounds CONNECTION-FLOOD abuse specifically. A
+#     real interactive session opens a handful of streams (start/stop/
+#     retry while testing settings); 10/min comfortably covers that.
+RATE_LIMIT_TIERS: dict[str, float] = {
+    "metrics": 300.0,
+    "standard": 30.0,
+    "heavy": 6.0,
+    "websocket_connect": 10.0,
+}
+# similarity_rebuild (1 per 30 minutes, not per-minute): a REAL measured
+# ~27-minute full-population operation (player_similarity.py's own
+# docstring) -- this endpoint exists to be triggered rarely, deliberately
+# ("once after fetching new player data," per its own existing
+# docstring), so its capacity is 1 with a refill rate matched to a 30-
+# minute window rather than reusing the per-minute convention every other
+# tier uses.
+_SIMILARITY_REBUILD_WINDOW_SECONDS = 30 * 60.0
+
+_rate_limiters: dict[str, _RateLimiter] = {
+    tier: _RateLimiter(capacity=capacity) for tier, capacity in RATE_LIMIT_TIERS.items()
+}
+_rate_limiters["similarity_rebuild"] = _RateLimiter(capacity=1.0)
+_rate_limiters["similarity_rebuild"].refill_per_second = 1.0 / _SIMILARITY_REBUILD_WINDOW_SECONDS
+
+
+def _rate_limit_key(client_host: str | None) -> str:
+    """Step 0.2: keyed per API KEY when auth is enabled, per CLIENT IP
+    otherwise -- genuinely different keying logic for the two modes, not
+    one hardcoded scheme, since an unauthenticated deployment has no
+    other real identity signal to key on besides the caller's own network
+    address.
+
+    When `API_KEY` is set, this keys on the constant `API_KEY` value
+    itself (not the caller's own header, which `_require_api_key` has
+    already verified matches it before this ever runs) -- today, since
+    ADR-022 supports exactly ONE shared secret, every authenticated
+    caller shares ONE bucket in practice. Keying on the value itself
+    (rather than hardcoding a single named global bucket) is still the
+    right, forward-compatible choice: if ADR-022 is ever revisited to
+    support multiple distinct keys (its own Consequences section already
+    names "more than one party needs distinguishable access" as that
+    trigger), this naturally scales to a separate bucket per real key
+    with no further change here.
+    """
+    if API_KEY is not None:
+        return f"key:{API_KEY}"
+    return f"ip:{client_host or 'unknown'}"
+
+
+def _rate_limit(tier: str):
+    """A parametrized FastAPI dependency factory -- `Depends(_rate_limit("heavy"))`
+    -- mirroring `_require_api_key`'s own dependency-injection pattern,
+    added ALONGSIDE it (both appear in a route's own `dependencies=[...]`
+    list), never replacing or modifying it.
+
+    A no-op whenever `PUBLIC_DEPLOYMENT` is unset (Step 1.1) -- local
+    development and this project's own test suite must see ZERO behavior
+    change from this feature, the exact same guarantee `_require_api_key`
+    already gives for `API_KEY` unset. Rate limiting is only genuinely
+    OFF, not merely "set very high": no bucket is even checked when
+    `PUBLIC_DEPLOYMENT` is False, so there is no risk of a fast CI/test
+    run's legitimate request burst ever tripping it.
+    """
+    limiter = _rate_limiters[tier]
+
+    async def _check(request: Request) -> None:
+        if not PUBLIC_DEPLOYMENT:
+            return
+        client = request.client
+        key = _rate_limit_key(client.host if client is not None else None)
+        retry_after = await limiter.check(key)
+        if retry_after is not None:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Rate limit exceeded for this endpoint ({tier} tier). Retry after {retry_after:.0f}s.",
+                headers={"Retry-After": str(max(1, int(retry_after) + 1))},
+            )
+
+    return _check
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _model, _normalization_mean, _normalization_std, _model_run_id, _startup_monotonic, _yolo_checkpoint_warmed
@@ -226,6 +422,27 @@ async def lifespan(app: FastAPI):
     )
     logger.info(
         f"API_KEY {'is set -- protected endpoints now require a matching X-API-Key header.' if API_KEY else 'is unset -- no auth check, local/private default behavior (see ADR-022).'}"
+    )
+    # ADR-022 Update (rate limiting, Phase 2): an explicit, visible status
+    # line -- the same "surface the status, don't let it be silent"
+    # discipline every other PUBLIC_DEPLOYMENT-gated behavior in this file
+    # already follows (shot-map/pass-network/touch-map-timeline/passing-
+    # lanes variant logging above, API_KEY's own line just above this
+    # one). Step 1.2's explicit requirement: an operator turning
+    # PUBLIC_DEPLOYMENT on must see, in the startup log, that rate
+    # limiting is genuinely active for that run, not merely trust that it
+    # is by reading source.
+    logger.info(
+        f"PUBLIC_DEPLOYMENT={PUBLIC_DEPLOYMENT} -- rate limiting is "
+        + (
+            f"ACTIVE (tiers: {RATE_LIMIT_TIERS}, requests/minute; "
+            f"similarity_rebuild: 1 per {_SIMILARITY_REBUILD_WINDOW_SECONDS / 60:.0f} minutes; "
+            f"keyed per {'API key' if API_KEY is not None else 'client IP'}). "
+            "/health has no limiter at all."
+            if PUBLIC_DEPLOYMENT else
+            "OFF (local/private default behavior -- no request is ever throttled while "
+            "PUBLIC_DEPLOYMENT is unset, see ADR-022's Update section)."
+        )
     )
 
     # Milestone 33 Step 1.1: warm the CV YOLO checkpoint ONCE at startup --
@@ -612,10 +829,37 @@ async def tactical_stream(
     injection. `Depends()` doesn't apply to `@app.websocket` routes the
     same way it does REST ones in this FastAPI version, so this is a
     deliberate, explicit manual check here, not an oversight.
+
+    ADR-022 Update: the CONNECTION-rate check (Step 2.2) happens here too,
+    same class of manual-check-not-oversight reasoning -- `slowapi`
+    itself does not support WebSocket routes at all (see the rate-limiter
+    section's own comment), so this was always going to need a hand-
+    rolled check regardless of what REST uses. This bounds how many NEW
+    connections a caller can open per minute (`RATE_LIMIT_TIERS["websocket_connect"]`),
+    a genuinely separate concern from per-MESSAGE throttling within an
+    already-open connection -- a legitimately connected stream sends many
+    `threat`/`alert` messages by design (Milestone 17), and nothing about
+    that per-message volume is throttled here; only the RATE OF NEW
+    CONNECTION ATTEMPTS is, since each one does real setup work (a fresh
+    `CVPipeline` instance for `source="cv"`, or a `live_match_stream`
+    generator) before a single message is ever sent.
     """
     if API_KEY is not None and websocket.headers.get("x-api-key") != API_KEY:
         await websocket.close(code=1008, reason="Missing or invalid X-API-Key header")
         return
+
+    if PUBLIC_DEPLOYMENT:
+        ws_client = websocket.client
+        ws_key = _rate_limit_key(ws_client.host if ws_client is not None else None)
+        ws_retry_after = await _rate_limiters["websocket_connect"].check(ws_key)
+        if ws_retry_after is not None:
+            # 1013 ("Try Again Later") is the standard WebSocket close
+            # code for exactly this situation -- the REST-side analog of
+            # a 429, not a generic/ambiguous close.
+            await websocket.close(
+                code=1013, reason=f"Rate limit exceeded -- retry after {int(ws_retry_after) + 1}s"
+            )
+            return
 
     await websocket.accept()
 
@@ -766,7 +1010,7 @@ def _find_qualifying_frame_for_minute(
     return None
 
 
-@app.get("/simulate", dependencies=[Depends(_require_api_key)])
+@app.get("/simulate", dependencies=[Depends(_require_api_key), Depends(_rate_limit("standard"))])
 async def simulate(
     match_id: int,
     minute: int,
@@ -846,14 +1090,14 @@ async def simulate(
 # ============================================================================
 
 
-@app.get("/reports/player/{player_id}", dependencies=[Depends(_require_api_key)])
+@app.get("/reports/player/{player_id}", dependencies=[Depends(_require_api_key), Depends(_rate_limit("standard"))])
 async def get_player_report(player_id: int, match_ids: list[int] = Query(...)):
     """Wraps player_report.generate_player_report, unmodified. `match_ids`
     is a repeated query parameter, e.g. `?match_ids=1&match_ids=2`."""
     return await asyncio.to_thread(generate_player_report, player_id, match_ids)
 
 
-@app.get("/reports/player/{player_id}/shot-map", dependencies=[Depends(_require_api_key)])
+@app.get("/reports/player/{player_id}/shot-map", dependencies=[Depends(_require_api_key), Depends(_rate_limit("standard"))])
 async def get_player_shot_map(player_id: int, match_ids: list[int] = Query(...)):
     """Wraps player_report.generate_player_shot_map (or, in PUBLIC_DEPLOYMENT
     mode, generate_player_shot_map_aggregated), unmodified. A DEDICATED
@@ -881,7 +1125,7 @@ async def get_player_shot_map(player_id: int, match_ids: list[int] = Query(...))
     return await asyncio.to_thread(generate_player_shot_map, player_id, match_ids)
 
 
-@app.get("/reports/player/{player_id}/match-summary", dependencies=[Depends(_require_api_key)])
+@app.get("/reports/player/{player_id}/match-summary", dependencies=[Depends(_require_api_key), Depends(_rate_limit("standard"))])
 async def get_player_match_summary(player_id: int, match_ids: list[int] = Query(...)):
     """Wraps player_report.generate_player_match_summary, unmodified.
 
@@ -895,7 +1139,7 @@ async def get_player_match_summary(player_id: int, match_ids: list[int] = Query(
     return await asyncio.to_thread(generate_player_match_summary, player_id, match_ids)
 
 
-@app.get("/reports/player/{player_id}/press-resistance", dependencies=[Depends(_require_api_key)])
+@app.get("/reports/player/{player_id}/press-resistance", dependencies=[Depends(_require_api_key), Depends(_rate_limit("standard"))])
 async def get_player_press_resistance_index(player_id: int, match_ids: list[int] = Query(...)):
     """Wraps player_report.generate_player_press_resistance_index, unmodified.
 
@@ -911,7 +1155,7 @@ async def get_player_press_resistance_index(player_id: int, match_ids: list[int]
     return await asyncio.to_thread(generate_player_press_resistance_index, player_id, match_ids)
 
 
-@app.get("/reports/player/{player_id}/similar", dependencies=[Depends(_require_api_key)])
+@app.get("/reports/player/{player_id}/similar", dependencies=[Depends(_require_api_key), Depends(_rate_limit("heavy"))])
 async def get_similar_players(player_id: int, top_k: int = 5):
     """Wraps player_similarity.find_similar_players, unmodified -- a fast
     lookup against the ALREADY-PRECOMPUTED, disk-cached similarity index
@@ -937,7 +1181,7 @@ async def get_similar_players(player_id: int, top_k: int = 5):
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
-@app.post("/reports/player-similarity/rebuild", dependencies=[Depends(_require_api_key)])
+@app.post("/reports/player-similarity/rebuild", dependencies=[Depends(_require_api_key), Depends(_rate_limit("similarity_rebuild"))])
 async def rebuild_player_similarity_index():
     """Wraps player_similarity.build_player_similarity_index, unmodified.
 
@@ -956,7 +1200,7 @@ async def rebuild_player_similarity_index():
     return await asyncio.to_thread(build_player_similarity_index)
 
 
-@app.get("/reports/player/{player_id}/match/{match_id}/touch-map", dependencies=[Depends(_require_api_key)])
+@app.get("/reports/player/{player_id}/match/{match_id}/touch-map", dependencies=[Depends(_require_api_key), Depends(_rate_limit("standard"))])
 async def get_player_match_touch_map(player_id: int, match_id: int):
     """Wraps player_report.generate_player_match_touch_map (or, in
     PUBLIC_DEPLOYMENT mode, generate_player_match_touch_map_aggregated),
@@ -975,7 +1219,7 @@ async def get_player_match_touch_map(player_id: int, match_id: int):
     return await asyncio.to_thread(generate_player_match_touch_map, player_id, match_id)
 
 
-@app.get("/reports/player/{player_id}/match/{match_id}/timeline", dependencies=[Depends(_require_api_key)])
+@app.get("/reports/player/{player_id}/match/{match_id}/timeline", dependencies=[Depends(_require_api_key), Depends(_rate_limit("standard"))])
 async def get_player_match_timeline(player_id: int, match_id: int):
     """Wraps player_report.generate_player_match_timeline (or, in
     PUBLIC_DEPLOYMENT mode, generate_player_match_timeline_aggregated),
@@ -993,7 +1237,7 @@ async def get_player_match_timeline(player_id: int, match_id: int):
     return await asyncio.to_thread(generate_player_match_timeline, player_id, match_id)
 
 
-@app.get("/reports/pass-network/{match_id}", dependencies=[Depends(_require_api_key)])
+@app.get("/reports/pass-network/{match_id}", dependencies=[Depends(_require_api_key), Depends(_rate_limit("standard"))])
 async def get_pass_network(match_id: int):
     """Wraps pass_network.generate_pass_network (or, in PUBLIC_DEPLOYMENT
     mode, generate_pass_network_aggregated), unmodified. Single `match_id`
@@ -1019,7 +1263,7 @@ async def get_pass_network(match_id: int):
     return await asyncio.to_thread(generate_pass_network, match_id)
 
 
-@app.get("/reports/team/{team_name}", dependencies=[Depends(_require_api_key)])
+@app.get("/reports/team/{team_name}", dependencies=[Depends(_require_api_key), Depends(_rate_limit("heavy"))])
 async def get_team_report(team_name: str, match_ids: list[int] = Query(default=[])):
     """Wraps team_report.generate_team_report, unmodified.
 
@@ -1050,7 +1294,7 @@ async def get_team_report(team_name: str, match_ids: list[int] = Query(default=[
     return report
 
 
-@app.get("/reports/team/{team_name}/pass-entropy", dependencies=[Depends(_require_api_key)])
+@app.get("/reports/team/{team_name}/pass-entropy", dependencies=[Depends(_require_api_key), Depends(_rate_limit("standard"))])
 async def get_team_pass_entropy(team_name: str, match_ids: list[int] = Query(default=[])):
     """Wraps team_report.generate_team_pass_entropy, unmodified.
 
@@ -1073,7 +1317,7 @@ async def get_team_pass_entropy(team_name: str, match_ids: list[int] = Query(def
     return await asyncio.to_thread(generate_team_pass_entropy, team_name, match_ids)
 
 
-@app.get("/reports/team/{team_name}/passing-lanes", dependencies=[Depends(_require_api_key)])
+@app.get("/reports/team/{team_name}/passing-lanes", dependencies=[Depends(_require_api_key), Depends(_rate_limit("heavy"))])
 async def get_team_passing_lanes(team_name: str, match_ids: list[int] = Query(default=[])):
     """Wraps team_report.generate_team_passing_lanes (or, in
     PUBLIC_DEPLOYMENT mode, generate_team_passing_lanes_aggregated),
@@ -1100,7 +1344,7 @@ async def get_team_passing_lanes(team_name: str, match_ids: list[int] = Query(de
     return await asyncio.to_thread(generate_team_passing_lanes, team_name, match_ids)
 
 
-@app.get("/reports/team/{team_name}/opposition-analysis", dependencies=[Depends(_require_api_key)])
+@app.get("/reports/team/{team_name}/opposition-analysis", dependencies=[Depends(_require_api_key), Depends(_rate_limit("standard"))])
 async def get_team_opposition_analysis(team_name: str, match_ids: list[int] = Query(default=[])):
     """Wraps team_report.generate_team_opposition_analysis, unmodified.
 
@@ -1122,13 +1366,13 @@ async def get_team_opposition_analysis(team_name: str, match_ids: list[int] = Qu
     return await asyncio.to_thread(generate_team_opposition_analysis, team_name, match_ids)
 
 
-@app.get("/reports/team-comparison", dependencies=[Depends(_require_api_key)])
+@app.get("/reports/team-comparison", dependencies=[Depends(_require_api_key), Depends(_rate_limit("heavy"))])
 async def get_team_comparison(team_a: str, season_a: int, team_b: str, season_b: int):
     """Wraps team_comparison.compare_team_seasons, unmodified."""
     return await asyncio.to_thread(compare_team_seasons, team_a, season_a, team_b, season_b)
 
 
-@app.get("/reports/team-comparison/match", dependencies=[Depends(_require_api_key)])
+@app.get("/reports/team-comparison/match", dependencies=[Depends(_require_api_key), Depends(_rate_limit("heavy"))])
 async def get_team_match_comparison(team_name: str, match_id_a: int, match_id_b: int):
     """Wraps team_comparison.compare_team_matches, unmodified.
 
@@ -1156,7 +1400,7 @@ async def get_team_match_comparison(team_name: str, match_id_a: int, match_id_b:
 # ============================================================================
 
 
-@app.get("/alerts/history", dependencies=[Depends(_require_api_key)])
+@app.get("/alerts/history", dependencies=[Depends(_require_api_key), Depends(_rate_limit("standard"))])
 async def get_alerts_history(
     match_id: int | None = None,
     source: Literal["statsbomb", "cv"] | None = None,
@@ -1200,6 +1444,12 @@ async def health():
     endpoint exists to guarantee. This is "was MLflow reachable when the
     server started," not "is MLflow reachable this instant" -- stated
     explicitly here so it is never misread as a live re-check.
+
+    ADR-022 Update: deliberately has NO `Depends(_rate_limit(...))`, the
+    same full exemption this endpoint already has from `_require_api_key`
+    -- a load balancer/uptime monitor needs to probe liveness without
+    being throttled OR credentialed, and this is the only endpoint in
+    this file exempted from EITHER check.
     """
     return {
         "status": "ok" if _model is not None else "degraded",
@@ -1212,7 +1462,7 @@ async def health():
     }
 
 
-@app.get("/metrics", dependencies=[Depends(_require_api_key)])
+@app.get("/metrics", dependencies=[Depends(_require_api_key), Depends(_rate_limit("metrics"))])
 async def metrics():
     """Basic operational counters -- plain JSON, not a Prometheus-format
     exporter (no `prometheus_client` dependency exists anywhere in this

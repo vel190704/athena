@@ -132,3 +132,130 @@ decision.
   README section already tells an operator what to configure before
   going public; adding "and set API_KEY too" to that same checklist is
   a documentation problem, not a reason to change the default here.
+
+## Update: Rate Limiting (Phase 2 — closing the item this ADR left open)
+
+This ADR's own Decision section named rate-limiting as "explicitly
+UNRESOLVED... the deferred half of the original 'auth/rate-limiting'
+flag, not silently folded into this decision." This Update closes that
+out, following the exact same scoping discipline as the API-key decision
+above: minimal, off by default, real and enforced the moment
+`PUBLIC_DEPLOYMENT` is ever turned on.
+
+**Library/approach chosen: hand-rolled, not `slowapi`.** `slowapi` (this
+ADR's own roadmap note named it as the likely candidate) was checked
+directly, not assumed: it and its own dependency (`limits`) are
+genuinely lightweight for the default in-memory backend — `slowapi`
+itself is a 14KB wheel, `limits` a 60KB wheel with only
+`deprecated`/`packaging`/`typing-extensions` as required (non-extra)
+dependencies; the heavier backends (redis, memcached, mongodb) are all
+optional extras this project would never install. Tonight's own repeated
+OOM history was the reason to check this rather than assume it, and the
+answer is genuinely "no real memory concern here."
+
+**Rejected anyway, for a different, disqualifying reason:** `slowapi`'s
+own documentation states plainly, "`websocket` endpoints are not
+supported yet." This project's live tactical stream (`/ws/tactical-stream`)
+is exactly the endpoint most in need of its OWN connection-rate
+consideration (Step 2.2) — meaning even with `slowapi` installed, the
+WebSocket half of this problem would need a hand-rolled mechanism
+regardless, the exact same class of framework gap this ADR's own auth
+decision already hit and solved manually (`Depends()` not applying to
+`@app.websocket` routes the same way it does REST ones). Rather than run
+TWO different rate-limiting implementations side by side — a
+library-based decorator for REST, a hand-rolled check for WebSocket, with
+no guarantee their semantics agree — ONE simple, in-memory token bucket
+(`_RateLimiter`/`_TokenBucket` in `api.py`) is applied uniformly to both,
+via `Depends(_rate_limit(tier))` for REST routes and a manual check
+before `accept()` for the WebSocket route (mirroring `_require_api_key`'s
+own REST-vs-WebSocket split exactly). This also avoids a new dependency
+for only partial coverage of the actual problem.
+
+**Correct for this project's actual deployment model:** an in-memory,
+per-process dict is sufficient because this project runs as a single
+uvicorn process (this ADR's own stated context: one operator, no
+multi-worker/shared-state need) — the same reasoning that already
+justified SQLite over Postgres for alert history (ADR-019) and a single
+shared secret over a full auth system (this ADR's own Decision above). A
+genuinely multi-instance deployment would need a shared backend (Redis —
+`limits` itself would have needed exactly this too), explicitly out of
+scope for the same reason a real auth system was.
+
+**Rate-limit KEY (Step 0.2), two genuinely different modes, not one
+hardcoded scheme:**
+- `API_KEY` set (auth enabled): keyed on the API key VALUE itself
+  (`f"key:{API_KEY}"`). Since this ADR supports exactly ONE shared
+  secret today, this is, in practice, one shared bucket for every
+  authenticated caller — stated plainly, not hidden. Keying on the
+  value (rather than a hardcoded single global bucket name) is still the
+  right, forward-compatible choice: this ADR's own Consequences section
+  already names "more than one party needs distinguishable access" as
+  the trigger for revisiting the single-shared-secret decision, and a
+  per-key-value bucket needs no further change if that day comes.
+- `API_KEY` unset (today's local-dev default, unaffected either way
+  since rate limiting itself is off then — see below): keyed on client
+  IP (`request.client.host` for REST, `websocket.client.host` for the
+  WebSocket route).
+
+**Tiered limits (Step 0.3), each independently justified, not one
+blanket number — all requests/minute (token-bucket capacity) unless
+stated otherwise:**
+
+| Tier | Limit | Endpoints | Reasoning |
+|---|---|---|---|
+| (none — fully exempt) | unlimited | `GET /health` | Same full exemption this ADR already gives it from the API-key check — a load balancer/uptime monitor must never be throttled OR credentialed. |
+| `metrics` | 300/min | `GET /metrics` | "Effectively unlimited" per this project's own Step 1 requirement — a real monitoring poller checks every 10-60s; 300/min is far above any real polling cadence. |
+| `standard` | 30/min | `/simulate`, `/reports/player/{id}` (report, shot-map, match-summary, press-resistance, touch-map, timeline), `/reports/pass-network/{match_id}`, `/reports/team/{name}/pass-entropy`, `/reports/team/{name}/opposition-analysis`, `/alerts/history` | Bounded single-player/single-match linear scans over already-cached files. Real dashboard usage fires ~6-8 of these per "Generate Report" click; 30/min gives comfortable headroom for a legitimate multi-panel session while bounding a scripted loop to a modest, sustainable rate. |
+| `heavy` | 6/min | `/reports/team/{name}`, `/reports/team/{name}/passing-lanes`, `/reports/team-comparison`, `/reports/team-comparison/match`, `/reports/player/{id}/similar` | This ADR's own Context section already measured `/reports/team/{name}` at "up to ~100s for a well-supported team" (real `BiomechanicalPitchControl` computation); 6/min (1 per 10s) bounds sustained hammering from stacking concurrent/queued heavy work while still letting a real user explore a handful of teams/comparisons per minute. `/reports/player/{id}/similar` is placed here per this task's own explicit scope, even though its own live query is in fact a fast precomputed-index lookup, not a slow one. |
+| `similarity_rebuild` | 1 per 30 minutes | `POST /reports/player-similarity/rebuild` | Its own, uniquely tight tier — a REAL measured ~27-minute full-population operation (`player_similarity.py`'s own docstring), meant to be triggered rarely and deliberately ("once after fetching new player data"). Allowing even a handful of these per hour would be genuinely excessive resource consumption for what this endpoint is for. |
+| `websocket_connect` | 10 new connections/min | `WS /ws/tactical-stream` | A CONNECTION-rate limit, deliberately NOT per-message throttling — a legitimately open stream sends many `threat`/`alert` messages by design (Milestone 17) and none of that volume is throttled. Each NEW connection does real setup work (a fresh `CVPipeline` instance for `source="cv"`, a `live_match_stream` generator) before a single message is sent, so this bounds connection-flood abuse specifically. A real interactive session opens a handful of streams per sitting (start/stop/retry while testing settings); 10/min covers that comfortably. |
+
+**Response on exceeding a limit:** REST returns a real `429` with a
+`Retry-After` header (the real number of seconds until the bucket's next
+token, not a fixed/generic value) and a JSON body naming the tier. The
+WebSocket route closes with code `1013` ("Try Again Later" — the
+standard WebSocket close code for exactly this situation, the REST-side
+analog of a 429), before `accept()`, mirroring the existing `1008`
+unauthorized-close pattern exactly.
+
+**Tied to `PUBLIC_DEPLOYMENT`, not a separate flag (Step 1):**
+`PUBLIC_DEPLOYMENT` unset (today's default, and this project's own test
+suite's only configuration) means rate limiting is genuinely OFF — no
+bucket is even checked, not merely "set very high" — so local
+development and the existing test suite's own rapid sequential requests
+see zero behavior change (confirmed directly: the full existing suite,
+`production/tests/test_api.py` and `production/tests/test_dashboard.py`,
+passes unchanged with zero new failures). `PUBLIC_DEPLOYMENT=true`
+enables it for real, with an explicit startup log line (mirroring every
+other `PUBLIC_DEPLOYMENT`-gated status line this file already prints)
+stating plainly that rate limiting is active, which tiers exist at what
+capacity, and which keying mode is in effect — an operator turning
+`PUBLIC_DEPLOYMENT` on sees this confirmed, not merely assumes it from
+reading source.
+
+**Relationship to ADR-021's content-exposure gating (Step 1.3):**
+genuinely separate concerns, layered, not duplicated or in conflict.
+ADR-021's `PUBLIC_DEPLOYMENT` checks control WHAT DATA a response
+contains (e.g. the shot map's aggregated-vs-raw variant); this Update's
+checks control HOW OFTEN a caller may ask for it at all, checked earlier
+in the same dependency chain (`Depends(_require_api_key)` — WHO,
+`Depends(_rate_limit(tier))` — HOW OFTEN — then the endpoint's own
+`PUBLIC_DEPLOYMENT` branching decides WHAT). A request can be rejected by
+either check independently; neither one changes the other's behavior.
+
+**Validated, not merely reasoned through:** a REAL, triggered 429 was
+confirmed for the `heavy` tier's own unmodified 6/min capacity, and
+separately for `similarity_rebuild`'s own 1-per-30-minutes capacity
+(`production/tests/test_rate_limiting.py`); a REAL, triggered WebSocket
+close-code-1013 was confirmed for `websocket_connect`'s own unmodified
+10/min capacity. `/health` and `/metrics` were confirmed to stay
+unthrottled under real repeated requests with `PUBLIC_DEPLOYMENT=true`.
+The full existing test suite was confirmed unaffected with
+`PUBLIC_DEPLOYMENT` at its real default (unset).
+
+This closes the rate-limiting half of the original "auth/rate-limiting"
+review flag this ADR's own Context section named — both halves are now
+resolved, this ADR's own Decision text notwithstanding (that text is left
+unmodified above, per this project's own append-don't-overwrite ADR
+convention; this Update supersedes only the "remains explicitly
+UNRESOLVED" framing, not the API-key decision itself).
