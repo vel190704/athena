@@ -734,6 +734,72 @@ def test_pass_network_endpoint_no_data_for_unfetchable_match():
 
 
 # ============================================================================
+# GET /reports/match/{match_id} (new reporting track, Part A -- Automatic
+# Match Report). This file's own `_force_mock_explanation_executor` autouse
+# fixture (top of file) forces the mock explanation executor for every test
+# here, same as every other endpoint touching `generate_tactical_explanation_
+# with_source` -- the real-Gemini honesty check for THIS endpoint's narrative
+# is `test_match_report.py::test_automatic_match_report_real_gemini_narrative_
+# passes_honesty_check`'s own dedicated, opt-in job, not this file's.
+# ============================================================================
+
+
+def test_automatic_match_report_endpoint_real_match_both_sides():
+    """Real match, real 360 coverage on both sides -- confirms the
+    endpoint wires generate_automatic_match_report + the narrative step
+    together correctly and returns 200 with the expected compiled shape."""
+    with TestClient(app) as client:
+        response = client.get(f"/reports/match/{MATCH_ID}")
+    assert response.status_code == 200
+    report = response.json()
+
+    assert report["no_data"] is False
+    assert len(report["teams"]) == 2
+    assert set(report["team_reports"].keys()) == set(report["teams"])
+    assert set(report["opposition_analysis"].keys()) == set(report["teams"])
+    assert report["pass_network"]["match_id"] == MATCH_ID
+    assert isinstance(report["alert_count"], int)
+    # Narrative step: the mock executor (forced by this file's autouse
+    # fixture) still returns SOME non-empty templated string -- never a
+    # crash or an empty body -- even though this prompt's shape doesn't
+    # match the mock's own regex structure (see match_report.py's
+    # build_match_report_narrative_prompt docstring for why that's an
+    # accepted, explicitly-stated tradeoff).
+    assert report["narrative_source"] == "mock"
+    assert isinstance(report["narrative"], str) and report["narrative"].strip()
+
+
+def test_automatic_match_report_endpoint_public_deployment_uses_aggregated_pass_network(monkeypatch):
+    """ADR-021 condition-2 compliance: under PUBLIC_DEPLOYMENT, the compiled
+    report's pass_network sub-document must be the aggregated (no raw
+    nodes/edges/avg_location) variant, mirroring the standalone
+    /reports/pass-network/{match_id} endpoint's own real, already-tested
+    gating behavior exactly."""
+    monkeypatch.setattr(api_module, "PUBLIC_DEPLOYMENT", True)
+    with TestClient(app) as client:
+        response = client.get(f"/reports/match/{MATCH_ID}")
+    assert response.status_code == 200
+    raw_body_text = response.text
+    report = response.json()
+
+    assert "nodes" not in report["pass_network"]
+    assert "edges" not in report["pass_network"]
+    assert "num_players" in report["pass_network"]
+    assert "avg_location" not in raw_body_text
+
+
+def test_automatic_match_report_endpoint_no_data_for_unfetchable_match():
+    """A match_id with fewer than 2 real teams found must return a clean
+    no_data response (no narrative attempted), not a 500 or a crash."""
+    with TestClient(app) as client:
+        response = client.get("/reports/match/1")
+    assert response.status_code == 200
+    report = response.json()
+    assert report["no_data"] is True
+    assert "narrative" not in report
+
+
+# ============================================================================
 # Player Dashboard (additive new feature, on top of Milestone 40's Player
 # Report): match-level views. Match Summary is unconditionally aggregate
 # (ADR-021: NOT gated by PUBLIC_DEPLOYMENT). Touch Map and Timeline follow

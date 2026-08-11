@@ -1,5 +1,9 @@
 """Milestones 17 & 19 (Module 3/9 UI), extended with the reporting track's
-Streamlit integration: Project Athena's dashboard, now five tabs wide.
+Streamlit integration: Project Athena's dashboard, now nine tabs wide
+(Pass Network and Alerts History were added after this docstring's "five
+tabs" count was first written but before this correction; Match Report and
+Tactical Chat are this session's own additions -- see their own tab
+sections below for what each does).
 
 "Live CV Monitor" holds the two ORIGINAL panels, unchanged in behavior:
 
@@ -113,6 +117,7 @@ import os
 import sys
 import tempfile
 import time
+import uuid
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -234,6 +239,15 @@ TACTICAL_ACTIONS = ["high_press", "drop_deep", "force_wide", "no_change"]
 # a single /simulate-style 5s budget is too tight for these. 60s matches this
 # file's own RECV_TIMEOUT_SECONDS as a "generous but bounded" convention.
 REPORT_REQUEST_TIMEOUT_SECONDS = 60.0
+
+# AI Tactical Chat (new reporting track, Part B): each turn rebuilds a
+# match's full context package (a generate_automatic_match_report-scale
+# call, measured at ~2s for the cached match this dashboard defaults to)
+# PLUS a real Gemini round-trip -- generously bounded above both costs
+# combined, well under REPORT_REQUEST_TIMEOUT_SECONDS's own 60s heavy-report
+# budget since a chat reply is expected to feel conversational, not
+# report-generation-slow.
+CHAT_REQUEST_TIMEOUT_SECONDS = 30.0
 
 # Player Similarity Search's own precompute rebuild -- a genuinely slow,
 # manually-triggered operation (MEASURED against this project's real full
@@ -736,6 +750,23 @@ def _cached_pass_network_aggregated_png(pass_network_aggregated: dict) -> bytes:
         Path(tmp_path).unlink(missing_ok=True)
 
 
+# Automatic Match Report (new reporting track, Part A): GET
+# /reports/match/{match_id}. A slower call than the other reporting
+# endpoints (it aggregates two full Team Report calls plus more, "heavy"
+# tier on the API side) -- REPORT_REQUEST_TIMEOUT_SECONDS (60s) is reused
+# unchanged rather than a new, longer timeout constant, matching how the
+# existing Team Report panel already budgets for a single heavy call at
+# that same 60s figure.
+@st.cache_data(show_spinner=False)
+def _cached_match_report(rest_base_url: str, match_id: int) -> dict:
+    response = requests.get(
+        f"{rest_base_url}/reports/match/{match_id}",
+        timeout=REPORT_REQUEST_TIMEOUT_SECONDS,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
 # Alerts History tab: GET /alerts/history (ADR-019's persistence store, via
 # alert_store.fetch_alerts -- see api.py). Every filter param is Optional on
 # the endpoint's own side (None = no filter, AND-combined) -- `requests`
@@ -803,6 +834,27 @@ def _fetch_report_safely(fetch_fn, rest_base_url: str) -> dict | None:
     return None
 
 
+def _fetch_chat_reply_safely(rest_base_url: str, session_id: str, match_id: int, message: str) -> dict | None:
+    """POST /chat/tactical, reusing `_fetch_report_safely`'s exact same
+    Timeout/ConnectionError/HTTPError handling -- NOT wrapped in
+    `st.cache_data` (unlike the GET report fetchers above): a chat reply is
+    not idempotent given identical arguments the way a report fetch is --
+    the server-side session history that grounds this exact prompt has
+    changed by the time an identical question might be asked again, so
+    caching would risk silently replaying a stale reply."""
+
+    def _do_post():
+        response = requests.post(
+            f"{rest_base_url}/chat/tactical",
+            json={"session_id": session_id, "match_id": match_id, "message": message},
+            timeout=CHAT_REQUEST_TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+        return response.json()
+
+    return _fetch_report_safely(_do_post, rest_base_url)
+
+
 st.set_page_config(page_title="Project Athena Dashboard", layout="wide")
 st.title("Project Athena Dashboard")
 st.caption(
@@ -838,10 +890,13 @@ with st.sidebar:
     )
     st.divider()
 
-tab_cv, tab_player, tab_team, tab_trends, tab_compare, tab_pass_network, tab_alerts = st.tabs(
+(
+    tab_cv, tab_player, tab_team, tab_trends, tab_compare, tab_pass_network, tab_alerts,
+    tab_match_report, tab_chat,
+) = st.tabs(
     [
         "Live CV Monitor", "Player Reports", "Team Reports", "Team Trends", "Team Comparison",
-        "Pass Network", "Alerts History",
+        "Pass Network", "Alerts History", "Match Report", "Tactical Chat",
     ]
 )
 
@@ -966,6 +1021,50 @@ with tab_cv:
                     delta=f"{delta * 100:+.2f} pp",
                     delta_color="inverse",
                 )
+
+    # ========================================================================
+    # Panel 1b: Coach Mode (new reporting track, Part C) -- the narrow,
+    # genuinely new gap Step 0's dedup check identified beyond the What-If
+    # Simulator above: ranking ALL tactical actions at once for the SAME
+    # match/minute this panel's own inputs already select, instead of
+    # requiring one manual "Run Simulation" click per action. Reuses this
+    # panel's own `match_id`/`minute` inputs directly (no separate Coach
+    # Mode inputs) -- GET /coach-mode, not a new simulation pipeline.
+    # ========================================================================
+    st.subheader("Coach Mode -- rank all tactical actions")
+    st.caption(
+        "Runs and ranks every tactical action at once for the match/minute above, instead of "
+        "one What-If Simulator run per action. Recommends the action with the lowest simulated "
+        "threat (GET /coach-mode)."
+    )
+    coach_mode_clicked = st.button("Run Coach Mode")
+    coach_mode_result_placeholder = st.empty()
+
+    def _fetch_coach_mode() -> dict:
+        response = requests.get(
+            f"{rest_base_url}/coach-mode",
+            params={"match_id": match_id, "minute": int(minute)},
+            timeout=SIMULATE_REQUEST_TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+        return response.json()
+
+    if coach_mode_clicked:
+        coach_mode_result_placeholder.info("Ranking all tactical actions...")
+        coach_mode_result = _fetch_report_safely(_fetch_coach_mode, rest_base_url)
+        if coach_mode_result is not None:
+            with coach_mode_result_placeholder.container():
+                st.metric("Baseline Threat (15s)", f"{coach_mode_result['baseline_threat_15s'] * 100:.2f}%")
+                st.success(f"Recommended action: **{coach_mode_result['recommended_action']}**")
+                rankings_df = pd.DataFrame(coach_mode_result["rankings"])
+                rankings_df["simulated_threat_15s"] = rankings_df["simulated_threat_15s"] * 100
+                rankings_df["delta"] = rankings_df["delta"] * 100
+                rankings_df = rankings_df.rename(columns={
+                    "action": "Action",
+                    "simulated_threat_15s": "Simulated Threat (15s) %",
+                    "delta": "Delta (pp)",
+                })
+                st.dataframe(rankings_df, width="stretch")
 
     st.divider()
 
@@ -2511,3 +2610,156 @@ with tab_alerts:
 
                     with st.expander("Raw alert data"):
                         st.json(alerts)
+
+
+# ============================================================================
+# TAB: Match Report (new reporting track, Part A -- Automatic Match Report).
+# A pure UI wiring layer over the new GET /reports/match/{match_id}
+# endpoint, the SAME "call api.py over HTTP, don't reimplement" principle
+# ADR-018 established for the other reporting tabs. See match_report.py's
+# module docstring for the Step 0 dedup check: this compiles data already
+# available across the Team Reports / Pass Network / Alerts History tabs
+# into ONE document plus a grounded narrative, rather than duplicating any
+# of those tabs' own computation.
+# ============================================================================
+with tab_match_report:
+    st.header("Automatic Match Report")
+    st.caption(
+        "Compiles both teams' Team Reports, both teams' Opposition Analysis, this match's Pass "
+        "Network, and this match's own Alerts History into one document, plus a short narrative "
+        "grounded strictly in that real, already-computed data (GET /reports/match/{match_id})."
+    )
+
+    match_report_id_input = st.text_input(
+        "Match ID (StatsBomb match_id)", value=DEFAULT_MATCH_ID, key="match_report_id_input"
+    )
+    match_report_generate_clicked = st.button("Generate Match Report")
+
+    if match_report_generate_clicked:
+        try:
+            match_report_match_id = int(match_report_id_input.strip())
+        except ValueError:
+            st.error(f"Match ID must be a whole number -- got {match_report_id_input!r}.")
+        else:
+            with st.spinner("Compiling match report (this aggregates two full Team Reports -- can take a while)..."):
+                match_report = _fetch_report_safely(
+                    lambda: _cached_match_report(rest_base_url, match_report_match_id), rest_base_url
+                )
+
+            if match_report is not None:
+                if match_report.get("no_data"):
+                    st.info(match_report.get("reason", "No match report data available for this match_id."))
+                else:
+                    st.subheader(f"{' vs '.join(match_report['teams'])} (match_id={match_report_match_id})")
+
+                    narrative_source = match_report.get("narrative_source", "unknown")
+                    st.markdown(f"**Narrative** _(source: {narrative_source})_")
+                    st.write(match_report.get("narrative", ""))
+
+                    team_cols = st.columns(len(match_report["teams"]))
+                    for col, team in zip(team_cols, match_report["teams"]):
+                        with col:
+                            st.markdown(f"**{team}**")
+                            team_report = match_report["team_reports"].get(team, {})
+                            if team_report.get("matches_used", 0) > 0:
+                                threat_by_zone = team_report.get("threat_by_pitch_zone") or {}
+                                for zone, value in threat_by_zone.items():
+                                    if value is not None:
+                                        st.metric(f"Threat ({zone})", f"{value * 100:.1f}%")
+                            else:
+                                st.caption("No 360 coverage for this match -- no zone/control data.")
+
+                            opposition = match_report["opposition_analysis"].get(team, {})
+                            long_pass_share = (opposition.get("build_up_tendency") or {}).get("long_pass_share")
+                            if long_pass_share is not None:
+                                st.metric("Build-up long-pass share", f"{long_pass_share * 100:.1f}%")
+                            set_piece_share = (opposition.get("set_piece_reliance") or {}).get("set_piece_shot_share")
+                            if set_piece_share is not None:
+                                st.metric("Set-piece shot share", f"{set_piece_share * 100:.1f}%")
+
+                    st.metric("Tactical alerts this match", match_report.get("alert_count", 0))
+
+                    with st.expander("Raw compiled match report data"):
+                        st.json(match_report)
+
+
+# ============================================================================
+# TAB: Tactical Chat (new reporting track, Part B -- AI Tactical Chat). A
+# pure UI wiring layer over the new POST /chat/tactical endpoint.
+#
+# PLACED IN ITS OWN TAB, not folded into "Live CV Monitor" (the other option
+# this task's own instructions named): the module docstring's documented
+# "PERMANENT CONSEQUENCE" already means EVERY tab in this file is equally
+# blocked whenever the Live CV Monitor tab's stream/simulator loop is
+# running -- placing Chat there specifically would not avoid that shared
+# blocking surface (it applies file-wide, not per-tab), and would only
+# conflate an unrelated, purely request/response feature with that tab's
+# already-documented blocking-loop caveat for no benefit. A new tab keeps
+# Chat's own state (conversation history, session id) independent, the
+# same reasoning the Match Report and Alerts History tabs above already
+# follow.
+# ============================================================================
+with tab_chat:
+    st.header("AI Tactical Chat")
+    st.caption(
+        "Ask follow-up questions about a specific match. Every reply is grounded ONLY in that "
+        "match's real, already-computed data (team reports, opposition analysis, pass network, "
+        "recent alerts) -- rebuilt fresh before every single reply, never cached across turns. "
+        "If you ask something this system hasn't computed (a future prediction, a substitution "
+        "recommendation, an injury status), it will say so plainly rather than guess. "
+        "Powered by POST /chat/tactical."
+    )
+
+    if "chat_session_id" not in st.session_state:
+        st.session_state["chat_session_id"] = str(uuid.uuid4())
+    if "chat_display_history" not in st.session_state:
+        st.session_state["chat_display_history"] = []
+
+    chat_match_id_input = st.text_input(
+        "Match ID (StatsBomb match_id) -- context is rebuilt from this match on every message",
+        value=DEFAULT_MATCH_ID,
+        key="chat_match_id_input",
+    )
+
+    if st.button("Reset conversation", key="chat_reset_button"):
+        st.session_state["chat_session_id"] = str(uuid.uuid4())
+        st.session_state["chat_display_history"] = []
+        st.rerun()
+
+    for chat_turn in st.session_state["chat_display_history"]:
+        with st.chat_message(chat_turn["role"]):
+            st.write(chat_turn["text"])
+            if chat_turn.get("source"):
+                st.caption(f"(source: {chat_turn['source']})")
+
+    chat_user_message = st.chat_input("Ask about this match's tactical picture...")
+    if chat_user_message:
+        try:
+            chat_match_id = int(chat_match_id_input.strip())
+        except ValueError:
+            st.error(f"Match ID must be a whole number -- got {chat_match_id_input!r}.")
+        else:
+            st.session_state["chat_display_history"].append({"role": "user", "text": chat_user_message})
+            with st.chat_message("user"):
+                st.write(chat_user_message)
+
+            with st.chat_message("assistant"):
+                with st.spinner("Rebuilding this match's context and generating a reply..."):
+                    chat_result = _fetch_chat_reply_safely(
+                        rest_base_url, st.session_state["chat_session_id"], chat_match_id, chat_user_message
+                    )
+                if chat_result is not None:
+                    reply_text = chat_result["reply"]
+                    reply_source = chat_result.get("reply_source", "unknown")
+                    st.write(reply_text)
+                    st.caption(f"(source: {reply_source})")
+                    st.session_state["chat_display_history"].append(
+                        {"role": "assistant", "text": reply_text, "source": reply_source}
+                    )
+                # On a real request failure, `_fetch_chat_reply_safely` has
+                # already rendered `st.error(...)` inside this same
+                # `st.chat_message("assistant")` container -- nothing is
+                # appended to `chat_display_history` in that case, so a
+                # failed turn does not leave a fabricated assistant message
+                # in the conversation the model would otherwise be shown as
+                # its own prior turn on a retry.

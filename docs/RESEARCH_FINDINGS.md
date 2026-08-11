@@ -352,6 +352,39 @@ literal success criterion ("pass landing error reduction ≤ X meters") has ther
 yet been measured against real trajectories at all — only the filter's internal
 convergence has been validated.
 
+**Update — ADR-008's follow-up milestone, executed (nonzero-Cd done; real-data validation
+found to be blocked by a genuine data gap, not attempted on an invented input):**
+
+*Step 1, nonzero-but-known Cd (pure synthetic, done):* extended the synthetic
+generator to a combined friction+known-drag model (`v² = u² − 2*(mu+Cd)*g*d`,
+`true_mu=0.35`, `true_Cd=0.15`), with the known `Cd` subtracted from each raw
+observation before `correct()` — isolating whether the Kalman math still converges
+once a second known physical effect must be explicitly accounted for. **Real result:
+posterior converged to `mu=0.35098`, 0.280% relative error** — inside the 2% gate
+(`test_friction.py::test_kalman_friction_filter_converges_within_2_percent_with_known_nonzero_drag`).
+
+*Step 0/2, real StatsBomb data (checked directly, ~33,000 real cached Pass events
+across 30 matches):* `pass.height` reliably separates Ground/Low/High passes (usable
+to scope to ground-only, per the filter's `Cd=0` design); `pass.length` is an exact
+geometric distance (verified to floating-point precision); `duration` implies a
+plausible average speed for 98.47% of ground passes (median 12.7 m/s) but has a real
+noisy tail (~0.5% imply >40 m/s, up to a nonsensical 2,170 m/s — near-simultaneous
+timestamps from deflections/rapid exchanges, not real flight time). **Critically, no
+field anywhere — checked exhaustively across every top-level and `pass`-nested key,
+plus the linked `Ball Receipt*` event — provides an initial or final velocity.** Only
+an average velocity (`length/duration`) is derivable, which is mathematically
+insufficient to feed `observe_mu_from_pass(v_initial, v_final, distance)`: the
+underlying kinematics has two unknowns (`v_i`, `mu`) per pass and only one equation,
+and pooling across passes doesn't close the gap since each pass has its own unknown
+`v_i`. Closing it would require assuming a velocity value that isn't in the data —
+exactly the fabrication this task was told not to do. **Real-data validation was
+therefore stopped, honestly, as a genuine dataset limitation** (see ADR-008's Update
+section for the full field-by-field accounting) — not executed on an invented input,
+and not silently skipped. RQ3's literal "pass landing error" criterion remains
+unmeasured against real trajectories, and would require real ball-tracking/velocity
+data (e.g. optical tracking, which this open StatsBomb event dataset does not
+include) to ever close.
+
 ### RQ4 — Can graph-based team representations outperform handcrafted tactical features?
 
 **Question (README):** *"Can graph-based team representations outperform handcrafted
@@ -648,8 +681,11 @@ dynamic in the same milestone; v2 must revisit reaction-time degradation explici
 conflates tracking noise, aerodynamic drag, spin, and genuine friction variation — a
 real-data validation failure would be undiagnosable. The filter is validated first on
 synthetic data with `Cd=0` (exactly known), isolating "is the Kalman math correct" from
-"does the physics model match reality." See RQ3 above for the verified result. A
-follow-up (nonzero-but-known `Cd`, then real data) is explicitly still open.
+"does the physics model match reality." See RQ3 above for the verified result. The
+nonzero-but-known-`Cd` follow-up is now done (0.280% error); the real-data follow-up
+was attempted and found genuinely blocked by a dataset gap (no velocity field exists
+anywhere in real StatsBomb open event data) — see RQ3's Update and ADR-008's own
+Update section.
 
 **ADR-009 — StatsBomb data is already per-actor oriented (supersedes ADR-003's flip).**
 The direct successor to ADR-003's discovery: since raw coordinates are already recorded
@@ -780,10 +816,15 @@ Prioritized, not exhaustive:
    pipeline will need genuine per-half/per-team direction handling — CV-extracted pixel
    coordinates will NOT arrive pre-normalized to an acting-team frame the way
    StatsBomb's data does.
-5. **RQ3's real-data validation gap**: extend the Kalman filter's synthetic validation to
-   nonzero-but-known `Cd` (per ADR-008's own follow-up requirement), then finally to real
-   StatsBomb pass trajectories, before RQ3's literal "pass landing error" success
-   criterion can be assessed at all.
+5. **RQ3's real-data validation gap**: the nonzero-but-known-`Cd` synthetic extension
+   ADR-008 called for is now done (0.280% error, still inside the 2% gate). Real-data
+   validation was attempted and found genuinely blocked: real StatsBomb open event data
+   provides pass distance and elapsed time, but no field anywhere provides an
+   independent initial or final velocity — only an average velocity is derivable,
+   which is mathematically insufficient for this filter's two-endpoint observation
+   model. RQ3's literal "pass landing error" success criterion remains unmeasured
+   against real trajectories and would require real ball-tracking/velocity data this
+   open dataset does not include (see ADR-008's Update section).
 6. **RQ5 Thread B's single-match sample size**: Oracle Substitution Validation has only
    ever been run on one match, yielding one unconfounded observation. Running it across
    many matches — and explicitly stratifying by whether a substitution's window overlaps

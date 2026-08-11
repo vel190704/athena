@@ -444,3 +444,48 @@ async def generate_tactical_explanation(prompt: str) -> str:
     """
     text, _source = await generate_tactical_explanation_with_source(prompt)
     return text
+
+
+# =============================================================================
+# AI Tactical Chat (new reporting track, Part B): its OWN real/mock
+# dispatcher, ADDITIVE ONLY -- nothing above this point is modified.
+# =============================================================================
+
+_CHAT_UNAVAILABLE_MESSAGE = (
+    "Tactical Chat is currently unavailable (no real language-model connection). "
+    "Please try again in a moment."
+)
+
+
+async def generate_chat_reply_with_source(prompt: str) -> tuple[str, str]:
+    """AI Tactical Chat's OWN real/mock dispatch -- reuses the SAME
+    try-real-then-fall-back-on-ANY-failure PATTERN
+    `generate_tactical_explanation_with_source` above already established,
+    but is deliberately NOT that function: its fallback returns an
+    explicit, honest "chat unavailable" message instead of
+    `generate_explanation` (the shared mock executor)'s "Tactical
+    Analysis: threat is unknown%..." template, which is built to parse
+    `build_tactical_prompt`'s single-scalar-threat-plus-factors shape. A
+    chat prompt (`tactical_chat.build_chat_prompt`) has a structurally
+    different, multi-turn conversational shape that template cannot
+    describe meaningfully -- a fabricated-looking "threat is unknown%"
+    reply inside a live chat conversation would read as a broken or wrong
+    answer, not an honest unavailability notice, so this returns the
+    latter explicitly instead. Never fabricates a conversational turn.
+
+    Still goes through `generate_explanation_real` UNMODIFIED when a real
+    key is present -- same `_HONESTY_SYSTEM_INSTRUCTION`, same timeout,
+    same real API call -- only the FALLBACK content differs from
+    `generate_tactical_explanation_with_source`'s.
+    """
+    if not os.environ.get("GEMINI_API_KEY"):
+        return _CHAT_UNAVAILABLE_MESSAGE, "unavailable"
+
+    try:
+        return await generate_explanation_real(prompt), "gemini"
+    except Exception as exc:  # noqa: BLE001 -- deliberately broad, same reasoning as generate_tactical_explanation_with_source
+        logger.warning(
+            f"[chat] Real Gemini call failed ({type(exc).__name__}) -- returning the honest "
+            f"chat-unavailable fallback, not a fabricated reply. Error: {_safe_error_text(exc)}"
+        )
+        return _CHAT_UNAVAILABLE_MESSAGE, "unavailable"

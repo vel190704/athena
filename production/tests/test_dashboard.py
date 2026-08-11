@@ -97,12 +97,16 @@ def live_api_server():
     thread.join(timeout=10)
 
 
-def test_dashboard_loads_all_seven_tabs_no_exception():
+def test_dashboard_loads_all_nine_tabs_no_exception():
+    """Was "...seven tabs..." until this session's Automatic Match Report
+    and AI Tactical Chat tabs were appended (both AFTER every pre-existing
+    tab, so no existing tab's index shifted -- see e.g. `at.tabs[2]` still
+    resolving to Team Reports in other tests in this file)."""
     at = AppTest.from_file(DASHBOARD_PATH)
     at.run(timeout=APP_TIMEOUT_SECONDS)
 
     assert not at.exception
-    assert len(at.tabs) == 7
+    assert len(at.tabs) == 9
     headers = [h.value for tab in at.tabs for h in tab.header]
     assert "Player Report" in headers
     assert "Team Report" in headers
@@ -110,6 +114,8 @@ def test_dashboard_loads_all_seven_tabs_no_exception():
     assert "Team-Season Style Comparison" in headers
     assert "Pass Network" in headers
     assert "Alerts History" in headers
+    assert "Automatic Match Report" in headers
+    assert "AI Tactical Chat" in headers
 
 
 def test_team_reports_tab_data_tiering_note_renders_statically_no_backend_needed():

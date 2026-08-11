@@ -9,6 +9,7 @@ extraction path.
 """
 
 import os
+from typing import get_args
 
 os.environ.setdefault("MLFLOW_ALLOW_FILE_STORE", "true")
 
@@ -19,7 +20,7 @@ from production.src.models.evaluation import predict_cumulative_incidence
 from production.src.models.explainer import load_deterministic_mlp
 from production.src.pipeline.feature_extractor import extract_features
 from production.src.pipeline.simulator import perturb_features
-from production.src.serving.api import _find_qualifying_frame_for_minute, app
+from production.src.serving.api import _find_qualifying_frame_for_minute, app, simulate
 
 MATCH_ID = 3857276
 TIME_BIN = 3  # 15s horizon, matching every prior milestone
@@ -139,3 +140,83 @@ def test_simulate_endpoint_404_past_end_of_match():
 # in-match "gap" case would be fabricating a scenario this data doesn't
 # actually contain, which the milestone instructions explicitly warn
 # against.
+
+
+# ============================================================================
+# GET /coach-mode (new reporting track, Part C -- Coach Mode). Ranks ALL
+# tactical actions at once for one match/minute, the narrow gap beyond
+# /simulate's own single-action-per-request shape identified by Step 0's
+# dedup check. See api.py's own coach_mode docstring for the full scoping
+# reasoning.
+# ============================================================================
+
+
+def test_coach_mode_endpoint_returns_valid_ranked_response():
+    with TestClient(app) as client:
+        response = client.get(f"/coach-mode?match_id={MATCH_ID}&minute=10")
+
+    assert response.status_code == 200
+    body = response.json()
+
+    for key in ("match_id", "minute", "baseline_threat_15s", "rankings", "recommended_action"):
+        assert key in body, f"missing key {key!r} in response: {body}"
+
+    assert body["match_id"] == MATCH_ID
+    assert body["minute"] == 10
+    assert 0.0 <= body["baseline_threat_15s"] <= 1.0
+
+    # Same action set /simulate itself accepts, read directly off that
+    # endpoint's own Literal type -- not a second, independently-typed list.
+    expected_actions = set(get_args(simulate.__annotations__["action"]))
+    ranked_actions = {r["action"] for r in body["rankings"]}
+    assert ranked_actions == expected_actions
+    assert len(body["rankings"]) == len(expected_actions)
+
+    # Rankings must actually be sorted ascending by delta.
+    deltas = [r["delta"] for r in body["rankings"]]
+    assert deltas == sorted(deltas)
+    assert body["recommended_action"] == body["rankings"][0]["action"]
+
+    # no_change's delta must be exactly 0.0 -- it IS the baseline action.
+    no_change_entry = next(r for r in body["rankings"] if r["action"] == "no_change")
+    assert no_change_entry["delta"] == 0.0
+    assert no_change_entry["simulated_threat_15s"] == body["baseline_threat_15s"]
+
+
+def test_coach_mode_endpoint_cross_validates_against_simulate_endpoint():
+    """Coach Mode must agree EXACTLY with 4 separate /simulate calls for
+    the same match/minute -- this is the actual guarantee Coach Mode makes
+    (a ranked batch of the same underlying computation, not a different or
+    simplified one). Cross-validates against the endpoint under test
+    above, not a from-scratch re-derivation, since /simulate's own
+    correctness is already independently cross-validated (see
+    test_simulate_endpoint_cross_validates_against_batch_pipeline)."""
+    minute = 10
+
+    with TestClient(app) as client:
+        coach_response = client.get(f"/coach-mode?match_id={MATCH_ID}&minute={minute}")
+        assert coach_response.status_code == 200
+        coach_body = coach_response.json()
+
+        for expected in coach_body["rankings"]:
+            simulate_response = client.get(
+                f"/simulate?match_id={MATCH_ID}&minute={minute}&action={expected['action']}"
+            )
+            assert simulate_response.status_code == 200
+            simulate_body = simulate_response.json()
+
+            assert abs(simulate_body["baseline_threat_15s"] - coach_body["baseline_threat_15s"]) < 1e-9
+            assert abs(simulate_body["simulated_threat_15s"] - expected["simulated_threat_15s"]) < 1e-9
+            assert abs(simulate_body["delta"] - expected["delta"]) < 1e-9
+
+
+def test_coach_mode_endpoint_404_past_end_of_match():
+    """Same real 404 case /simulate's own equivalent test above uses (case
+    (a) -- genuinely past this match's actual final event minute)."""
+    with TestClient(app) as client:
+        response = client.get(f"/coach-mode?match_id={MATCH_ID}&minute=200")
+
+    assert response.status_code == 404
+    body = response.json()
+    assert "200" in body["detail"]
+    assert str(MATCH_ID) in body["detail"]

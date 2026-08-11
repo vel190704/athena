@@ -18,7 +18,7 @@ import os
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Literal
+from typing import Literal, get_args
 
 # Must be set before the lifespan handler's first MlflowClient() call (this
 # project's mlflow version treats the file-store backend as read-only
@@ -30,6 +30,7 @@ os.environ.setdefault("MLFLOW_ALLOW_FILE_STORE", "true")
 
 import torch
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
+from pydantic import BaseModel
 from ultralytics import YOLO
 
 from production.src.constants import TIME_BIN
@@ -43,12 +44,17 @@ from production.src.models.explainer import (
     _cumulative_incidence_forward,
     build_tactical_prompt,
     compute_attributions,
+    generate_chat_reply_with_source,
     generate_tactical_explanation_with_source,
     load_deterministic_mlp,
 )
 from production.src.pipeline.feature_extractor import extract_features
 from production.src.pipeline.simulator import perturb_features
 from production.src.pipeline.survival_dataset import FEATURE_KEYS
+from production.src.reporting.match_report import (
+    build_match_report_narrative_prompt,
+    generate_automatic_match_report,
+)
 from production.src.reporting.pass_network import (
     generate_pass_network,
     generate_pass_network_aggregated,
@@ -68,6 +74,7 @@ from production.src.reporting.player_similarity import (
     build_player_similarity_index,
     find_similar_players,
 )
+from production.src.reporting.tactical_chat import build_chat_prompt, format_context_package_text
 from production.src.reporting.team_comparison import compare_team_matches, compare_team_seasons
 from production.src.reporting.team_report import (
     generate_team_opposition_analysis,
@@ -1063,6 +1070,78 @@ async def simulate(
     }
 
 
+@app.get("/coach-mode", dependencies=[Depends(_require_api_key), Depends(_rate_limit("standard"))])
+async def coach_mode(match_id: int, minute: int):
+    """Coach Mode (new reporting track, Part C): ranks ALL tactical
+    actions at once for the current match state, instead of requiring one
+    /simulate request per action.
+
+    STEP 0 DEDUP CHECK (see this task's own report for the full writeup):
+    /simulate above is Literal-typed to exactly ONE action per request,
+    and the What-If Simulator panel is a single selectbox + a single
+    button -- one request/response, never a ranked comparison. This
+    endpoint is scoped to EXACTLY that narrow, genuinely new gap
+    (running + ranking multiple actions at once) and nothing more --
+    every other piece is reused UNCHANGED from /simulate: the same frame
+    lookup (`_find_qualifying_frame_for_minute`), the same
+    `extract_features`/`perturb_features` pipeline, the same
+    `_predict_cumulative_incidence_sync` helper. This is additive
+    orchestration on top of /simulate's own already-validated pipeline,
+    not a parallel or duplicate implementation of it.
+
+    The baseline threat is computed ONCE (it does not depend on `action`,
+    so computing it once and reusing it for every action's delta -- rather
+    than once per action, as 4 separate /simulate calls would each
+    redundantly do -- is this endpoint's actual efficiency gain over
+    calling /simulate 4 times). The action set itself is read directly off
+    /simulate's own `Literal[...]` type annotation via `typing.get_args`,
+    not re-typed as a second, independently-maintained list here that
+    could silently drift out of sync if /simulate's own action set ever
+    changes.
+
+    Ranks by `delta` ascending: a MORE NEGATIVE delta means simulated
+    threat is LOWER than baseline, i.e. tactically BETTER -- so
+    `rankings[0]` is this endpoint's actual recommendation
+    (`recommended_action`).
+    """
+    result = _find_qualifying_frame_for_minute(match_id, minute)
+    if result is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No 360 freeze-frame found at or after minute {minute} for match {match_id}",
+        )
+    event, frame_data = result
+
+    parsed_frame = parse_360_frame(event, frame_data)
+    baseline_features = extract_features(parsed_frame)
+    baseline_threat_15s, _ = await asyncio.to_thread(_predict_cumulative_incidence_sync, baseline_features)
+
+    actions = get_args(simulate.__annotations__["action"])
+    rankings = []
+    for action in actions:
+        simulated_features = perturb_features(baseline_features, action)
+        simulated_threat_15s, _ = await asyncio.to_thread(
+            _predict_cumulative_incidence_sync, simulated_features
+        )
+        rankings.append(
+            {
+                "action": action,
+                "simulated_threat_15s": simulated_threat_15s,
+                "delta": simulated_threat_15s - baseline_threat_15s,
+            }
+        )
+
+    rankings.sort(key=lambda r: r["delta"])
+
+    return {
+        "match_id": match_id,
+        "minute": minute,
+        "baseline_threat_15s": baseline_threat_15s,
+        "rankings": rankings,
+        "recommended_action": rankings[0]["action"],
+    }
+
+
 # ============================================================================
 # Reporting endpoints (ADR-018): the ONLY code path that should call
 # load_deterministic_mlp() or touch data/raw/ for reporting purposes going
@@ -1388,6 +1467,131 @@ async def get_team_match_comparison(team_name: str, match_id_a: int, match_id_b:
     remains unconditional (not gated by PUBLIC_DEPLOYMENT).
     """
     return await asyncio.to_thread(compare_team_matches, team_name, match_id_a, match_id_b)
+
+
+@app.get("/reports/match/{match_id}", dependencies=[Depends(_require_api_key), Depends(_rate_limit("heavy"))])
+async def get_automatic_match_report(match_id: int):
+    """Automatic Match Report (new reporting track, Part A): compiles
+    EXISTING per-feature outputs -- both teams' Team Reports, both teams'
+    Opposition Analysis, this match's Pass Network, and this match_id's
+    own Alerts History -- into ONE document, plus a short Gemini/mock
+    narrative grounded strictly in that compiled data. See
+    match_report.py's own module docstring for the Step 0 dedup check
+    that confirmed this compilation capability did not already exist
+    (today it requires 6 separate tab/endpoint lookups).
+
+    "heavy" tier (not "standard"): this aggregates TWO full
+    generate_team_report calls -- each independently already gated
+    "heavy" at its own endpoint -- plus more, genuinely more expensive
+    than any single existing "heavy" endpoint, not less.
+
+    ADR-021 condition-2 compliance: mirrors the existing
+    /reports/pass-network/{match_id} endpoint's own PUBLIC_DEPLOYMENT
+    gating decision exactly, decided HERE (which pass-network function to
+    pass in) rather than duplicated as new gating logic inside
+    generate_automatic_match_report itself, which reads no deployment
+    flag of its own.
+    """
+    pass_network_fn = generate_pass_network_aggregated if PUBLIC_DEPLOYMENT else generate_pass_network
+    compiled = await asyncio.to_thread(generate_automatic_match_report, match_id, pass_network_fn)
+    if compiled.get("no_data"):
+        return compiled
+
+    prompt = await asyncio.to_thread(build_match_report_narrative_prompt, compiled)
+    narrative, narrative_source = await generate_tactical_explanation_with_source(prompt)
+    compiled["narrative"] = narrative
+    compiled["narrative_source"] = narrative_source
+    return compiled
+
+
+# ============================================================================
+# AI Tactical Chat (new reporting track, Part B). See tactical_chat.py's own
+# module docstring for the full grounding-architecture design (Step 0's
+# dedup check, Step 1's bounded-context-package reasoning). This section
+# owns the ONLY two things that are genuinely stateful/async, and therefore
+# do not belong in that pure, synchronous reporting module: the in-memory
+# per-session conversation history, and the real/mock dispatch itself
+# (`explainer.generate_chat_reply_with_source`).
+#
+# SESSION STORE, STATED EXPLICITLY: plain in-memory dict, no new
+# persistence (Step 1.3's own instruction) -- lost on process restart, same
+# as this project's other genuinely-ephemeral live state (the WebSocket
+# threat_buffer client-side, `_rate_limiters`' own token buckets). Guarded
+# by an `asyncio.Lock`, the SAME pattern `_RateLimiter` above already uses,
+# since concurrent chat requests across different sessions (or, in theory,
+# two rapid messages in the same session) must not race on the shared dict.
+# ============================================================================
+
+
+class TacticalChatRequest(BaseModel):
+    session_id: str
+    match_id: int
+    message: str
+
+
+# Hand-picked, stated explicitly (this project's standing practice for
+# every tunable constant): 20 messages = 10 user/assistant turn-pairs kept
+# per session -- enough for the adversarial multi-turn drift test (Step 3.3
+# asks for drift to be checked "by turn 3-4") to have real room, without
+# letting one long-running session's prompt grow unboundedly turn over
+# turn. 500 sessions is a defensive cap against unbounded memory growth
+# from arbitrary caller-supplied session_id values under PUBLIC_DEPLOYMENT
+# -- evicts the OLDEST session (insertion order, plain dict) once exceeded,
+# never the currently-active one.
+_MAX_CHAT_HISTORY_MESSAGES = 20
+_MAX_CHAT_SESSIONS = 500
+_chat_sessions: dict[str, list[dict]] = {}
+_chat_sessions_lock = asyncio.Lock()
+
+
+@app.post("/chat/tactical", dependencies=[Depends(_require_api_key), Depends(_rate_limit("standard"))])
+async def tactical_chat(request: TacticalChatRequest):
+    """One turn of AI Tactical Chat. Rebuilds the grounding context package
+    fresh from `request.match_id` on EVERY call (Step 1.3 -- see
+    tactical_chat.py's module docstring for why stale context is
+    explicitly disallowed), appends this turn to `request.session_id`'s
+    server-side history, and dispatches via `generate_chat_reply_with_source`
+    -- REAL Gemini if `GEMINI_API_KEY` is set and the call succeeds, an
+    explicit honest "chat unavailable" message otherwise (never a
+    fabricated mock conversation; see that function's own docstring for
+    why this is a DIFFERENT dispatcher from every other LLM call site in
+    this project, not the shared `generate_tactical_explanation_with_source`).
+    """
+    compiled_report = await asyncio.to_thread(generate_automatic_match_report, request.match_id)
+    context_text = await asyncio.to_thread(format_context_package_text, compiled_report)
+
+    async with _chat_sessions_lock:
+        if request.session_id not in _chat_sessions and len(_chat_sessions) >= _MAX_CHAT_SESSIONS:
+            oldest_session_id = next(iter(_chat_sessions))
+            del _chat_sessions[oldest_session_id]
+        history_snapshot = list(_chat_sessions.get(request.session_id, []))
+
+    prompt = await asyncio.to_thread(build_chat_prompt, context_text, history_snapshot, request.message)
+    reply, reply_source = await generate_chat_reply_with_source(prompt)
+
+    async with _chat_sessions_lock:
+        history = _chat_sessions.setdefault(request.session_id, [])
+        history.append({"role": "user", "text": request.message})
+        history.append({"role": "assistant", "text": reply})
+        # max(0, ...) is load-bearing, not defensive styling: found the hard
+        # way (a real 6-turn adversarial test run) that a bare
+        # `len(history) - _MAX_CHAT_HISTORY_MESSAGES` goes NEGATIVE whenever
+        # a session is still under the cap, and `list[:negative_n]` does NOT
+        # mean "delete nothing" -- it slices from the end (e.g. `[:-8]` on a
+        # 12-element list deletes the first 4), silently dropping early
+        # turns years before the real cap was ever reached. Clamping to 0
+        # makes the slice a true no-op until the session genuinely exceeds
+        # _MAX_CHAT_HISTORY_MESSAGES.
+        del history[: max(0, len(history) - _MAX_CHAT_HISTORY_MESSAGES)]
+        turn_count = len(history) // 2
+
+    return {
+        "session_id": request.session_id,
+        "match_id": request.match_id,
+        "reply": reply,
+        "reply_source": reply_source,
+        "turn_count": turn_count,
+    }
 
 
 # ============================================================================

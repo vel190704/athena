@@ -62,3 +62,73 @@ def test_kalman_friction_filter_converges_within_2_percent():
         f"Final posterior mu={kf.mu:.5f} deviates from true_mu={TRUE_MU} "
         f"by {relative_error * 100:.3f}%, exceeding the {ERROR_MARGIN * 100:.2f}% gate"
     )
+
+
+# --- ADR-008's first required follow-up: nonzero-but-known Cd -------------
+#
+# Cd is expressed here in the SAME units/form as mu -- an equivalent
+# constant deceleration contribution a_drag = Cd * g, so the combined
+# noiseless model stays the exact closed form v^2 = u^2 - 2*(mu+Cd)*g*d
+# (not a fundamentally different velocity-dependent quadratic-drag ODE).
+# This is deliberately the smallest real extension of the Cd=0 baseline:
+# a second, distinct, EXACTLY known physical term is added to the true
+# kinematics, and observe_mu_from_pass() -- which still assumes ALL
+# deceleration is friction, since kalman_friction.py's core logic is not
+# being modified -- necessarily returns mu+Cd (not mu) when fed a
+# drag-affected final velocity. The known Cd is therefore subtracted
+# OUTSIDE the filter, in this test, before each correct() call. This
+# isolates the actual thing ADR-008 asks this follow-up to check: does
+# the filter's own math (predict/correct, Kalman gain) still converge
+# correctly once a second known physical effect is present and must be
+# explicitly accounted for -- as opposed to Cd=0 having accidentally
+# been the only case that ever worked.
+TRUE_CD = 0.15
+
+
+def true_final_velocity_with_drag(
+    v_initial: float, mu: float, cd: float, distance: float, g: float
+) -> float:
+    """Noiseless final velocity under combined friction (mu) + known drag (cd)."""
+    v_squared = v_initial**2 - 2.0 * (mu + cd) * g * distance
+    return np.sqrt(v_squared)
+
+
+def test_kalman_friction_filter_converges_within_2_percent_with_known_nonzero_drag():
+    # Reseeded explicitly (rather than relying on the module-level seed()
+    # call above plus test execution order) so this test's own randomness
+    # is fully self-contained and reproducible regardless of test order.
+    np.random.seed(42)
+
+    kf = KalmanFrictionFilter(
+        initial_mu=0.5,
+        initial_variance=0.1,
+        process_noise_q=1e-5,
+        measurement_noise_r=0.01,
+    )
+
+    noiseless_final_v = true_final_velocity_with_drag(
+        INITIAL_VELOCITY_MS, TRUE_MU, TRUE_CD, PASS_DISTANCE_M, G
+    )
+
+    for _ in range(NUM_PASSES):
+        kf.predict()
+
+        noisy_final_v = noiseless_final_v + np.random.normal(0.0, MEASUREMENT_NOISE_STD_MS)
+        raw_observed_mu = kf.observe_mu_from_pass(
+            v_initial=INITIAL_VELOCITY_MS,
+            v_final=noisy_final_v,
+            distance=PASS_DISTANCE_M,
+        )
+        # raw_observed_mu == mu + Cd (observe_mu_from_pass has no notion of
+        # drag); subtract the KNOWN Cd before correcting, exactly as a real
+        # pipeline would if Cd were independently measured/known.
+        observed_mu = raw_observed_mu - TRUE_CD
+
+        kf.correct(observed_mu)
+
+    relative_error = abs(kf.mu - TRUE_MU) / TRUE_MU
+    assert relative_error < ERROR_MARGIN, (
+        f"Final posterior mu={kf.mu:.5f} deviates from true_mu={TRUE_MU} "
+        f"by {relative_error * 100:.3f}%, exceeding the {ERROR_MARGIN * 100:.2f}% gate "
+        f"(known Cd={TRUE_CD} extension)"
+    )
