@@ -145,6 +145,88 @@ def test_chat_history_trimming_caps_at_max_when_genuinely_exceeded(mock_chat_dis
     assert resp.json()["turn_count"] == api_module._MAX_CHAT_HISTORY_MESSAGES // 2
 
 
+def test_chat_endpoint_public_deployment_never_computes_raw_pass_network(mock_chat_dispatcher, monkeypatch):
+    """ADR-021 compliance regression test (a REAL, previously-unverified
+    gap found by a dedicated post-hoc audit, not caught at original build
+    time): this endpoint's call into `generate_automatic_match_report`
+    originally omitted `pass_network_fn`, silently defaulting to the RAW
+    `generate_pass_network` (real per-player average location + pairwise
+    edge weights) regardless of `PUBLIC_DEPLOYMENT`. Nothing was ever
+    transmitted externally (`format_context_package_text` never reads the
+    `pass_network` field), but this project's own established discipline
+    treats UNCONDITIONAL COMPUTATION of the raw variant itself as the
+    compliance violation -- see every other PUBLIC_DEPLOYMENT branch in
+    api.py's own comments ("never even computed on that path, not merely
+    withheld from an already-built response"). This test locks in the fix
+    (api.py now selects `pass_network_fn` exactly like
+    /reports/match/{match_id} already does) by counting REAL calls to
+    each variant, not just inspecting the HTTP response.
+    """
+    import production.src.reporting.pass_network as pass_network_module
+
+    real_raw = pass_network_module.generate_pass_network
+    real_aggregated = pass_network_module.generate_pass_network_aggregated
+    calls = {"raw": 0, "aggregated": 0}
+
+    def counting_raw(match_id):
+        calls["raw"] += 1
+        return real_raw(match_id)
+
+    def counting_aggregated(match_id):
+        calls["aggregated"] += 1
+        return real_aggregated(match_id)
+
+    monkeypatch.setattr(api_module, "generate_pass_network", counting_raw)
+    monkeypatch.setattr(api_module, "generate_pass_network_aggregated", counting_aggregated)
+
+    with TestClient(app) as client:
+        # PUBLIC_DEPLOYMENT unset (default): the raw variant is expected and correct.
+        client.post(
+            "/chat/tactical",
+            json={"session_id": "adr021-off", "match_id": MATCH_ID, "message": "hi"},
+        )
+        assert calls["raw"] == 1
+        assert calls["aggregated"] == 0
+
+        # PUBLIC_DEPLOYMENT=true: the raw variant must NEVER be called --
+        # this is the actual regression this test guards against.
+        monkeypatch.setattr(api_module, "PUBLIC_DEPLOYMENT", True)
+        calls["raw"] = 0
+        calls["aggregated"] = 0
+        response = client.post(
+            "/chat/tactical",
+            json={"session_id": "adr021-on", "match_id": MATCH_ID, "message": "hi"},
+        )
+
+    assert response.status_code == 200
+    assert calls["raw"] == 0, "raw generate_pass_network was computed under PUBLIC_DEPLOYMENT=True"
+    assert calls["aggregated"] == 1
+
+
+def test_chat_endpoint_response_never_leaks_raw_pass_network_under_public_deployment(monkeypatch):
+    """Belt-and-suspenders: the SAME raw-HTTP-text-search method already
+    established for the shot map/pass network endpoints (test_api.py),
+    applied here -- confirms the actual bytes over the wire, not a
+    parsed-dict check, never carry raw pass-network fields under
+    PUBLIC_DEPLOYMENT regardless of the internal compute-path fix above.
+    """
+    monkeypatch.setattr(api_module, "PUBLIC_DEPLOYMENT", True)
+    with TestClient(app) as client:
+        response = client.post(
+            "/chat/tactical",
+            json={
+                "session_id": "adr021-leak-check",
+                "match_id": MATCH_ID,
+                "message": "Describe the pass network for this match.",
+            },
+        )
+    assert response.status_code == 200
+    raw_body_text = response.text
+    assert '"nodes"' not in raw_body_text
+    assert '"edges"' not in raw_body_text
+    assert "avg_location" not in raw_body_text
+
+
 def test_chat_endpoint_honest_fallback_when_gemini_unavailable(monkeypatch):
     """Step 2.3: a real API failure (here, simulated by a deliberately
     invalid key) must produce the explicit "chat unavailable" message, NOT

@@ -827,3 +827,90 @@ application state on the SERVER, never returned to a caller in full; only
 the query player's own already-exempt raw values and the coarse group
 labels described above ever leave `find_similar_players`'s own return
 value.
+
+## Update: Dedicated Post-Hoc Audit of Automatic Match Report / Coach Mode /
+AI Tactical Chat (verification-only pass, real HTTP tests both flag states)
+
+Each of these three new endpoints (plus `/coach-mode`, which needed no new
+compliance reasoning at all) was reasoned about individually during its own
+build earlier this session, but never re-checked against condition 2 as a
+dedicated, focused pass across all of them together. Run explicitly for
+that reason, with real `TestClient` requests under BOTH `PUBLIC_DEPLOYMENT`
+states and a raw-response-text search (the same method already established
+for the shot map/pass network audits above), not code review alone.
+
+**1. `/reports/match/{match_id}` (Automatic Match Report) — COMPLIANT,
+confirmed by real test.** This aggregator calls `generate_team_report`
+(already condition-2-compliant by construction) and
+`generate_team_opposition_analysis` (already EXEMPT, own addendum above)
+directly — neither needed a gate to begin with. For the pass network
+sub-component, the endpoint correctly selects
+`generate_pass_network_aggregated` vs. `generate_pass_network` based on
+`PUBLIC_DEPLOYMENT` BEFORE calling `generate_automatic_match_report`,
+mirroring the standalone `/reports/pass-network/{match_id}` endpoint's own
+selection exactly. Verified against the real raw response body: `"nodes"`,
+`"edges"`, and `avg_location` are present with `PUBLIC_DEPLOYMENT` unset and
+genuinely absent with it set to true.
+
+**2. `/coach-mode` — no gating needed, confirmed by real test, not
+assumed.** Reuses `/simulate`'s own pipeline, which itself has zero
+`PUBLIC_DEPLOYMENT`-relevant behavior (its response is two threat scalars
+and a delta, nothing individually-located or player-attributable). Checked
+`/simulate`'s source directly for any `PUBLIC_DEPLOYMENT` reference (none)
+and confirmed `/coach-mode`'s own real raw response body carries no
+`nodes`/`edges`/`avg_location`/`location`/`player_id`/`player_name` under
+either flag state — identical response shape both ways, as expected for a
+derived-scalar-only endpoint (the same class already established exempt
+for Tactical Momentum, Press Resistance Index, Tactical Entropy, etc.).
+
+**3. `POST /chat/tactical` — A REAL GAP WAS FOUND AND FIXED.** This
+endpoint's context package is built by calling
+`generate_automatic_match_report` directly (not by re-deriving the
+match-report endpoint's own gating decision), and that call site omitted
+the `pass_network_fn` argument entirely — silently defaulting to the RAW
+`generate_pass_network` regardless of `PUBLIC_DEPLOYMENT`, even though that
+same function's own docstring already documents that its caller is
+responsible for passing the deployment-appropriate variant (exactly what
+`/reports/match/{match_id}` does correctly). This did NOT produce an
+externally-observable leak today — confirmed by real request/response
+inspection, not assumed: `tactical_chat.format_context_package_text` never
+reads the `pass_network` field into the prompt or the HTTP response at all
+under either flag state. But the raw, gated variant (real per-player
+average location + real pairwise completed-pass edge weights) was still
+being COMPUTED, unconditionally, on every single chat turn under
+`PUBLIC_DEPLOYMENT=true` — exactly the thing this project's own established
+discipline treats as the actual compliance requirement throughout this ADR
+("the raw ... list is never even computed on that path, not merely
+withheld from an already-built response"), and a real latent risk: any
+future extension of the chat context to summarize pass-network activity
+(a plausible, natural addition) would have silently inherited an
+already-computed raw result with no gate anywhere in its own code path.
+
+**Fix applied** (minimal, no feature logic changed beyond this): the
+`/chat/tactical` endpoint now selects `pass_network_fn` the same way
+`/reports/match/{match_id}` already does
+(`generate_pass_network_aggregated if PUBLIC_DEPLOYMENT else
+generate_pass_network`) before calling `generate_automatic_match_report`.
+Verified directly, not just re-read: monkeypatch-counted real calls to each
+variant confirm `generate_pass_network` (raw) is called exactly once with
+`PUBLIC_DEPLOYMENT` unset and ZERO times with it set to true (only
+`generate_pass_network_aggregated` runs in that mode) —
+`test_tactical_chat.py::test_chat_endpoint_public_deployment_never_computes_raw_pass_network`.
+A second, belt-and-suspenders test
+(`test_chat_endpoint_response_never_leaks_raw_pass_network_under_public_deployment`)
+locks in the raw-HTTP-response-text guarantee the same way the shot
+map/pass network's own tests already do.
+
+**4. Chat's out-of-scope refusal instruction — sanity-checked, no gap, as
+expected.** `tactical_chat._CHAT_GROUNDING_INSTRUCTIONS` is static text,
+not conditioned on `PUBLIC_DEPLOYMENT` in any way — it instructs the model
+to answer ONLY from whatever the context package actually contains and to
+decline otherwise, which is correctly conservative regardless of how much
+or how little that package holds under either deployment mode. There is no
+scenario where a public deployment should get a MORE permissive refusal
+policy than a private one, and none exists.
+
+**Net finding:** one real, previously-unverified gap (item 3), now fixed
+and regression-tested; the other three items were already correct,
+confirmed by real test rather than by re-reading the code that was
+originally reasoned about individually at build time.

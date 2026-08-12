@@ -1556,8 +1556,32 @@ async def tactical_chat(request: TacticalChatRequest):
     fabricated mock conversation; see that function's own docstring for
     why this is a DIFFERENT dispatcher from every other LLM call site in
     this project, not the shared `generate_tactical_explanation_with_source`).
+
+    ADR-021 compliance fix (found during a dedicated post-hoc audit of
+    every endpoint built in this session's final stretch, not at original
+    build time): `generate_automatic_match_report`'s own docstring already
+    documents that ITS caller is responsible for passing the
+    PUBLIC_DEPLOYMENT-appropriate `pass_network_fn` -- exactly as the
+    /reports/match/{match_id} endpoint above does. This call site
+    originally omitted that argument, silently defaulting to the RAW
+    `generate_pass_network` (real per-player average location + pairwise
+    edge weights) regardless of PUBLIC_DEPLOYMENT. `format_context_package_text`
+    never actually reads the `pass_network` field today, so nothing was
+    ever transmitted to the model or the HTTP response (confirmed by real
+    request/response inspection, not assumed) -- but the raw, gated
+    variant was still being COMPUTED unconditionally on every turn, which
+    is exactly the thing this project's own established discipline treats
+    as the actual compliance requirement ("never even computed on that
+    path, not merely withheld from an already-built response" -- see every
+    other PUBLIC_DEPLOYMENT branch in this file). Fixed to mirror the
+    match-report endpoint's own selection exactly, so this stays correct
+    even if a future change starts reading `pass_network` into the chat
+    context.
     """
-    compiled_report = await asyncio.to_thread(generate_automatic_match_report, request.match_id)
+    pass_network_fn = generate_pass_network_aggregated if PUBLIC_DEPLOYMENT else generate_pass_network
+    compiled_report = await asyncio.to_thread(
+        generate_automatic_match_report, request.match_id, pass_network_fn
+    )
     context_text = await asyncio.to_thread(format_context_package_text, compiled_report)
 
     async with _chat_sessions_lock:
