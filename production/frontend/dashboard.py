@@ -30,6 +30,16 @@ sections below for what each does).
      carry) and reduces it further (an average, then a difference of two
      averages), so it can only carry LESS information than the signal
      already found compliant, never more. No new gating needed.
+     Further extended (additive, this session) with Match Segmentation: a
+     discrete game-phase label ("Building Attack" / "Transition" /
+     "Defensive Consolidation" / "Stable") derived ENTIRELY from Tactical
+     Momentum's own already-computed `smoothed_now`/`classification`
+     output -- see `classify_match_phase`'s own docstring (same
+     `tactical_momentum.py` module) for the exact decision table and the
+     majority-vote hysteresis window that prevents it from flipping on a
+     single noisy message. Same ephemeral, unpersisted, ADR-021-exempt
+     scope as Tactical Momentum, for the same reason (a further reduction
+     of an already-exempt derived signal).
 
 The four new tabs ("Player Reports", "Team Reports", "Team Trends",
 "Team Comparison") are a pure UI WIRING layer over the existing reporting
@@ -168,11 +178,14 @@ from production.src.reporting.team_trend_visualizer import render_team_trend_com
 from production.src.reporting.team_visualizer import render_team_dashboard
 
 from production.frontend.tactical_momentum import (
+    ELEVATED_THREAT_LEVEL,
     MOMENTUM_MIN_MESSAGES_FOR_TREND,
     MOMENTUM_SMOOTHING_WINDOW_MESSAGES,
     MOMENTUM_TREND_LOOKBACK_MESSAGES,
     MOMENTUM_TREND_THRESHOLD,
+    SEGMENT_DWELL_MESSAGES,
     _compute_tactical_momentum,
+    classify_match_phase,
 )
 
 # ADR-021 condition-2 / Team Trends serving-contradiction compliance fix:
@@ -1084,6 +1097,11 @@ with tab_cv:
         momentum_placeholder.info(
             f"Momentum: warming up (0/{MOMENTUM_MIN_MESSAGES_FOR_TREND} messages)"
         )
+        st.caption("Match Segmentation (discrete game-phase, derived from Tactical Momentum above)")
+        segment_placeholder = st.empty()
+        segment_placeholder.info(
+            f"Phase: warming up (0/{MOMENTUM_MIN_MESSAGES_FOR_TREND} messages)"
+        )
 
     with alerts_col:
         st.subheader("Tactical Alerts")
@@ -1128,6 +1146,42 @@ with tab_cv:
                     f"+/-{MOMENTUM_TREND_THRESHOLD * 100:.1f} pp trend."
                 ),
             )
+
+    # Match Segmentation (additive new feature): a discrete game-phase
+    # label, alongside (not replacing) the momentum indicator above --
+    # each phase rendered via a different Streamlit status container so
+    # the 4 real categories stay visually distinguishable at a glance.
+    _SEGMENT_RENDER_STYLE = {
+        "Building Attack": "error",  # elevated, live threat -- the "pay attention" state
+        "Transition": "warning",
+        "Defensive Consolidation": "success",
+        "Stable": "info",
+    }
+
+    def _render_segment(phase_result: dict) -> None:
+        """Renders `classify_match_phase`'s return value. Deliberately
+        shows BOTH the hysteresis-smoothed `phase` (the headline label)
+        and the RAW pre-hysteresis `raw_phase` (in the caption) -- the
+        same "show the smoothed AND the underlying number" transparency
+        `_render_momentum` above already applies to `classification` vs.
+        `trend`."""
+        if phase_result["status"] == "warming_up":
+            segment_placeholder.info(
+                f"Phase: warming up ({phase_result['messages_so_far']}/"
+                f"{phase_result['messages_needed']} messages)"
+            )
+            return
+        phase = phase_result["phase"]
+        style = _SEGMENT_RENDER_STYLE.get(phase, "info")
+        render_fn = getattr(segment_placeholder, style)
+        render_fn(
+            f"Match Phase: **{phase}**\n\n"
+            f"Smoothed threat_15s: {phase_result['smoothed_now'] * 100:.2f}% "
+            f"(elevated threshold: {ELEVATED_THREAT_LEVEL * 100:.0f}%), "
+            f"momentum: {phase_result['momentum_classification']}, "
+            f"raw (pre-hysteresis) phase: {phase_result['raw_phase']} "
+            f"(dwell window: {SEGMENT_DWELL_MESSAGES} messages)."
+        )
 
     if start_clicked:
         # Milestone 33: which data source's query params to build depends on
@@ -1197,6 +1251,7 @@ with tab_cv:
                             threat_buffer.pop(0)
                         chart_placeholder.line_chart(pd.DataFrame({"threat_15s": threat_buffer}))
                         _render_momentum(_compute_tactical_momentum(threat_buffer))
+                        _render_segment(classify_match_phase(threat_buffer))
                         # real_time_lag_sec (Milestone 33, CV source only): how
                         # far behind real video time the stream currently is.
                         # Surfaced honestly rather than silently either

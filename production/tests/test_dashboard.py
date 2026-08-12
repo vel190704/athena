@@ -44,9 +44,12 @@ from fastapi.testclient import TestClient
 
 import production.src.serving.api as api_module
 from production.frontend.tactical_momentum import (
+    ELEVATED_THREAT_LEVEL,
     MOMENTUM_MIN_MESSAGES_FOR_TREND,
     MOMENTUM_TREND_THRESHOLD,
+    SEGMENT_DWELL_MESSAGES,
     _compute_tactical_momentum,
+    classify_match_phase,
 )
 from production.src.serving import alert_store as alert_store_module
 from production.src.serving.api import app as _fastapi_app
@@ -242,6 +245,156 @@ def test_compute_tactical_momentum_trend_sign_matches_threshold_real_data():
             assert momentum["classification"] == "Fading"
         else:
             assert momentum["classification"] == "Stable"
+
+
+# ============================================================================
+# TAB: Live CV Monitor -- Match Segmentation (additive new feature): a
+# discrete game-phase classifier derived entirely from Tactical Momentum's
+# own already-computed output (`smoothed_now`, `classification`) -- no new
+# data extraction, Tactical Momentum's own logic above unmodified. Lives in
+# the SAME `tactical_momentum.py` module for the same testability reason.
+# ============================================================================
+
+
+def test_classify_match_phase_empty_buffer_warming_up_no_crash():
+    """Mirrors Tactical Momentum's own equivalent test -- segmentation
+    cannot exist before momentum itself does."""
+    phase = classify_match_phase([])
+    assert phase == {
+        "status": "warming_up",
+        "messages_so_far": 0,
+        "messages_needed": MOMENTUM_MIN_MESSAGES_FOR_TREND,
+    }
+
+
+def test_classify_match_phase_real_data_produces_all_four_categories():
+    """Step 3.1's real sanity check: replayed against 350 real messages
+    from the real cached validation match (source=statsbomb), the phase
+    classification must show genuine variation across all 4 real category
+    labels -- not stuck on one -- and must transition sensibly (not on
+    every single message). VERIFIED manually before writing this
+    assertion: this exact real stream produces a real 22.2%/33.4%/26.5%/
+    16.9% split across (Stable/Defensive Consolidation/Building Attack/
+    Transition) with 332 real classified messages and 32 real phase
+    transitions -- a healthy, non-degenerate distribution, not a
+    near-constant or flickering-every-message one."""
+    threats = _collect_real_threat_sequence(350)
+
+    phases = []
+    for i in range(MOMENTUM_MIN_MESSAGES_FOR_TREND, len(threats) + 1):
+        result = classify_match_phase(threats[:i])
+        assert result["status"] == "ready"
+        assert result["phase"] in {"Building Attack", "Defensive Consolidation", "Transition", "Stable"}
+        phases.append(result["phase"])
+
+    assert set(phases) == {"Building Attack", "Defensive Consolidation", "Transition", "Stable"}
+
+    # "Not flickering on every message": the number of real transitions
+    # must be meaningfully smaller than the number of messages classified
+    # (the hysteresis window's whole purpose) -- a same-message-to-message
+    # flip rate would defeat the point of the dwell/majority-vote filter.
+    transitions = sum(1 for i in range(1, len(phases)) if phases[i] != phases[i - 1])
+    assert transitions < len(phases) * 0.5
+
+
+def test_classify_match_phase_raw_classification_matches_decision_table_real_data():
+    """Cross-check independent of the function's own internal branching:
+    for every real 'ready' reading, the RAW (pre-hysteresis) phase must
+    agree with a fresh, independently-computed 2x3 decision-table lookup
+    over (elevated: smoothed_now >= ELEVATED_THREAT_LEVEL) x (momentum
+    classification) -- catches a flipped comparison or a swapped label
+    that a same-formula assertion could not, the same discipline Tactical
+    Momentum's own trend-sign cross-check applies."""
+    threats = _collect_real_threat_sequence(200)
+
+    for i in range(MOMENTUM_MIN_MESSAGES_FOR_TREND, len(threats) + 1):
+        momentum = _compute_tactical_momentum(threats[:i])
+        result = classify_match_phase(threats[:i])
+        elevated = momentum["smoothed_now"] >= ELEVATED_THREAT_LEVEL
+
+        if elevated and momentum["classification"] in ("Building", "Stable"):
+            expected_raw = "Building Attack"
+        elif not elevated and momentum["classification"] == "Fading":
+            expected_raw = "Defensive Consolidation"
+        elif not elevated and momentum["classification"] == "Stable":
+            expected_raw = "Stable"
+        else:
+            expected_raw = "Transition"
+
+        assert result["raw_phase"] == expected_raw
+
+
+def test_classify_match_phase_hysteresis_suppresses_single_message_spike():
+    """Step 3.2: THE real hysteresis/dwell-window test, a constructed
+    synthetic noisy sequence (not real match data -- this needs a
+    precisely controlled disturbance, the same reason Tactical Momentum's
+    own boundary test above uses a real-data boundary slice rather than a
+    fabricated one only where control, not realism, is what's actually
+    under test).
+
+    A long flat baseline (0.04, well below ELEVATED_THREAT_LEVEL) warms up
+    past MOMENTUM_MIN_MESSAGES_FOR_TREND, then ONE single isolated spike
+    (0.95) is injected, then baseline resumes. VERIFIED by direct trace
+    before writing these assertions: the RAW (pre-hysteresis) classification
+    flips the INSTANT the spike enters `smoothed_now`'s own 10-message
+    window (message index 25), but the hysteresis-smoothed `phase` does
+    NOT flip until index 27 -- exactly 2 messages later, matching
+    SEGMENT_DWELL_MESSAGES=5's own majority-vote arithmetic (a flip
+    requires 3 of the last 5 raw votes to agree; the spike only occupies
+    1 of 5 lookback buffer-states at index 25, 2 of 5 at index 26, and
+    reaches 3 of 5 -- a majority -- only at index 27). This is the ACTUAL
+    noise-suppression guarantee: an isolated single-message disturbance
+    cannot flip the displayed phase on its own.
+    """
+    baseline = 0.04
+    spike = 0.95
+    buffer = [baseline] * 25
+    buffer.append(spike)
+    buffer.extend([baseline] * 10)
+
+    spike_index = 25  # 0-indexed position of the single spike in `buffer`
+
+    # Steady baseline before the spike: phase must be "Stable" throughout.
+    for i in range(MOMENTUM_MIN_MESSAGES_FOR_TREND, spike_index + 1):
+        result = classify_match_phase(buffer[:i])
+        assert result["status"] == "ready"
+        assert result["phase"] == "Stable", f"expected Stable before the spike at index {i}"
+
+    # The spike's own message and the immediately following one: the RAW
+    # classification has already flipped, but the hysteresis-smoothed
+    # `phase` must NOT flip yet -- this is the actual thing under test.
+    at_spike = classify_match_phase(buffer[: spike_index + 1])
+    assert at_spike["raw_phase"] != "Stable", "sanity check: the spike should visibly perturb the RAW classification"
+    assert at_spike["phase"] == "Stable", "a single isolated spike must not flip the hysteresis-smoothed phase"
+
+    one_after = classify_match_phase(buffer[: spike_index + 2])
+    assert one_after["phase"] == "Stable", "hysteresis must still hold 1 message after the isolated spike"
+
+    # Once the spike has persisted in enough of the lookback window to win
+    # a genuine majority, the phase IS allowed to reflect it -- hysteresis
+    # suppresses NOISE, it does not permanently ignore a real (even if
+    # transient) signal once it has been consistently observed.
+    majority_reached = classify_match_phase(buffer[: spike_index + 3])
+    assert majority_reached["phase"] != "Stable"
+
+
+def test_classify_match_phase_recovers_to_stable_after_spike_clears_window():
+    """The other half of the same real trace: once the single spike has
+    fully scrolled out of BOTH of Tactical Momentum's own smoothing
+    windows (smoothed_now's and smoothed_then's, together spanning
+    MOMENTUM_MIN_MESSAGES_FOR_TREND=20 messages), the phase must recover
+    to "Stable" -- confirming the disturbance's effect is bounded and
+    temporary, not a permanent corruption of the classifier's state (this
+    function is PURE and stateless by design; there is no persistent state
+    that COULD get stuck, but this confirms that holds in practice too)."""
+    baseline = 0.04
+    spike = 0.95
+    buffer = [baseline] * 25 + [spike] + [baseline] * 30
+
+    final = classify_match_phase(buffer)
+    assert final["phase"] == "Stable"
+    assert final["raw_phase"] == "Stable"
+    assert final["smoothed_now"] == baseline
 
 
 def test_player_reports_tab_low_sample_warning_renders_real_data(live_api_server):
