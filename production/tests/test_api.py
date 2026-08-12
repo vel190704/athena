@@ -820,6 +820,43 @@ def test_automatic_match_report_endpoint_no_data_for_unfetchable_match():
     assert "narrative" not in report
 
 
+def test_tactical_events_endpoint_returns_real_shape():
+    """GET /reports/match/{match_id}/tactical-events (new reporting
+    track): real match, real event data -- confirms the endpoint wires
+    detect_tactical_events through unmodified. Full numeric validation
+    lives in test_tactical_events.py's own direct, function-level tests;
+    this is just the HTTP wiring smoke test, matching every other
+    reporting endpoint's own convention in this file."""
+    with TestClient(app) as client:
+        response = client.get(f"/reports/match/{MATCH_ID}/tactical-events")
+    assert response.status_code == 200
+    result = response.json()
+
+    assert result["no_data"] is False
+    assert result["match_id"] == MATCH_ID
+    assert len(result["counter_attacks"]) > 0
+    assert len(result["build_up_patterns"]) > 0
+    assert len(result["switches_of_play"]) > 0
+
+
+def test_match_timeline_endpoint_returns_real_shape():
+    """GET /reports/match/{match_id}/timeline (new reporting track,
+    capstone): real match -- confirms the endpoint wires
+    generate_match_timeline through unmodified, including the explicit
+    momentum/segmentation-out-of-scope note. Full numeric/period-boundary
+    validation lives in test_match_timeline.py's own direct,
+    function-level tests; this is just the HTTP wiring smoke test."""
+    with TestClient(app) as client:
+        response = client.get(f"/reports/match/{MATCH_ID}/timeline")
+    assert response.status_code == 200
+    result = response.json()
+
+    assert result["no_data"] is False
+    assert result["match_id"] == MATCH_ID
+    assert result["momentum_segmentation_in_scope"] is False
+    assert len(result["timeline_entries"]) > 0
+
+
 # ============================================================================
 # Player Dashboard (additive new feature, on top of Milestone 40's Player
 # Report): match-level views. Match Summary is unconditionally aggregate

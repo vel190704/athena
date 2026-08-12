@@ -55,6 +55,7 @@ from production.src.reporting.match_report import (
     build_match_report_narrative_prompt,
     generate_automatic_match_report,
 )
+from production.src.reporting.match_timeline import generate_match_timeline
 from production.src.reporting.pass_network import (
     generate_pass_network,
     generate_pass_network_aggregated,
@@ -75,6 +76,7 @@ from production.src.reporting.player_similarity import (
     find_similar_players,
 )
 from production.src.reporting.tactical_chat import build_chat_prompt, format_context_package_text
+from production.src.reporting.tactical_events import detect_tactical_events
 from production.src.reporting.team_comparison import compare_team_matches, compare_team_seasons
 from production.src.reporting.team_report import (
     generate_team_opposition_analysis,
@@ -1530,6 +1532,65 @@ async def get_automatic_match_report(match_id: int):
     compiled["narrative"] = narrative
     compiled["narrative_source"] = narrative_source
     return compiled
+
+
+@app.get(
+    "/reports/match/{match_id}/tactical-events",
+    dependencies=[Depends(_require_api_key), Depends(_rate_limit("standard"))],
+)
+async def get_tactical_events(match_id: int):
+    """Wraps tactical_events.detect_tactical_events, unmodified.
+
+    Own dedicated endpoint (not merged into /reports/match/{match_id}'s
+    own compiled dict) -- the SAME reasoning Weak-Spot Lifetime Analysis's
+    own endpoint already established: keeps generate_automatic_match_report
+    itself unmodified and avoids adding this feature's own real compute
+    cost to every Automatic Match Report call by default, even when the
+    dashboard's Match Report tab renders both panels together.
+
+    Event-data only, no 360 dependency (unlike Weak-Spot Lifetime) --
+    "standard" tier, matching every other single-match, event-data-only
+    endpoint in this file.
+
+    ADR-021 condition 2: NOT gated by PUBLIC_DEPLOYMENT -- see
+    detect_tactical_events's own docstring in tactical_events.py for the
+    full Step 0 scoping and ADR-021's own Tactical Event Detection
+    addendum for the full exemption reasoning (no player identity and,
+    deliberately by design, no individual event's exact coordinate
+    anywhere in the output).
+    """
+    return await asyncio.to_thread(detect_tactical_events, match_id)
+
+
+@app.get(
+    "/reports/match/{match_id}/timeline",
+    dependencies=[Depends(_require_api_key), Depends(_rate_limit("standard"))],
+)
+async def get_match_timeline(match_id: int):
+    """Wraps match_timeline.generate_match_timeline, unmodified.
+
+    Tactical Timeline UI (capstone): unifies Weak-Spot Lifetime Analysis
+    and Tactical Event Detection onto one shared, chronologically-sorted,
+    period-boundary-corrected time axis. Tactical Momentum/Match
+    Segmentation are DELIBERATELY NOT included -- see
+    generate_match_timeline's own module docstring (Step 0) for the full,
+    explicit scope decision: they are live-stream-only concepts with no
+    batch/post-hoc match-level equivalent today, not silently dropped.
+
+    "standard" tier: internally calls generate_weak_spot_lifetime_analysis
+    (itself "standard", ~2.7s per team measured) for both teams plus
+    detect_tactical_events (event-data only, fast) -- genuinely more work
+    than a single-team single-match_id endpoint, but nowhere near the
+    ~100s-scale multi-match cost that earns "heavy" elsewhere in this
+    file.
+
+    ADR-021 condition 2: NOT gated by PUBLIC_DEPLOYMENT -- see
+    generate_match_timeline's own docstring and ADR-021's own Tactical
+    Timeline UI addendum for the full exemption reasoning, including the
+    explicit check for whether CORRELATING two already-exempt signals in
+    time introduces any new exposure (it does not).
+    """
+    return await asyncio.to_thread(generate_match_timeline, match_id)
 
 
 # ============================================================================

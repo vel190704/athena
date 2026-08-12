@@ -153,6 +153,7 @@ import websocket
 
 import production.src.reporting.candidate_index as candidate_index_module
 from production.src.reporting.candidate_index import enumerate_cached_candidates
+from production.src.reporting.match_timeline_visualizer import render_match_timeline
 from production.src.reporting.pass_network_visualizer import (
     render_pass_network,
     render_pass_network_aggregated,
@@ -796,6 +797,45 @@ def _cached_match_report(rest_base_url: str, match_id: int) -> dict:
     )
     response.raise_for_status()
     return response.json()
+
+
+# Tactical Event Detection (new reporting track): GET
+# /reports/match/{match_id}/tactical-events -- OWN dedicated fetch, not
+# folded into _cached_match_report above, matching that endpoint's own
+# separation from generate_automatic_match_report on the API side.
+@st.cache_data(show_spinner=False)
+def _cached_tactical_events(rest_base_url: str, match_id: int) -> dict:
+    response = requests.get(
+        f"{rest_base_url}/reports/match/{match_id}/tactical-events",
+        timeout=REPORT_REQUEST_TIMEOUT_SECONDS,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+# Tactical Timeline UI (new reporting track, capstone): GET
+# /reports/match/{match_id}/timeline -- OWN dedicated fetch, same
+# separation-from-Match-Report convention Tactical Event Detection's own
+# fetch above already established.
+@st.cache_data(show_spinner=False)
+def _cached_match_timeline(rest_base_url: str, match_id: int) -> dict:
+    response = requests.get(
+        f"{rest_base_url}/reports/match/{match_id}/timeline",
+        timeout=REPORT_REQUEST_TIMEOUT_SECONDS,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+@st.cache_data(show_spinner=False)
+def _cached_match_timeline_png(timeline_data: dict) -> bytes:
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+        tmp_path = tmp.name
+    try:
+        render_match_timeline(timeline_data, tmp_path)
+        return Path(tmp_path).read_bytes()
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
 
 
 # Alerts History tab: GET /alerts/history (ADR-019's persistence store, via
@@ -2848,6 +2888,155 @@ with tab_match_report:
 
                     with st.expander("Raw compiled match report data"):
                         st.json(match_report)
+
+    # ========================================================================
+    # Tactical Event Detection (new reporting track): OWN dedicated button/
+    # fetch, not folded into "Generate Match Report" above -- mirrors the
+    # API side's own separate endpoint (own real compute cost, not bundled
+    # into every Automatic Match Report call by default). Reuses this tab's
+    # own match_report_id_input field so the match_id is only entered once.
+    # ========================================================================
+    st.divider()
+    st.subheader("Tactical Event Detection")
+    st.caption(
+        "Detects Counter Attack, Switch of Play, and Build-up Pattern instances from this match's "
+        "real possession-chain/event structure (event data only -- no 360 dependency, unlike "
+        "Weak-Spot Lifetime Analysis in the Team Reports tab). Uses the Match ID above "
+        "(GET /reports/match/{match_id}/tactical-events)."
+    )
+    tactical_events_clicked = st.button("Detect Tactical Events")
+
+    if tactical_events_clicked:
+        try:
+            tactical_events_match_id = int(match_report_id_input.strip())
+        except ValueError:
+            st.error(f"Match ID must be a whole number -- got {match_report_id_input!r}.")
+        else:
+            with st.spinner("Detecting tactical events..."):
+                tactical_events = _fetch_report_safely(
+                    lambda: _cached_tactical_events(rest_base_url, tactical_events_match_id), rest_base_url
+                )
+
+            if tactical_events is not None:
+                if tactical_events.get("no_data"):
+                    st.info(tactical_events.get("reason", "No data available for this match_id."))
+                else:
+                    event_cols = st.columns(3)
+                    event_cols[0].metric(
+                        "Counter Attacks",
+                        len(tactical_events["counter_attacks"]),
+                        help=(
+                            f"{tactical_events['counter_attack_fraction_of_chains'] * 100:.1f}% of "
+                            f"{tactical_events['total_chains']} real possession chains. Threshold: reaches "
+                            f"the attacking third within "
+                            f"{tactical_events['counter_attack_time_to_final_third_seconds']:.0f}s of an "
+                            "opponent turnover."
+                        ),
+                    )
+                    event_cols[1].metric(
+                        "Build-up Patterns",
+                        len(tactical_events["build_up_patterns"]),
+                        help=(
+                            f"{tactical_events['build_up_fraction_of_chains'] * 100:.1f}% of "
+                            f"{tactical_events['total_chains']} real possession chains. Threshold: "
+                            f"starts in defensive/middle third, NOT fast, >= "
+                            f"{tactical_events['buildup_min_passes']} real passes."
+                        ),
+                    )
+                    event_cols[2].metric(
+                        "Switches of Play",
+                        len(tactical_events["switches_of_play"]),
+                        help=(
+                            f"{tactical_events['switch_of_play_fraction_of_completed_passes'] * 100:.1f}% of "
+                            f"{tactical_events['total_completed_passes']} real completed passes. Threshold: "
+                            f">= {tactical_events['switch_of_play_lateral_threshold_meters']:.0f}m real "
+                            "lateral distance."
+                        ),
+                    )
+
+                    detail_tabs = st.tabs(["Counter Attacks", "Build-up Patterns", "Switches of Play"])
+                    with detail_tabs[0]:
+                        if tactical_events["counter_attacks"]:
+                            st.dataframe(pd.DataFrame(tactical_events["counter_attacks"]), width="stretch")
+                        else:
+                            st.info("No Counter Attacks detected.")
+                    with detail_tabs[1]:
+                        if tactical_events["build_up_patterns"]:
+                            st.dataframe(pd.DataFrame(tactical_events["build_up_patterns"]), width="stretch")
+                        else:
+                            st.info("No Build-up Patterns detected.")
+                    with detail_tabs[2]:
+                        if tactical_events["switches_of_play"]:
+                            st.dataframe(pd.DataFrame(tactical_events["switches_of_play"]), width="stretch")
+                        else:
+                            st.info("No Switches of Play detected.")
+
+                    with st.expander("Raw tactical events data"):
+                        st.json(tactical_events)
+
+    # ========================================================================
+    # Tactical Timeline UI (new reporting track, capstone): unifies Weak-Spot
+    # Lifetime Analysis and Tactical Event Detection onto one shared time
+    # axis. Placed here, alongside the compiled Match Report and Tactical
+    # Event Detection panels (not a new tab) -- the roadmap's own explicit
+    # framing for this feature, since it's a visualization OVER those two
+    # match-level signals, not a separate concern. Tactical Momentum/Match
+    # Segmentation are DELIBERATELY NOT part of this timeline -- see
+    # match_timeline.py's own Step 0 docstring for the full, explicit scope
+    # reasoning (live-stream-only concepts, no batch/post-hoc equivalent
+    # exists today) -- stated again here, visibly, so a dashboard user sees
+    # the same honest scope note the API response itself carries.
+    # ========================================================================
+    st.divider()
+    st.subheader("Tactical Timeline")
+    st.caption(
+        "A single, unified chronological view of this match: Weak-Spot Lifetime instances "
+        "(Team Reports tab) and Tactical Events (Counter Attack / Build-up Pattern / Switch of "
+        "Play, above) plotted on one continuous time axis, correctly handling the real "
+        "half-time minute-numbering boundary. Uses the Match ID above "
+        "(GET /reports/match/{match_id}/timeline)."
+    )
+    st.info(
+        "Tactical Momentum and Match Segmentation are NOT included here -- both are live-stream-"
+        "only concepts (ephemeral, client-side, computed in the Live CV Monitor tab) with no "
+        "persisted or batch match-level equivalent today. This timeline unifies the two signals "
+        "that already exist as real, match-clock-indexed batch data."
+    )
+    timeline_clicked = st.button("Build Tactical Timeline")
+
+    if timeline_clicked:
+        try:
+            timeline_match_id = int(match_report_id_input.strip())
+        except ValueError:
+            st.error(f"Match ID must be a whole number -- got {match_report_id_input!r}.")
+        else:
+            with st.spinner("Building tactical timeline (Weak-Spot Lifetime for both teams + Tactical Events)..."):
+                timeline_data = _fetch_report_safely(
+                    lambda: _cached_match_timeline(rest_base_url, timeline_match_id), rest_base_url
+                )
+
+            if timeline_data is not None:
+                if timeline_data.get("no_data"):
+                    st.info(timeline_data.get("reason", "No timeline data available for this match_id."))
+                else:
+                    timeline_png = _cached_match_timeline_png(timeline_data)
+                    st.image(
+                        timeline_png,
+                        caption=f"Tactical Timeline -- match_id={timeline_match_id}",
+                        width="stretch",
+                    )
+                    timeline_cols = st.columns(4)
+                    timeline_cols[0].metric("Counter Attacks", timeline_data["counter_attack_count"])
+                    timeline_cols[1].metric("Build-up Patterns", timeline_data["build_up_count"])
+                    timeline_cols[2].metric("Switches of Play", timeline_data["switch_of_play_count"])
+                    timeline_cols[3].metric("Weak-Spot Instances", timeline_data["weak_spot_instance_count"])
+                    st.caption(
+                        f"Period 2 display offset: +{timeline_data['period_2_display_offset']:.1f} min "
+                        f"(real period-1 max minute: {timeline_data['period_1_max_minute']:.1f}, not assumed 45.0)."
+                    )
+
+                    with st.expander("Raw timeline data"):
+                        st.json(timeline_data)
 
 
 # ============================================================================

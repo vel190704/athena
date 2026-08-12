@@ -979,3 +979,116 @@ externally-sourced information.
 served UNCONDITIONALLY, not gated behind `PUBLIC_DEPLOYMENT` -- consistent
 with the season-aggregate heatmap's own existing exemption, extended
 explicitly (not assumed) to cover the added time dimension.
+
+## Addendum: Tactical Event Detection (`detect_tactical_events`)
+
+Resolved EXEMPT from condition 2 -- reasoned through explicitly, per the
+task's own instruction to compare directly against `chain_builder.py`'s
+own compliance status (which has never itself been separately audited --
+it is a pure classification/grouping function with no existing endpoint of
+its own) rather than assuming inheritance from either the Session/Match
+Comparison precedent or the Pass Network one.
+
+**1. What's actually in the output, checked field-by-field.** Counter
+Attack and Build-up Pattern instances: `{chain_id, period, team,
+start_minute, end_minute, ...derived scalars...}` -- `chain_id` is
+StatsBomb's own internal `possession` integer, not a player identifier;
+`team` is the SAME team-name-only identity level `generate_team_pass_entropy`/
+`generate_team_opposition_analysis` already serve unconditionally. Switch
+of Play instances: `{period, minute, team, lateral_distance_meters}` --
+same team-only identity, a single DERIVED scalar (lateral distance), no
+player name or ID anywhere.
+
+**2. The deciding factor, checked directly against the two established
+precedents this feature sits between.** Session/Match Comparison's own
+exemption held because its grid carried "no player name or ID anywhere...
+and no location finer than one ~10m×9.7m cell" -- the SAME is true here:
+no player identity anywhere in any of the three detectors' output. Pass
+Network's raw edges were gated specifically because a count was paired
+with a NAMED INDIVIDUAL's own precise average location. Tactical Event
+Detection never names an individual player at all, so that specific
+combination cannot arise here regardless of what else is in the output.
+
+**3. The one genuinely new risk actually worth checking closely (per the
+shot map's own precedent: an exact per-event coordinate, even with NO
+player name attached, was already found sufficient on its own to require
+gating -- "directly traceable to one specific StatsBomb Shot event" was
+the shot map's own stated problem, not "traceable via a named player").**
+Switch of Play's own Step 0 definition is computed FROM a real pass's
+exact `location`/`end_location` pair internally -- if that pair, or any
+other individual event's exact coordinate, were included in this output,
+it would risk the same individually-traceable-event problem, independent
+of the player-identity question. **This was designed around, not
+discovered after the fact**: none of the three detectors' return values
+ever include an individual event's raw `(x, y)` coordinate anywhere --
+only team, chain/period timing (already-exempt per Weak-Spot Lifetime's
+own precedent -- time alone is not the risky ingredient), and DERIVED
+scalar values (`lateral_distance_meters`, `time_to_final_third_seconds`,
+`n_passes`) computed from that coordinate but not equal to it. A derived
+scalar cannot be inverted back into the exact coordinate that produced it
+(the same "a derived value cannot carry MORE recoverable information than
+its input" reasoning this ADR's Tactical Entropy/Player Similarity/
+Weak-Spot Lifetime addenda already established).
+
+**Resolution:** `detect_tactical_events` and its `GET
+/reports/match/{match_id}/tactical-events` endpoint are served
+UNCONDITIONALLY, not gated behind `PUBLIC_DEPLOYMENT` -- consistent with
+Session/Match Comparison's own exemption, explicitly distinguished from
+Pass Network's/the shot map's gating by the deliberate absence of any
+individual event's exact coordinate anywhere in the output, not merely by
+the absence of a player name field.
+
+## Addendum: Tactical Timeline UI (`match_timeline.generate_match_timeline`)
+
+Resolved EXEMPT from condition 2 -- checked explicitly whether MERGING two
+already-exempt signals onto one shared time axis introduces any NEW
+exposure that neither signal carried alone, rather than assuming
+"both inputs are exempt" trivially implies "the combination is exempt."
+
+**1. What's actually new here, and what isn't.** This module recomputes
+NOTHING -- it calls `generate_weak_spot_lifetime_analysis` (ADR-021-exempt,
+own addendum above) and `detect_tactical_events` (ADR-021-exempt, own
+addendum above) UNMODIFIED, and only re-sorts/re-timestamps their already-
+exempt output onto one continuous display axis. Every field surfaced here
+(`team`, `period`, `start_minute`/`end_minute`, the per-signal `label`, and
+`detail` -- the full original instance dict from its own source function)
+was already present, unmodified, in one of those two already-cleared
+outputs. No player identity and no individual event's exact coordinate is
+introduced anywhere -- the same absence both source functions already
+established, carried through unchanged.
+
+**2. The real question: does CORRELATING two signals' time windows expose
+something neither exposed alone?** Checked directly with a real example
+(match 3857276): a real Canada Counter Attack instance (chain_id=22,
+period 1, display-minutes 10.0-11.0) was found to temporally overlap 6
+real Morocco weak-spot instances in the same window. Knowing "these two
+things happened around the same few real minutes" reveals a genuine
+TACTICAL relationship (Canada's fast transition coincided with gaps in
+Morocco's defensive shape) -- but it reveals nothing MORE
+individually-recoverable than either signal already stated on its own:
+still no player name, still no location finer than a coarse `(col, row)`
+cell for the weak-spot side, still no individual event's exact coordinate
+for the tactical-event side. Correlating two coarse, team-level, derived
+signals in TIME does not sharpen either one's own spatial or
+individual-identity resolution -- it only says "these two coarse,
+already-safe facts co-occurred," which is a strictly WEAKER claim than
+either fact would be if it additionally carried location/identity
+precision it does not have to begin with.
+
+**3. Momentum/Segmentation's exclusion (Step 0) is itself part of why this
+stays clean.** Since neither is included (see this module's own Step 0
+docstring), this timeline never has to reason about combining a
+LIVE-STREAM signal with a BATCH one, or about any compliance question a
+hypothetical batch-replayed momentum/segmentation sequence might raise on
+its own (it would very likely inherit the same exemption Tactical
+Momentum/Match Segmentation already carry client-side -- a further
+reduction of the same already-exempt `threat_15s` scalar -- but that
+question is deliberately not reached here, since that signal isn't part
+of this timeline).
+
+**Resolution:** `generate_match_timeline` and its `GET
+/reports/match/{match_id}/timeline` endpoint are served UNCONDITIONALLY,
+not gated behind `PUBLIC_DEPLOYMENT` -- consistent with both of its two
+source functions' own existing exemptions, with the cross-signal
+correlation question checked explicitly (not assumed) and found not to
+introduce any new exposure.
