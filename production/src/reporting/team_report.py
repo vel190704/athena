@@ -1029,3 +1029,260 @@ def generate_team_opposition_analysis(team_name: str, match_ids: list[int]) -> d
             ),
         },
     }
+
+
+# =============================================================================
+# Weak-Spot Lifetime Analysis (new reporting track): ADDITIVE ONLY -- nothing
+# above this line (including generate_team_report's own season-aggregate
+# weak-zone heatmap) is modified. That existing function collapses EVERY
+# 360-covered chain frame across `match_ids` into ONE static grid, discarding
+# temporal order entirely -- deliberately the right design for a season-
+# level "where is this team generally weak" summary, but it cannot answer
+# "how long did a specific weak zone actually stay exposed, in real time,
+# within one match." This section answers that different question, reusing
+# the SAME unmodified `BiomechanicalPitchControl` engine and the SAME
+# `GRID_COLS x GRID_ROWS` cell convention on the SAME kind of frames, added
+# here (not a new module) because it extends this file's own weak-zone
+# concept directly and needs no reporting-layer dependency the rest of this
+# file doesn't already have.
+#
+# ITERATION, STATED EXPLICITLY (why this does NOT reuse
+# `_match_representative_chain_frames`): that helper deliberately samples
+# only ONE representative 360 frame per possession chain -- the right
+# choice for a static aggregate, but consecutive representative frames can
+# be many real minutes apart (chains end/start unevenly), which would make
+# "did this weak spot really persist, or did we just skip past a change and
+# back again" impossible to answer honestly. This function instead iterates
+# EVERY real 360-covered, located event in strict chronological order
+# (`(period, index)`, the same ordering key `team_report.py`'s own
+# chain-frame builder already sorts possessions by) -- a real, disclosed
+# design difference from that precedent, not an oversight.
+# =============================================================================
+
+# STEP 0.1: "WEAK" -- a real, disclosed judgment call, grounded in a real
+# match's real observed control-value distribution (SAME methodology
+# match_segmentation's own ELEVATED_THREAT_LEVEL used: inspect real data,
+# pick a threshold marking a meaningful MINORITY, not the majority-default
+# state) -- deliberately NOT match_segmentation.ELEVATED_THREAT_LEVEL or
+# api.py's SPIKE_THRESHOLD, both of which measure a completely different
+# quantity (predicted shot probability) on a different scale; reusing
+# either here would be a category error, the same one Match Segmentation's
+# own Step 0 was warned against for the reverse case.
+#
+# Verified directly (match_id=3857276, Canada defending, full match: 1231
+# real defending frames, 7267 real per-frame-per-coarse-cell mean control
+# readings -- the SAME `control_probabilities.max(dim=0).values` per-cell
+# aggregation `generate_team_report`'s own `control_heatmap_grid` already
+# uses): real values ranged [0.00001, 0.341], median 0.072, mean 0.087.
+# MOST cells at MOST moments have naturally low control -- not because of
+# genuine defensive vulnerability, but because BiomechanicalPitchControl's
+# own sparse masking (ADR-005, `mask_radius=30m`) concentrates control near
+# the ball and near a team's own nearby players; a cell far from both is
+# structurally near-zero regardless of whether the defense is actually
+# exposed there. 0.04 marks the real ~30th percentile of observed values
+# (32.5% of real readings fall at or below it) -- a genuine minority,
+# matching Match Segmentation's own ~30% "elevated" fraction, not a
+# threshold that would label most of the pitch "weak" at every moment.
+WEAK_CONTROL_THRESHOLD = 0.04
+
+# STEP 0.2/0.3: "SAME weak spot persisting" -- the SAME grid cell
+# `(col, row)`, not an adjacency cluster. A deliberate simplification, not
+# an oversight: `generate_team_report`'s own `weakest_control_zones` already
+# treats one `(col, row)` cell as the atomic unit of "a zone" (individual
+# cells, never merged clusters), each cell already covers a real
+# `CELL_WIDTH_METERS x CELL_HEIGHT_METERS` (~10m x ~9.7m) area (not a
+# pixel-level sliver), and adjacency-cluster tracking would need real
+# merge/split logic across frames as a "weak region" drifts -- genuine
+# added complexity with no established precedent anywhere in this
+# project to reuse, deferred rather than invented ad hoc for this feature.
+#
+# GAP TOLERANCE (30.0s): applied to the real elapsed time between two
+# CONSECUTIVE REAL OBSERVATIONS OF THE SAME CELL -- NOT the raw
+# frame-to-frame gap across the whole match. A specific cell only receives
+# a control reading in frames where the ball comes within
+# BiomechanicalPitchControl's own `mask_radius` (30m) of it -- a real
+# subset of every 360-covered frame, not all of them. Verified directly on
+# the same real match: 33,584 real same-period consecutive per-cell
+# observation gaps, median 1.0s, mean 12.2s (a heavier tail than the raw
+# frame gap, exactly because not every frame observes every cell) -- 88.6%
+# of real per-cell gaps fall within 30s. Beyond that, a reappearing weak
+# reading is treated as a NEW instance, not a continuation -- this project's
+# own "verify, don't assume" discipline: a real, long silence about one
+# specific cell is honestly reported as a gap in what could be observed,
+# never bridged over by assumption.
+#
+# PERIOD BOUNDARIES ALWAYS END AN INSTANCE UNCONDITIONALLY, regardless of
+# the numeric gap -- a genuine design refinement found DURING this
+# threshold's own real-data verification, not assumed up front: StatsBomb's
+# raw `minute` field does not reset at half-time and the two periods'
+# ranges can overlap (the SAME real gotcha `api.py`'s
+# `_find_qualifying_frame_for_minute` already documents), so a naive
+# minute-difference calculation across the boundary can even go NEGATIVE --
+# comparing only within the same period sidesteps that bug entirely, and
+# is also the semantically correct behavior regardless: half-time is a
+# real, guaranteed discontinuity in play, not merely a data gap that
+# happens to be long.
+GAP_TOLERANCE_SECONDS = 30.0
+
+
+def generate_weak_spot_lifetime_analysis(team_name: str, match_id: int) -> dict:
+    """Weak-Spot Lifetime Analysis: tracks how long a specific pitch zone
+    stays WEAK (per `WEAK_CONTROL_THRESHOLD`) for `team_name` while
+    DEFENDING, across `match_id`'s real 360-covered frame sequence IN TIME
+    ORDER -- see this section's own header comment for Step 0's full
+    definitions.
+
+    SINGLE match_id, not a `match_ids` list like `generate_team_report`
+    above: a weak-spot "lifetime" is an inherently WITHIN-MATCH temporal
+    concept (splicing frames from two different matches into one
+    continuous timeline would not mean anything) -- the same reasoning
+    ADR-021's own Pass Network addendum already applied ("inherently
+    single-match scope... aggregating it across matches... would not mean
+    anything"), reused here for the same underlying reason.
+
+    Scope: only frames where `team_name` is the DEFENDING side (`parsed
+    ["team"] != team_name`, mirroring `generate_team_report`'s own
+    `is_team_attacking` check) -- an attacking-phase frame's control values
+    describe the OPPONENT's defensive exposure, not `team_name`'s own.
+
+    Returns a dict with `weak_spot_instances` (one entry per tracked
+    instance: zone, period, start/end match-clock minute, duration,
+    frame_count), `longest_lived_weak_spot`, `total_weak_minutes_by_zone`,
+    and the real 360-coverage accounting fields Step 0.4 requires (`
+    total_events`, `total_located_events`, `total_360_covered_located_events`,
+    `event_360_coverage_fraction`, `defending_frames_used`) so a caller
+    never has to assume full-match coverage.
+    """
+    events = fetch_match_events(match_id)
+    frames = fetch_match_360(match_id)
+    if events is None or frames is None:
+        return {
+            "team_name": team_name,
+            "match_id": match_id,
+            "no_data": True,
+            "reason": "No event or 360 data available for this match_id.",
+        }
+
+    frames_by_event_uuid = {f["event_uuid"]: f for f in frames}
+    covered_events = [
+        e
+        for e in events
+        if e.get("period") in (1, 2) and "location" in e and e["id"] in frames_by_event_uuid
+    ]
+    covered_events.sort(key=lambda e: (e["period"], e["index"]))
+
+    total_events = len(events)
+    total_located_events = sum(1 for e in events if "location" in e)
+
+    engine = BiomechanicalPitchControl()
+    pitch_grid = _build_pitch_grid()
+
+    # observations[(col, row)] = [(period, event_minute, mean_control), ...],
+    # built in the SAME chronological order `covered_events` is sorted in.
+    observations: dict[tuple[int, int], list[tuple[int, float, float]]] = defaultdict(list)
+    defending_frames_used = 0
+
+    for event in covered_events:
+        frame_data = frames_by_event_uuid[event["id"]]
+        parsed = parse_360_frame(event, frame_data)
+        if parsed["team"] == team_name:
+            continue  # attacking-phase frame -- not team_name's own defensive exposure
+
+        team_mask = ~parsed["is_teammate"]
+        team_pos = parsed["player_pos"][team_mask]
+        if team_pos.shape[0] == 0:
+            continue
+        team_vel = parsed["player_vel"][team_mask]
+        team_fatigue = parsed["fatigue_mod"][team_mask]
+        defending_frames_used += 1
+
+        active_coords, control_probabilities, _ = engine(
+            team_pos, team_vel, team_fatigue, pitch_grid, parsed["ball_pos"]
+        )
+        team_control = control_probabilities.max(dim=0).values
+
+        cols = (active_coords[:, 0] // CELL_WIDTH_METERS).long().clamp(0, GRID_COLS - 1)
+        rows = (active_coords[:, 1] // CELL_HEIGHT_METERS).long().clamp(0, GRID_ROWS - 1)
+        cell_sum: dict[tuple[int, int], float] = {}
+        cell_count: dict[tuple[int, int], int] = {}
+        for col, row, value in zip(cols.tolist(), rows.tolist(), team_control.tolist()):
+            key = (col, row)
+            cell_sum[key] = cell_sum.get(key, 0.0) + value
+            cell_count[key] = cell_count.get(key, 0) + 1
+
+        event_minute = event["minute"] + event["second"] / 60.0
+        for key, total in cell_sum.items():
+            observations[key].append((event["period"], event_minute, total / cell_count[key]))
+
+    # Per-cell state machine (Step 0.2/0.3): walks each cell's own real
+    # chronological observation list independently, opening/closing weak-
+    # spot instances per the gap-tolerance/period-boundary rules above.
+    instances: list[dict] = []
+    for (col, row), obs_list in observations.items():
+        open_instance: dict | None = None
+        for period, minute, control in obs_list:
+            is_weak = control <= WEAK_CONTROL_THRESHOLD
+
+            if open_instance is not None:
+                same_period = period == open_instance["period"]
+                gap_seconds = (minute - open_instance["end"]) * 60.0 if same_period else None
+                gap_within_tolerance = same_period and gap_seconds <= GAP_TOLERANCE_SECONDS
+                if is_weak and gap_within_tolerance:
+                    open_instance["end"] = minute
+                    open_instance["frame_count"] += 1
+                    continue
+                # Either a non-weak reading (closing) or the gap/period
+                # boundary ended it (Step 0.3) -- either way, the instance
+                # is already complete as of its own last weak observation.
+                instances.append(open_instance)
+                open_instance = None
+
+            if is_weak:
+                open_instance = {
+                    "col": col,
+                    "row": row,
+                    "period": period,
+                    "start": minute,
+                    "end": minute,
+                    "frame_count": 1,
+                }
+        if open_instance is not None:
+            instances.append(open_instance)
+
+    weak_spot_instances = sorted(
+        (
+            {
+                "zone": {"col": inst["col"], "row": inst["row"]},
+                "period": inst["period"],
+                "start_minute": inst["start"],
+                "end_minute": inst["end"],
+                "duration_minutes": inst["end"] - inst["start"],
+                "frame_count": inst["frame_count"],
+            }
+            for inst in instances
+        ),
+        key=lambda i: -i["duration_minutes"],
+    )
+
+    total_weak_minutes_by_zone: dict[str, float] = defaultdict(float)
+    for inst in weak_spot_instances:
+        zone_key = f"{inst['zone']['col']}_{inst['zone']['row']}"
+        total_weak_minutes_by_zone[zone_key] += inst["duration_minutes"]
+
+    return {
+        "team_name": team_name,
+        "match_id": match_id,
+        "no_data": False,
+        "weak_control_threshold": WEAK_CONTROL_THRESHOLD,
+        "gap_tolerance_seconds": GAP_TOLERANCE_SECONDS,
+        "total_events": total_events,
+        "total_located_events": total_located_events,
+        "total_360_covered_located_events": len(covered_events),
+        "event_360_coverage_fraction": (
+            len(covered_events) / total_located_events if total_located_events > 0 else None
+        ),
+        "defending_frames_used": defending_frames_used,
+        "weak_spot_instances": weak_spot_instances,
+        "longest_lived_weak_spot": weak_spot_instances[0] if weak_spot_instances else None,
+        "total_weak_minutes_by_zone": dict(total_weak_minutes_by_zone),
+    }

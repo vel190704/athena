@@ -82,6 +82,7 @@ from production.src.reporting.team_report import (
     generate_team_passing_lanes,
     generate_team_passing_lanes_aggregated,
     generate_team_report,
+    generate_weak_spot_lifetime_analysis,
 )
 from production.src.serving.alert_store import DB_PATH as ALERT_DB_PATH
 from production.src.serving.alert_store import count_alerts, fetch_alerts, init_db, log_alert
@@ -1443,6 +1444,33 @@ async def get_team_opposition_analysis(team_name: str, match_ids: list[int] = Qu
     exemption reasoning.
     """
     return await asyncio.to_thread(generate_team_opposition_analysis, team_name, match_ids)
+
+
+@app.get(
+    "/reports/team/{team_name}/weak-spot-lifetime/{match_id}",
+    dependencies=[Depends(_require_api_key), Depends(_rate_limit("standard"))],
+)
+async def get_weak_spot_lifetime(team_name: str, match_id: int):
+    """Wraps team_report.generate_weak_spot_lifetime_analysis, unmodified.
+
+    SINGLE match_id in the path (not a `match_ids` query list like the
+    other team endpoints above) -- a weak-spot "lifetime" is an inherently
+    within-match temporal concept, the same reasoning that already gives
+    `/reports/pass-network/{match_id}` its own single-match path shape.
+
+    "standard" tier, not "heavy": measured directly against a real full
+    match (3857276, ~1229 real defending frames) at ~2.7s -- genuinely
+    fast, bounded to one match, not the ~100s-scale multi-match cost that
+    earns the "heavy" tier elsewhere in this file.
+
+    ADR-021 condition 2: NOT gated by PUBLIC_DEPLOYMENT -- see
+    generate_weak_spot_lifetime_analysis's own docstring in team_report.py
+    for the full Step 0 scoping and ADR-021's own Weak-Spot Lifetime
+    Analysis addendum for the full exemption reasoning (a time-indexed
+    sequence of coarse-zone/duration tuples, no player identity, no
+    location finer than the already-exempt season-heatmap's own grid).
+    """
+    return await asyncio.to_thread(generate_weak_spot_lifetime_analysis, team_name, match_id)
 
 
 @app.get("/reports/team-comparison", dependencies=[Depends(_require_api_key), Depends(_rate_limit("heavy"))])

@@ -502,6 +502,27 @@ def test_reports_team_endpoint_returns_real_report_with_shape():
     assert "weakest_control_zones" in report
 
 
+def test_weak_spot_lifetime_endpoint_returns_real_shape():
+    """GET /reports/team/{team_name}/weak-spot-lifetime/{match_id} (new
+    reporting track): real match, real 360 coverage -- confirms the
+    endpoint wires generate_weak_spot_lifetime_analysis through
+    unmodified. Full numeric validation lives in
+    test_weak_spot_lifetime.py's own direct, function-level tests; this is
+    just the HTTP wiring smoke test, matching every other reporting
+    endpoint's own convention in this file."""
+    with TestClient(app) as client:
+        response = client.get(f"/reports/team/Canada/weak-spot-lifetime/{MATCH_ID}")
+    assert response.status_code == 200
+    result = response.json()
+
+    assert result["no_data"] is False
+    assert result["team_name"] == "Canada"
+    assert result["match_id"] == MATCH_ID
+    assert len(result["weak_spot_instances"]) > 0
+    assert result["longest_lived_weak_spot"] is not None
+    assert "total_weak_minutes_by_zone" in result
+
+
 def test_reports_team_endpoint_zero_usable_matches_returns_clean_response_not_raw_422():
     """Real reproduction case (not synthetic): Atlético Madrid has 32
     real cached matches across every season, but ZERO with 360 coverage

@@ -664,6 +664,24 @@ def _cached_team_opposition_analysis(rest_base_url: str, team_name: str, match_i
     return response.json()
 
 
+# Weak-Spot Lifetime Analysis (new reporting track): GET
+# /reports/team/{team_name}/weak-spot-lifetime/{match_id}. SINGLE match_id,
+# not a match_ids tuple like the panels above -- a weak-spot "lifetime" is
+# an inherently within-match temporal concept (see
+# generate_weak_spot_lifetime_analysis's own docstring), so this panel gets
+# its own single-match_id input rather than reusing the multi-variant
+# season/match-list selection machinery the rest of this tab uses.
+@st.cache_data(show_spinner=False)
+def _cached_weak_spot_lifetime(rest_base_url: str, team_name: str, match_id: int) -> dict:
+    response = requests.get(
+        f"{rest_base_url}/reports/team/{requests.utils.quote(team_name, safe='')}"
+        f"/weak-spot-lifetime/{match_id}",
+        timeout=REPORT_REQUEST_TIMEOUT_SECONDS,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
 # team_trend_data.py is a deliberate, NAMED EXCEPTION to ADR-018's
 # consolidation -- see this file's module docstring and ADR-018 itself.
 # That module's own docstring already states it must never be wired into
@@ -2195,6 +2213,100 @@ with tab_team:
 
                 with st.expander(f"Raw opposition analysis data ({_opp_variant!r})"):
                     st.json(opp_report)
+
+        # ====================================================================
+        # Weak-Spot Lifetime Analysis (new reporting track): extends the
+        # Opposition Analysis panel's own "pitch-control weak zones" concept
+        # above (a STATIC, season-aggregate view collapsing every frame into
+        # one grid) with a TEMPORAL one -- how long a specific zone actually
+        # stayed weak, in real match-clock time, within ONE match. See
+        # generate_weak_spot_lifetime_analysis's own docstring in
+        # team_report.py for the full Step 0 definitions (WEAK_CONTROL_
+        # THRESHOLD, GAP_TOLERANCE_SECONDS). Co-located in this same tab
+        # (not a new tab) since it's a direct temporal extension of what's
+        # already here, matching this panel's own conceptual home.
+        # ====================================================================
+        if team_name:
+            st.divider()
+            st.subheader("Weak-Spot Lifetime Analysis (temporal, single match)")
+            st.caption(
+                "How long a specific pitch zone stayed WEAK (low defending-team pitch control) across "
+                "one match's real 360-covered frame sequence, in time order -- distinct from the "
+                "season-aggregate weak-zone heatmap above, which discards temporal order entirely. "
+                "Needs real 360 freeze-frame coverage for this specific match_id."
+            )
+            weak_spot_match_id_input = st.text_input(
+                "Match ID (StatsBomb match_id)", value=DEFAULT_MATCH_ID, key="weak_spot_match_id_input"
+            )
+            weak_spot_run_clicked = st.button("Analyze Weak-Spot Lifetimes")
+
+            if weak_spot_run_clicked:
+                try:
+                    weak_spot_match_id = int(weak_spot_match_id_input.strip())
+                except ValueError:
+                    st.error(f"Match ID must be a whole number -- got {weak_spot_match_id_input!r}.")
+                else:
+                    with st.spinner("Analyzing weak-spot lifetimes..."):
+                        weak_spot_result = _fetch_report_safely(
+                            lambda: _cached_weak_spot_lifetime(rest_base_url, team_name, weak_spot_match_id),
+                            rest_base_url,
+                        )
+
+                    if weak_spot_result is not None:
+                        if weak_spot_result.get("no_data"):
+                            st.info(weak_spot_result.get("reason", "No data available for this match_id."))
+                        else:
+                            coverage = weak_spot_result["event_360_coverage_fraction"]
+                            st.metric(
+                                "360 coverage of located events",
+                                f"{coverage * 100:.1f}%" if coverage is not None else "N/A",
+                                help=(
+                                    f"{weak_spot_result['total_360_covered_located_events']} of "
+                                    f"{weak_spot_result['total_located_events']} real located events had "
+                                    "a matching 360 frame. This is the START/END coverage of the event "
+                                    "stream, not a guarantee any SPECIFIC zone was continuously observed "
+                                    "-- see the caption below."
+                                ),
+                            )
+                            st.caption(
+                                f"Weak threshold: mean defending control <= {weak_spot_result['weak_control_threshold']}. "
+                                f"Gap tolerance: {weak_spot_result['gap_tolerance_seconds']:.0f}s between consecutive "
+                                f"real observations of the SAME zone (a specific zone is only observed in frames "
+                                f"where the ball comes within the physics engine's own mask radius of it -- a real "
+                                f"subset of every 360-covered frame, denser near typical play areas, sparser "
+                                f"elsewhere). {weak_spot_result['defending_frames_used']} real defending frames used."
+                            )
+
+                            longest = weak_spot_result.get("longest_lived_weak_spot")
+                            if longest is not None:
+                                st.markdown(
+                                    f"**Longest-lived weak spot**: zone (col={longest['zone']['col']}, "
+                                    f"row={longest['zone']['row']}), period {longest['period']}, "
+                                    f"{longest['start_minute']:.2f}' -> {longest['end_minute']:.2f}' "
+                                    f"({longest['duration_minutes']:.2f} real minutes, "
+                                    f"{longest['frame_count']} consecutive real frames)."
+                                )
+
+                            instances_df = pd.DataFrame(weak_spot_result["weak_spot_instances"])
+                            if not instances_df.empty:
+                                instances_df["col"] = instances_df["zone"].apply(lambda z: z["col"])
+                                instances_df["row"] = instances_df["zone"].apply(lambda z: z["row"])
+                                display_df = instances_df[[
+                                    "col", "row", "period", "start_minute", "end_minute",
+                                    "duration_minutes", "frame_count",
+                                ]].rename(columns={
+                                    "col": "Col", "row": "Row", "period": "Period",
+                                    "start_minute": "Start (min)", "end_minute": "End (min)",
+                                    "duration_minutes": "Duration (min)", "frame_count": "Frames",
+                                })
+                                st.dataframe(display_df.head(20), width="stretch")
+                                st.caption(
+                                    f"Top 20 of {len(weak_spot_result['weak_spot_instances'])} total real weak-spot "
+                                    "instances found (already sorted by duration, longest first)."
+                                )
+
+                            with st.expander("Raw weak-spot lifetime data"):
+                                st.json(weak_spot_result)
 
 # ============================================================================
 # TAB: Team Trends -- UI wiring over team_trend_data.py, unmodified. A

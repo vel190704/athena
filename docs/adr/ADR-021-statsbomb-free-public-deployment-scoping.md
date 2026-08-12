@@ -914,3 +914,68 @@ policy than a private one, and none exists.
 and regression-tested; the other three items were already correct,
 confirmed by real test rather than by re-reading the code that was
 originally reasoned about individually at build time.
+
+## Addendum: Weak-Spot Lifetime Analysis (`generate_weak_spot_lifetime_analysis`)
+
+Resolved EXEMPT from condition 2 -- reasoned through explicitly, NOT
+assumed to inherit the already-established exemption for
+`generate_team_report`'s own season-aggregate `weakest_control_zones`
+field just because this feature uses the SAME grid granularity and the
+SAME physics engine. The real, new question: this feature adds a TIME
+dimension the season heatmap never had (a real match-clock start/end
+window per weak-spot instance) -- does knowing "zone X was weak from
+minute 12 to minute 15" let anyone reconstruct any individual player's
+location or any specific real event, the way Pass Network's edges did?
+
+**1. What's actually in the output, checked field-by-field.** Each
+`weak_spot_instances` entry is `{zone: {col, row}, period, start_minute,
+end_minute, duration_minutes, frame_count}`. No player name or ID appears
+anywhere (only `team_name`, already-public, non-individually-attributable
+information -- the same identity level `generate_team_pass_entropy`/
+`generate_team_opposition_analysis` already serve unconditionally). No
+location finer than the SAME `GRID_COLS x GRID_ROWS` coarse cell
+(~10m x ~9.7m) `generate_team_report`'s own already-exempt heatmap uses --
+not a single degree finer.
+
+**2. The genuinely new ingredient (TIME) does not change the underlying
+recoverability test, on inspection.** Pass Network's edges were gated
+because a count was paired with a NAMED INDIVIDUAL's own precise average
+location -- that specific combination is what let a viewer approximately
+reconstruct one real pass event. Here, a `(zone, time window)` pair is
+still never paired with any player identity, and -- critically -- each
+value is itself an AGGREGATE over `frame_count` real frames (ranging from
+1 to 44 in real validation data below) of the WHOLE DEFENDING TEAM's own
+collective control at that cell (`control_probabilities.max(dim=0).values`,
+already max-reduced across every one of that team's own players before
+any further aggregation happens) -- not any single player's position at
+any single instant. Even knowing the exact real time window, the output
+alone reveals nothing about WHICH player(s) were positioned where, nothing
+about the ball's own exact location, and nothing about which specific
+event (a pass, a shot, a run) occurred -- only that the team's own
+COLLECTIVE reachability of one coarse cell stayed low across that span.
+This is a further temporal reduction of the SAME already-exempt per-cell
+control values the season heatmap already aggregates spatially, not a new
+kind of data extraction -- the same "a derived value computed from an
+already-exempt aggregate cannot carry MORE individually-recoverable
+information than that aggregate" reasoning this ADR's Tactical
+Entropy/Player Similarity addenda already established, extended here from
+a spatial reduction to a temporal one.
+
+**3. What this reasoning does NOT claim.** It does not claim zero possible
+inference by a sufficiently motivated viewer cross-referencing a reported
+time window against EXTERNAL sources (e.g. real broadcast footage) --
+but that risk exists identically for every ALREADY-EXEMPT feature in this
+project that reports any real match-clock time at all (Tactical Momentum
+and Match Segmentation's own live per-message timestamps, the season
+heatmap's own per-phase-bucket breakdown), and is outside what condition 2
+governs in the first place: condition 2 is about not re-exposing or
+redistributing StatsBomb's OWN raw data through this project's own output,
+not about foreclosing every inference a sufficiently motivated person
+could ever make by combining this project's output with unrelated,
+externally-sourced information.
+
+**Resolution:** `generate_weak_spot_lifetime_analysis` and its
+`GET /reports/team/{team_name}/weak-spot-lifetime/{match_id}` endpoint are
+served UNCONDITIONALLY, not gated behind `PUBLIC_DEPLOYMENT` -- consistent
+with the season-aggregate heatmap's own existing exemption, extended
+explicitly (not assumed) to cover the added time dimension.
