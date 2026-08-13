@@ -673,10 +673,33 @@ def _cached_team_opposition_analysis(rest_base_url: str, team_name: str, match_i
 # its own single-match_id input rather than reusing the multi-variant
 # season/match-list selection machinery the rest of this tab uses.
 @st.cache_data(show_spinner=False)
-def _cached_weak_spot_lifetime(rest_base_url: str, team_name: str, match_id: int) -> dict:
+def _cached_weak_spot_lifetime(
+    rest_base_url: str, team_name: str, match_id: int, include_recommendations: bool = False
+) -> dict:
+    """`include_recommendations` (Weak-Spot Exploitation Recommendation,
+    additive new feature): forwarded straight through to the endpoint's
+    own opt-in query param -- see get_weak_spot_lifetime's own docstring
+    in api.py for why this defaults to False (byte-for-byte unchanged
+    response shape/cost unless a caller explicitly asks for more)."""
     response = requests.get(
         f"{rest_base_url}/reports/team/{requests.utils.quote(team_name, safe='')}"
         f"/weak-spot-lifetime/{match_id}",
+        params={"include_recommendations": include_recommendations},
+        timeout=REPORT_REQUEST_TIMEOUT_SECONDS,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+# Decision Quality (Phase 4, final item): GET
+# /reports/team/{team_name}/decision-quality/{match_id}. SINGLE match_id,
+# same "best alternative available AT THAT MOMENT" reasoning Weak-Spot
+# Lifetime Analysis's own panel already established.
+@st.cache_data(show_spinner=False)
+def _cached_decision_quality(rest_base_url: str, team_name: str, match_id: int) -> dict:
+    response = requests.get(
+        f"{rest_base_url}/reports/team/{requests.utils.quote(team_name, safe='')}"
+        f"/decision-quality/{match_id}",
         timeout=REPORT_REQUEST_TIMEOUT_SECONDS,
     )
     response.raise_for_status()
@@ -2278,6 +2301,20 @@ with tab_team:
             weak_spot_match_id_input = st.text_input(
                 "Match ID (StatsBomb match_id)", value=DEFAULT_MATCH_ID, key="weak_spot_match_id_input"
             )
+            weak_spot_include_recommendations = st.checkbox(
+                "Include exploitation recommendations (top 20 instances -- adds ~10s, loads 2 more models)",
+                value=False,
+                key="weak_spot_include_recommendations",
+                help=(
+                    "For each of the top 20 longest-lived weak-spot instances: which defensive action "
+                    "(/coach-mode's own high_press/drop_deep/force_wide/no_change ranking) most reduces "
+                    "predicted threat at that instance's own real match state, plus a Deep Ensemble "
+                    "confidence signal (5 independently-trained members' real disagreement -- higher "
+                    "spread means lower confidence). This is the match STATE's own best fix, not a "
+                    "causal decomposition isolating that one grid cell alone -- see team_report.py's own "
+                    "Step 0 comment for the full disclosed scope."
+                ),
+            )
             weak_spot_run_clicked = st.button("Analyze Weak-Spot Lifetimes")
 
             if weak_spot_run_clicked:
@@ -2286,9 +2323,15 @@ with tab_team:
                 except ValueError:
                     st.error(f"Match ID must be a whole number -- got {weak_spot_match_id_input!r}.")
                 else:
-                    with st.spinner("Analyzing weak-spot lifetimes..."):
+                    spinner_text = (
+                        "Analyzing weak-spot lifetimes and computing exploitation recommendations..."
+                        if weak_spot_include_recommendations else "Analyzing weak-spot lifetimes..."
+                    )
+                    with st.spinner(spinner_text):
                         weak_spot_result = _fetch_report_safely(
-                            lambda: _cached_weak_spot_lifetime(rest_base_url, team_name, weak_spot_match_id),
+                            lambda: _cached_weak_spot_lifetime(
+                                rest_base_url, team_name, weak_spot_match_id, weak_spot_include_recommendations
+                            ),
                             rest_base_url,
                         )
 
@@ -2345,8 +2388,130 @@ with tab_team:
                                     "instances found (already sorted by duration, longest first)."
                                 )
 
+                                if weak_spot_include_recommendations:
+                                    recommended_rows = []
+                                    for inst in weak_spot_result["weak_spot_instances"][:20]:
+                                        rec = inst.get("recommendation")
+                                        if rec is None:
+                                            continue
+                                        recommended_rows.append({
+                                            "Col": inst["zone"]["col"],
+                                            "Row": inst["zone"]["row"],
+                                            "Duration (min)": round(inst["duration_minutes"], 2),
+                                            "Recommended Action": rec["recommended_action"],
+                                            "Baseline Threat": f"{rec['baseline_threat_15s'] * 100:.1f}%",
+                                            "Best Delta (pp)": f"{rec['rankings'][0]['delta'] * 100:+.1f}",
+                                            "Confidence (ensemble std)": round(
+                                                rec["confidence"]["ensemble_std_cumulative_incidence"], 4
+                                            ),
+                                        })
+                                    st.markdown("**Exploitation Recommendations**")
+                                    if recommended_rows:
+                                        st.dataframe(pd.DataFrame(recommended_rows), width="stretch")
+                                        st.caption(
+                                            "Recommended Action = the defensive posture that most reduces predicted "
+                                            "threat at that instance's own real match state (lowest simulated threat "
+                                            "among high_press/drop_deep/force_wide/no_change, /coach-mode's own "
+                                            "ranking). Confidence = the Deep Ensemble's real 5-member disagreement "
+                                            "(standard deviation of cumulative incidence) on the recommended "
+                                            "action's own resulting state -- LOWER means the 5 independently-trained "
+                                            "members agree more, i.e. HIGHER confidence in the recommendation."
+                                        )
+                                    else:
+                                        st.info("No recommendations could be computed (no real frame found near any instance).")
+
                             with st.expander("Raw weak-spot lifetime data"):
                                 st.json(weak_spot_result)
+
+        # ====================================================================
+        # Decision Quality (Phase 4, final item): was a player's pass under
+        # pressure the RIGHT choice, given the real best available
+        # alternative at that moment? ADR-021: the FIRST Phase 4 composition
+        # that genuinely needed gating (named player + precise location),
+        # not exemption -- mirrors the Pass Network/Shot Map panels' own
+        # defense-in-depth check exactly (inspects the ACTUAL response, not
+        # just this process's own PUBLIC_DEPLOYMENT flag).
+        # ====================================================================
+        if team_name:
+            st.divider()
+            st.subheader("Decision Quality (real pass choices under pressure)")
+            st.caption(
+                "For each real pass made under pressure: the real lane-openness of the option chosen "
+                "vs. the real BEST available alternative at that same moment (any other visible "
+                "teammate), against the real recorded outcome. Composes Press Resistance's own "
+                "pressure/success signal with a new per-frame generalization of Passing Lane "
+                "Visualizer's own lane-openness computation."
+            )
+            decision_quality_match_id_input = st.text_input(
+                "Match ID (StatsBomb match_id)", value=DEFAULT_MATCH_ID, key="decision_quality_match_id_input"
+            )
+            decision_quality_run_clicked = st.button("Analyze Decision Quality")
+
+            if decision_quality_run_clicked:
+                try:
+                    decision_quality_match_id = int(decision_quality_match_id_input.strip())
+                except ValueError:
+                    st.error(f"Match ID must be a whole number -- got {decision_quality_match_id_input!r}.")
+                else:
+                    with st.spinner("Analyzing decision quality..."):
+                        decision_quality_result = _fetch_report_safely(
+                            lambda: _cached_decision_quality(rest_base_url, team_name, decision_quality_match_id),
+                            rest_base_url,
+                        )
+
+                    if decision_quality_result is not None:
+                        if decision_quality_result.get("no_data"):
+                            st.info(decision_quality_result.get("reason", "No data available for this match_id."))
+                        else:
+                            # Defense in depth, same as the Pass Network/Shot Map panels:
+                            # check the ACTUAL response shape, not just this process's own flag.
+                            response_has_raw_decisions = "decisions" in decision_quality_result
+                            if PUBLIC_DEPLOYMENT and response_has_raw_decisions:
+                                st.error(
+                                    "Configuration error: this dashboard process has PUBLIC_DEPLOYMENT=true, "
+                                    "but the API server returned raw per-decision data (named players, "
+                                    "precise locations) -- refusing to render or display it. Set "
+                                    "PUBLIC_DEPLOYMENT=true on the API server process too."
+                                )
+                            elif PUBLIC_DEPLOYMENT or not response_has_raw_decisions:
+                                st.markdown("**Per-player decision quality (aggregated -- no location)**")
+                                st.dataframe(pd.DataFrame(decision_quality_result["player_summary"]), width="stretch")
+                                with st.expander("Raw decision quality data (aggregated)"):
+                                    st.json(decision_quality_result)
+                            else:
+                                metric_cols = st.columns(3)
+                                metric_cols[0].metric("Total decisions", decision_quality_result["total_decisions"])
+                                good_share = decision_quality_result["good_decision_share"]
+                                metric_cols[1].metric(
+                                    "Good decision share",
+                                    f"{good_share * 100:.1f}%" if good_share is not None else "N/A",
+                                    help=(
+                                        f"Chosen lane openness within "
+                                        f"{decision_quality_result['good_decision_openness_tolerance']} of the "
+                                        "real best available alternative."
+                                    ),
+                                )
+                                successful_share = decision_quality_result["successful_share"]
+                                metric_cols[2].metric(
+                                    "Successful share",
+                                    f"{successful_share * 100:.1f}%" if successful_share is not None else "N/A",
+                                )
+
+                                decisions_df = pd.DataFrame(decision_quality_result["decisions"])
+                                if not decisions_df.empty:
+                                    display_df = decisions_df[[
+                                        "player_name", "period", "minute", "chosen_lane_openness",
+                                        "best_alternative_lane_openness", "openness_gap", "successful", "good_decision",
+                                    ]].rename(columns={
+                                        "player_name": "Player", "period": "Period", "minute": "Minute",
+                                        "chosen_lane_openness": "Chosen Openness",
+                                        "best_alternative_lane_openness": "Best Alternative Openness",
+                                        "openness_gap": "Gap", "successful": "Successful", "good_decision": "Good Decision",
+                                    })
+                                    st.dataframe(display_df, width="stretch")
+
+                                with st.expander("Raw decision quality data"):
+                                    st.json(decision_quality_result)
 
 # ============================================================================
 # TAB: Team Trends -- UI wiring over team_trend_data.py, unmodified. A

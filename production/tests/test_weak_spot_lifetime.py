@@ -23,8 +23,11 @@ os.environ.setdefault("MLFLOW_ALLOW_FILE_STORE", "true")
 from production.src.reporting.team_report import (
     GAP_TOLERANCE_SECONDS,
     WEAK_CONTROL_THRESHOLD,
+    WEAK_SPOT_RECOMMENDATION_TOP_N,
+    add_exploitation_recommendations,
     generate_weak_spot_lifetime_analysis,
 )
+from production.src.pipeline.simulator import SUPPORTED_ACTIONS
 
 MATCH_ID = 3857276
 TEAM_NAME = "Canada"
@@ -287,3 +290,111 @@ def test_weak_spot_period_boundary_always_splits_regardless_of_numeric_gap(monke
     target_instances = _instances_for_target_cell(result)
     assert len(target_instances) == 2
     assert {inst["period"] for inst in target_instances} == {1, 2}
+
+
+# ============================================================================
+# Weak-Spot Exploitation Recommendation validation: add_exploitation_
+# recommendations -- composes /coach-mode's own ranking computation + the
+# Deep Ensemble's own real member-disagreement, additive over a real
+# generate_weak_spot_lifetime_analysis output. Real, end-to-end, against
+# the same match/team used throughout this file -- real trained MLflow
+# model artifacts (both the single MLP and the Deep Ensemble) are loaded,
+# not mocked, matching this project's own "verify against the real thing"
+# discipline for model-touching code.
+# ============================================================================
+
+
+def test_add_exploitation_recommendations_real_match_shape_and_scope():
+    """Real match: confirms the top-N instances (and ONLY the top-N) get
+    a real `recommendation` dict, every existing field is left untouched,
+    and each recommendation's own internal shape matches /coach-mode's
+    own real ranking output (4 actions, sorted best-first, delta==0 for
+    the true baseline/no_change reference)."""
+    result = generate_weak_spot_lifetime_analysis(TEAM_NAME, MATCH_ID)
+    original_instance_count = len(result["weak_spot_instances"])
+    original_first_instance = dict(result["weak_spot_instances"][0])
+
+    result = add_exploitation_recommendations(result, MATCH_ID)
+
+    assert len(result["weak_spot_instances"]) == original_instance_count  # nothing added/removed
+    for key, value in original_first_instance.items():  # existing fields untouched
+        assert result["weak_spot_instances"][0][key] == value
+
+    with_recommendation = [
+        inst for inst in result["weak_spot_instances"][:WEAK_SPOT_RECOMMENDATION_TOP_N]
+        if inst.get("recommendation") is not None
+    ]
+    assert len(with_recommendation) > 0, "expected at least one real recommendation among the top instances"
+
+    for inst in result["weak_spot_instances"][WEAK_SPOT_RECOMMENDATION_TOP_N:]:
+        assert "recommendation" not in inst  # absent, not None, beyond the top-N cutoff
+
+    for inst in with_recommendation:
+        rec = inst["recommendation"]
+        assert set(a["action"] for a in rec["rankings"]) == set(SUPPORTED_ACTIONS)
+        assert rec["recommended_action"] == rec["rankings"][0]["action"]
+        deltas = [r["delta"] for r in rec["rankings"]]
+        assert deltas == sorted(deltas)  # best (lowest simulated threat) first
+        no_change_entry = next(r for r in rec["rankings"] if r["action"] == "no_change")
+        assert abs(no_change_entry["delta"]) < 1e-9
+        assert abs(no_change_entry["simulated_threat_15s"] - rec["baseline_threat_15s"]) < 1e-9
+
+
+def test_add_exploitation_recommendations_real_confidence_signal_is_genuine_ensemble_disagreement():
+    """Confirms `confidence` is REAL Deep Ensemble output, not a
+    placeholder: 5 real per-member values (matching DEFAULT_ENSEMBLE_SIZE),
+    and the reported std genuinely equals the population std of those 5
+    real member values -- an independent cross-check, not trusting the
+    ensemble's own internal computation blindly."""
+    result = generate_weak_spot_lifetime_analysis(TEAM_NAME, MATCH_ID)
+    result = add_exploitation_recommendations(result, MATCH_ID)
+
+    checked_any = False
+    for inst in result["weak_spot_instances"][:WEAK_SPOT_RECOMMENDATION_TOP_N]:
+        rec = inst.get("recommendation")
+        if rec is None:
+            continue
+        checked_any = True
+        members = rec["confidence"]["ensemble_member_cumulative_incidences"]
+        assert len(members) == 5
+
+        # torch.Tensor.std() defaults to the UNBIASED (n-1) estimator --
+        # cross-checked against that specific convention, not assumed.
+        mean = sum(members) / len(members)
+        unbiased_variance = sum((m - mean) ** 2 for m in members) / (len(members) - 1)
+        expected_std = unbiased_variance**0.5
+        assert abs(rec["confidence"]["ensemble_std_cumulative_incidence"] - expected_std) < 1e-4
+
+        assert all(0.0 <= m <= 1.0 for m in members)  # real cumulative-incidence probabilities
+        assert rec["confidence"]["ensemble_run_id"]
+
+    assert checked_any
+
+
+def test_add_exploitation_recommendations_no_data_passthrough():
+    """A no_data weak_spot_result must pass through unchanged (no crash,
+    no attempted model load)."""
+    no_data_result = {"team_name": TEAM_NAME, "match_id": 1, "no_data": True, "reason": "no data"}
+    result = add_exploitation_recommendations(no_data_result, match_id=1)
+    assert result == no_data_result
+
+
+def test_add_exploitation_recommendations_real_spot_check_longest_lived_instance():
+    """Step 3's real spot-check: the SAME longest-lived instance already
+    validated in this file's own shape test above (zone col=6/row=6,
+    period 2, 45.70'-46.87') gets a real, football-plausible
+    recommendation -- verified directly, not assumed, against the actual
+    real model output."""
+    result = generate_weak_spot_lifetime_analysis(TEAM_NAME, MATCH_ID)
+    result = add_exploitation_recommendations(result, MATCH_ID)
+
+    longest = result["weak_spot_instances"][0]
+    assert longest["zone"] == {"col": 6, "row": 6}
+    rec = longest["recommendation"]
+    assert rec is not None
+    assert rec["frame_period"] == 2
+    assert rec["recommended_action"] in SUPPORTED_ACTIONS
+    # The recommended action must be a genuine improvement (or, at worst,
+    # tied with no_change) over doing nothing -- never a WORSE-than-baseline
+    # "recommendation".
+    assert rec["rankings"][0]["delta"] <= 0.0

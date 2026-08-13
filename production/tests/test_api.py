@@ -521,6 +521,32 @@ def test_weak_spot_lifetime_endpoint_returns_real_shape():
     assert len(result["weak_spot_instances"]) > 0
     assert result["longest_lived_weak_spot"] is not None
     assert "total_weak_minutes_by_zone" in result
+    assert "recommendation" not in result["weak_spot_instances"][0]  # opt-in param defaults to off
+
+
+def test_weak_spot_lifetime_endpoint_include_recommendations_opt_in():
+    """`include_recommendations=true` (Weak-Spot Exploitation
+    Recommendation, additive new feature): real match -- confirms the
+    endpoint wires add_exploitation_recommendations through when opted
+    in, and stays absent by default (the previous test's own assertion).
+    Full numeric validation lives in test_weak_spot_lifetime.py's own
+    direct, function-level tests; this is just the HTTP wiring smoke test."""
+    with TestClient(app) as client:
+        response = client.get(
+            f"/reports/team/Canada/weak-spot-lifetime/{MATCH_ID}",
+            params={"include_recommendations": True},
+        )
+    assert response.status_code == 200
+    result = response.json()
+
+    assert result["no_data"] is False
+    first_with_recommendation = next(
+        (inst for inst in result["weak_spot_instances"] if inst.get("recommendation") is not None), None
+    )
+    assert first_with_recommendation is not None
+    assert first_with_recommendation["recommendation"]["recommended_action"] in (
+        "no_change", "force_wide", "high_press", "drop_deep"
+    )
 
 
 def test_reports_team_endpoint_zero_usable_matches_returns_clean_response_not_raw_422():
@@ -855,6 +881,63 @@ def test_match_timeline_endpoint_returns_real_shape():
     assert result["match_id"] == MATCH_ID
     assert result["momentum_segmentation_in_scope"] is False
     assert len(result["timeline_entries"]) > 0
+
+
+# ============================================================================
+# GET /reports/team/{team_name}/decision-quality/{match_id} (Phase 4, final
+# item -- Decision Quality). The FIRST Phase 4 composition tonight that
+# genuinely needed ADR-021 gating (named player + precise location), not
+# exemption -- tested with the SAME raw-HTTP-text-search discipline the
+# shot map/Pass Network endpoints above already established.
+# ============================================================================
+
+
+def test_decision_quality_endpoint_default_serves_raw_per_decision_data():
+    """Flag unset (the default): real per-decision data -- named player,
+    precise location, real openness comparison -- for match 3857276."""
+    with TestClient(app) as client:
+        response = client.get(f"/reports/team/Canada/decision-quality/{MATCH_ID}")
+    assert response.status_code == 200
+    result = response.json()
+
+    assert result["no_data"] is False
+    assert "decisions" in result
+    assert result["total_decisions"] == 50
+    first_decision = result["decisions"][0]
+    assert "player_name" in first_decision and "location" in first_decision
+    assert "player_summary" not in result
+
+
+def test_decision_quality_endpoint_public_deployment_serves_aggregated_only_no_raw_leak(monkeypatch):
+    """The actual compliance guarantee, checked against the REAL raw HTTP
+    response body (same discipline as the shot map's/Pass Network's own
+    equivalent tests): with PUBLIC_DEPLOYMENT=True, no player's individual
+    location and no per-decision detail may appear ANYWHERE in the
+    response, under any key name, at any nesting depth."""
+    monkeypatch.setattr(api_module, "PUBLIC_DEPLOYMENT", True)
+
+    with TestClient(app) as client:
+        response = client.get(f"/reports/team/Canada/decision-quality/{MATCH_ID}")
+    assert response.status_code == 200
+    raw_body_text = response.text  # the actual bytes-over-the-wire, not a re-serialization
+    result = json.loads(raw_body_text)
+
+    assert "decisions" not in result
+    assert "player_summary" in result
+    first_player = result["player_summary"][0]
+    assert "total_decisions" in first_player
+    assert "location" not in first_player
+
+    # Belt-and-suspenders on the RAW TEXT itself.
+    assert '"decisions"' not in raw_body_text
+    assert '"location"' not in raw_body_text
+    assert "chosen_lane_openness" not in raw_body_text
+
+
+def test_decision_quality_endpoint_public_deployment_off_by_default_confirmed():
+    """Explicit control, same convention as the shot map's/Pass Network's
+    own equivalent tests -- confirms the real, unpatched default."""
+    assert api_module.PUBLIC_DEPLOYMENT is False
 
 
 # ============================================================================

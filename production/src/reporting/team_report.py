@@ -27,7 +27,7 @@ from production.src.ingestion.statsbomb_io import (
     parse_360_frame,
 )
 from production.src.models.evaluation import predict_cumulative_incidence
-from production.src.models.explainer import load_deterministic_mlp
+from production.src.models.explainer import load_deterministic_ensemble, load_deterministic_mlp
 from production.src.pipeline.chain_builder import build_possession_chains
 from production.src.pipeline.feature_extractor import (
     FINAL_THIRD_X,
@@ -42,6 +42,8 @@ from production.src.pipeline.habit_memory import (
     GRID_ROWS,
     MIN_HISTORICAL_EVENTS,
 )
+from production.src.pipeline.simulator import FEATURE_KEYS as SIMULATOR_FEATURE_KEYS
+from production.src.pipeline.simulator import SUPPORTED_ACTIONS, perturb_features
 from production.src.spatial.control import BiomechanicalPitchControl
 
 logger = logging.getLogger(__name__)
@@ -1286,3 +1288,183 @@ def generate_weak_spot_lifetime_analysis(team_name: str, match_id: int) -> dict:
         "longest_lived_weak_spot": weak_spot_instances[0] if weak_spot_instances else None,
         "total_weak_minutes_by_zone": dict(total_weak_minutes_by_zone),
     }
+
+
+# =============================================================================
+# Weak-Spot Exploitation Recommendation: ADDITIVE ONLY -- closes ONE
+# previously-disclosed gap in `generate_weak_spot_lifetime_analysis` above
+# (unmodified, called nowhere here in a way that changes its own return
+# value): it identifies WHERE a team is weak and for HOW LONG, but says
+# nothing about WHICH tactical action would fix it or HOW CONFIDENT that
+# recommendation should be. This composes 3 EXISTING, UNMODIFIED pieces --
+# `/coach-mode`'s own baseline-vs-perturbed-action ranking computation
+# (`extract_features`, `perturb_features`, `predict_cumulative_incidence`,
+# `load_deterministic_mlp` -- the exact same functions api.py's own
+# `_predict_cumulative_incidence_sync`/`coach_mode` wrap, reimplemented
+# here as direct calls since this reporting module has no access to
+# api.py's own request-scoped async helpers, not because the underlying
+# computation differs) and `DeepEnsembleDeepHit.predict_with_uncertainty`
+# (unmodified -- the SAME member-disagreement mechanism `train.py`'s own
+# uncertainty logging already uses) -- for each of the TOP-N longest-lived
+# weak-spot instances a real `generate_weak_spot_lifetime_analysis` call
+# already found.
+#
+# STEP 0 FINDING, STATED EXPLICITLY: this IS genuinely buildable, but with
+# a real, disclosed scope boundary, not a literal per-cell causal
+# decomposition. `/coach-mode`'s own 4 features (`attacking_control_near_
+# ball`, `defending_control_near_ball`, `attacking_control_final_third`,
+# `space_behind_defending_line`) are WHOLE-FRAME aggregates relative to
+# the ball's own position at one instant -- NOT per-grid-cell values.
+# There is therefore no way to isolate "the contribution of THIS ONE
+# `(col, row)` cell alone" from the model's own prediction; what IS real
+# and available is the match state AT THE MOMENT the weak-spot instance
+# began (a real 360-covered frame located near its own `start_minute`,
+# where -- by construction, since a cell only becomes "active" in
+# `generate_weak_spot_lifetime_analysis`'s own detection loop when the
+# ball is within `BiomechanicalPitchControl`'s own `mask_radius` of it --
+# the ball genuinely WAS near that zone). "Recommended action" here
+# therefore means: the defensive posture `team_name` (always the
+# DEFENDING side for a weak-spot instance, by that function's own
+# existing scope) should adopt to most reduce the model's own predicted
+# threat AT THAT MATCH STATE -- not a provably-isolated fix for that one
+# cell. Stated here, in the dashboard panel, and in this session's own
+# documentation, not left implicit.
+# =============================================================================
+
+# Matches match_timeline_visualizer.MAX_WEAK_SPOTS_PLOTTED's own real
+# readability cap -- the SAME "top-N by duration, not all raw instances"
+# convention already established for this same underlying data, reused
+# here rather than picking an independent number.
+WEAK_SPOT_RECOMMENDATION_TOP_N = 20
+
+
+def _find_defending_frame_at_or_after(
+    events: list, frames_by_event_uuid: dict, team_name: str, period: int, minute: float
+) -> tuple[dict, dict] | None:
+    """First real 360-covered, located event in `period` at or after
+    `minute` where `team_name` is the DEFENDING side (`event["team"]
+    ["name"] != team_name`) -- the same "first-match-at-or-after"
+    real-frame lookup pattern `api.py`'s own
+    `_find_qualifying_frame_for_minute` already establishes for
+    `/simulate`/`/coach-mode`, reimplemented locally here (a reporting
+    module has no business importing api.py's own serving-layer-private
+    helper) with the added defending-side filter this specific
+    composition needs, since a weak-spot instance's own recommendation
+    must be computed from a frame where `team_name` is genuinely
+    defending, not attacking.
+    """
+    for event in sorted(events, key=lambda e: (e["period"], e["index"])):
+        if event["period"] != period:
+            continue
+        if "location" not in event:
+            continue
+        event_minute = event["minute"] + event["second"] / 60.0
+        if event_minute < minute:
+            continue
+        if event.get("team", {}).get("name") == team_name:
+            continue  # team_name is ATTACKING in this frame -- not what a defensive fix needs
+        frame_data = frames_by_event_uuid.get(event["id"])
+        if frame_data is None:
+            continue
+        return event, frame_data
+    return None
+
+
+def add_exploitation_recommendations(weak_spot_result: dict, match_id: int) -> dict:
+    """MUTATES AND RETURNS `weak_spot_result` (a real
+    `generate_weak_spot_lifetime_analysis` output) -- adds a
+    `recommendation` key to each of its TOP `WEAK_SPOT_RECOMMENDATION_TOP_N`
+    `weak_spot_instances` (by `duration_minutes`, already sorted that way
+    by the source function). ADDITIVE ONLY: every existing field on
+    `weak_spot_result` and on each instance is left completely untouched;
+    instances beyond the top-N simply never get a `recommendation` key at
+    all (not set to `None` -- absent, so a caller can distinguish "not
+    computed for this instance" from "computed, but no real frame found").
+
+    See this module's own Step 0 comment (above `WEAK_SPOT_RECOMMENDATION_TOP_N`)
+    for the exact, disclosed scope of what "recommended action" means
+    here.
+
+    Each `recommendation` dict: `{"frame_period", "frame_minute",
+    "baseline_threat_15s", "rankings" (the SAME shape /coach-mode's own
+    endpoint returns: action/simulated_threat_15s/delta, sorted best-first),
+    "recommended_action", "mlp_run_id", "confidence": {
+    "ensemble_std_cumulative_incidence" (the real Deep Ensemble
+    member-disagreement on the RECOMMENDED action's own resulting state --
+    HIGHER means the ensemble's 5 independently-trained members disagree
+    MORE, i.e. LOWER confidence), "ensemble_member_cumulative_incidences"
+    (all 5 real per-member values, not just the summary std),
+    "ensemble_run_id"}}`. `None` (not a dict) if no real defending frame
+    could be located near that instance's own start.
+    """
+    if weak_spot_result.get("no_data"):
+        return weak_spot_result
+
+    team_name = weak_spot_result["team_name"]
+    events = fetch_match_events(match_id)
+    frames = fetch_match_360(match_id)
+    if events is None or frames is None:
+        for instance in weak_spot_result["weak_spot_instances"][:WEAK_SPOT_RECOMMENDATION_TOP_N]:
+            instance["recommendation"] = None
+        return weak_spot_result
+    frames_by_event_uuid = {f["event_uuid"]: f for f in frames}
+
+    mlp_model, mlp_mean, mlp_std, mlp_run_id = load_deterministic_mlp()
+    ensemble_model, ensemble_mean, ensemble_std, ensemble_run_id = load_deterministic_ensemble()
+
+    for instance in weak_spot_result["weak_spot_instances"][:WEAK_SPOT_RECOMMENDATION_TOP_N]:
+        located = _find_defending_frame_at_or_after(
+            events, frames_by_event_uuid, team_name, instance["period"], instance["start_minute"]
+        )
+        if located is None:
+            instance["recommendation"] = None
+            continue
+        event, frame_data = located
+
+        parsed_frame = parse_360_frame(event, frame_data)
+        baseline_features = extract_features(parsed_frame)
+        baseline_threat_15s = predict_cumulative_incidence(
+            mlp_model, baseline_features, mlp_mean, mlp_std, time_bin=DEFAULT_THREAT_TIME_BIN
+        )
+
+        rankings = []
+        for action in SUPPORTED_ACTIONS:
+            simulated_features = perturb_features(baseline_features, action)
+            simulated_threat_15s = predict_cumulative_incidence(
+                mlp_model, simulated_features, mlp_mean, mlp_std, time_bin=DEFAULT_THREAT_TIME_BIN
+            )
+            rankings.append(
+                {
+                    "action": action,
+                    "simulated_threat_15s": simulated_threat_15s,
+                    "delta": simulated_threat_15s - baseline_threat_15s,
+                }
+            )
+        rankings.sort(key=lambda r: r["delta"])
+        recommended_action = rankings[0]["action"]
+
+        recommended_features = perturb_features(baseline_features, recommended_action)
+        recommended_tensor = torch.tensor(
+            [recommended_features[key] for key in SIMULATOR_FEATURE_KEYS], dtype=torch.float32
+        ).unsqueeze(0)
+        normalized_tensor = (recommended_tensor - ensemble_mean) / ensemble_std
+        with torch.no_grad():
+            _, std_cumulative_incidence, per_member_cumulative_incidence = ensemble_model.predict_with_uncertainty(
+                normalized_tensor, time_bin=DEFAULT_THREAT_TIME_BIN
+            )
+
+        instance["recommendation"] = {
+            "frame_period": event["period"],
+            "frame_minute": event["minute"] + event["second"] / 60.0,
+            "baseline_threat_15s": baseline_threat_15s,
+            "rankings": rankings,
+            "recommended_action": recommended_action,
+            "mlp_run_id": mlp_run_id,
+            "confidence": {
+                "ensemble_std_cumulative_incidence": std_cumulative_incidence.item(),
+                "ensemble_member_cumulative_incidences": per_member_cumulative_incidence.squeeze(-1).tolist(),
+                "ensemble_run_id": ensemble_run_id,
+            },
+        }
+
+    return weak_spot_result

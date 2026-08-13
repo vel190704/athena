@@ -51,6 +51,10 @@ from production.src.models.explainer import (
 from production.src.pipeline.feature_extractor import extract_features
 from production.src.pipeline.simulator import perturb_features
 from production.src.pipeline.survival_dataset import FEATURE_KEYS
+from production.src.reporting.decision_quality import (
+    generate_decision_quality_analysis,
+    generate_decision_quality_analysis_aggregated,
+)
 from production.src.reporting.match_report import (
     build_match_report_narrative_prompt,
     generate_automatic_match_report,
@@ -79,6 +83,7 @@ from production.src.reporting.tactical_chat import build_chat_prompt, format_con
 from production.src.reporting.tactical_events import detect_tactical_events
 from production.src.reporting.team_comparison import compare_team_matches, compare_team_seasons
 from production.src.reporting.team_report import (
+    add_exploitation_recommendations,
     generate_team_opposition_analysis,
     generate_team_pass_entropy,
     generate_team_passing_lanes,
@@ -1452,7 +1457,7 @@ async def get_team_opposition_analysis(team_name: str, match_ids: list[int] = Qu
     "/reports/team/{team_name}/weak-spot-lifetime/{match_id}",
     dependencies=[Depends(_require_api_key), Depends(_rate_limit("standard"))],
 )
-async def get_weak_spot_lifetime(team_name: str, match_id: int):
+async def get_weak_spot_lifetime(team_name: str, match_id: int, include_recommendations: bool = False):
     """Wraps team_report.generate_weak_spot_lifetime_analysis, unmodified.
 
     SINGLE match_id in the path (not a `match_ids` query list like the
@@ -1463,7 +1468,24 @@ async def get_weak_spot_lifetime(team_name: str, match_id: int):
     "standard" tier, not "heavy": measured directly against a real full
     match (3857276, ~1229 real defending frames) at ~2.7s -- genuinely
     fast, bounded to one match, not the ~100s-scale multi-match cost that
-    earns the "heavy" tier elsewhere in this file.
+    earns the "heavy" tier elsewhere in this file. With
+    `include_recommendations=true` (see below), real measured cost is
+    ~10s total (loading 2 more models + ~120 additional forward passes
+    across the top-20 instances) -- still comfortably under the "heavy"
+    threshold.
+
+    `include_recommendations` (default False, so this endpoint's DEFAULT
+    behavior and response shape is byte-for-byte unchanged from before
+    this addition): when true, calls `team_report.add_exploitation_recommendations`
+    (also unmodified logic, additive-only against the same real report)
+    to attach a `recommendation` field to the top-20-by-duration weak-spot
+    instances -- see that function's own docstring for exactly what
+    "recommended action" and "confidence" mean here, and its own Step 0
+    comment for the disclosed scope boundary (a real match-state
+    recommendation, not a per-cell causal decomposition). Opt-in, not
+    default-on, specifically so every EXISTING caller/test of this
+    endpoint keeps seeing the exact same response shape and cost it
+    already did.
 
     ADR-021 condition 2: NOT gated by PUBLIC_DEPLOYMENT -- see
     generate_weak_spot_lifetime_analysis's own docstring in team_report.py
@@ -1471,8 +1493,14 @@ async def get_weak_spot_lifetime(team_name: str, match_id: int):
     Analysis addendum for the full exemption reasoning (a time-indexed
     sequence of coarse-zone/duration tuples, no player identity, no
     location finer than the already-exempt season-heatmap's own grid).
+    `add_exploitation_recommendations` introduces no new player identity
+    or precise-location field either -- see this feature's own ADR-021
+    addendum.
     """
-    return await asyncio.to_thread(generate_weak_spot_lifetime_analysis, team_name, match_id)
+    result = await asyncio.to_thread(generate_weak_spot_lifetime_analysis, team_name, match_id)
+    if include_recommendations:
+        result = await asyncio.to_thread(add_exploitation_recommendations, result, match_id)
+    return result
 
 
 @app.get("/reports/team-comparison", dependencies=[Depends(_require_api_key), Depends(_rate_limit("heavy"))])
@@ -1591,6 +1619,49 @@ async def get_match_timeline(match_id: int):
     time introduces any new exposure (it does not).
     """
     return await asyncio.to_thread(generate_match_timeline, match_id)
+
+
+@app.get(
+    "/reports/team/{team_name}/decision-quality/{match_id}",
+    dependencies=[Depends(_require_api_key), Depends(_rate_limit("standard"))],
+)
+async def get_decision_quality(team_name: str, match_id: int):
+    """Wraps decision_quality.generate_decision_quality_analysis (or, in
+    PUBLIC_DEPLOYMENT mode, generate_decision_quality_analysis_aggregated),
+    unmodified. Phase 4's final item -- composes Press Resistance's real
+    per-event pressure/success signal with a real per-decision passing-
+    lane-openness comparison (chosen lane vs. the real best available
+    alternative at that moment) against the real recorded outcome.
+
+    SINGLE match_id in the path, not a `match_ids` query list -- "the best
+    alternative available AT THAT MOMENT" is an inherently single-match,
+    single-frame concept, the same reasoning Weak-Spot Lifetime Analysis/
+    Tactical Event Detection already established for their own within-
+    match data.
+
+    ADR-021 condition-2 compliance (SAME gating decision and pattern as
+    the shot-map/Pass-Network/Passing-Lanes endpoints above, decided ONCE
+    from the module-level PUBLIC_DEPLOYMENT flag): PUBLIC_DEPLOYMENT=false
+    (default) returns generate_decision_quality_analysis's real per-
+    decision data (named player, precise location, chosen/best-alternative
+    openness, outcome) -- the SAME named-individual-plus-precise-location
+    risk pattern Pass Network's/Passing Lanes' own raw variants already
+    established, gated identically here. PUBLIC_DEPLOYMENT=true returns
+    generate_decision_quality_analysis_aggregated's per-player-rate-only
+    variant instead -- the raw `decisions` list (and every individual
+    location/openness value inside it) is never even computed as part of
+    the RETURNED response shape on that path, not merely omitted from an
+    already-built one (the underlying raw computation is still run
+    internally, since the aggregated variant is built by summarizing it --
+    see that function's own docstring for why this mirrors
+    `generate_pass_network_aggregated`'s own established pattern exactly).
+    See docs/adr/ADR-021's own Decision Quality addendum for the full
+    reasoning -- this is the FIRST Phase 4 composition tonight that
+    genuinely needed gating rather than exemption.
+    """
+    if PUBLIC_DEPLOYMENT:
+        return await asyncio.to_thread(generate_decision_quality_analysis_aggregated, team_name, match_id)
+    return await asyncio.to_thread(generate_decision_quality_analysis, team_name, match_id)
 
 
 # ============================================================================

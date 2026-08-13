@@ -1092,3 +1092,108 @@ not gated behind `PUBLIC_DEPLOYMENT` -- consistent with both of its two
 source functions' own existing exemptions, with the cross-signal
 correlation question checked explicitly (not assumed) and found not to
 introduce any new exposure.
+
+## Addendum: Weak-Spot Exploitation Recommendation (`add_exploitation_recommendations`)
+
+Resolved EXEMPT from condition 2 -- checked directly against the field
+list this ADR's own Pass Network addendum already established as the
+actual risk pattern (a NAMED INDIVIDUAL paired with a precise LOCATION),
+not assumed exempt just because its two source computations
+(`/coach-mode`'s ranking, the Deep Ensemble's disagreement) are already
+unconditional/exempt elsewhere.
+
+**What's in a `recommendation` dict, field by field:** `frame_period`/
+`frame_minute` (a real-clock time value -- already the SAME class of
+field Weak-Spot Lifetime Analysis's own `start_minute`/`end_minute`
+already serve unconditionally), `baseline_threat_15s`/`rankings`
+(`action` name + 2 derived scalars, the SAME shape `/coach-mode`'s own
+existing, unconditional endpoint already returns for every caller),
+`recommended_action` (one of 4 fixed strings), `mlp_run_id`/`ensemble_run_id`
+(internal MLflow identifiers for the model artifacts used -- not player or
+match data at all), and `confidence` (a real standard deviation plus 5
+real member-level cumulative-incidence floats -- statistical outputs of a
+model, not observations of any real player or event). **No player name or
+ID appears anywhere in this structure, and no location finer than the
+`(period, minute)` pair already established exempt.** The 4-scalar feature
+vector this recommendation is computed from (`attacking_control_near_ball`,
+etc.) is itself the SAME already-exempt aggregate `/coach-mode`'s own
+existing, unconditional endpoint already exposes for any caller-supplied
+match/minute -- this feature only chooses WHICH minute to query
+(one near a real weak-spot instance's own start) automatically, rather
+than requiring a human to pick it, which changes nothing about what the
+resulting response itself contains.
+
+**Resolution:** `add_exploitation_recommendations` and the
+`include_recommendations` opt-in parameter on
+`GET /reports/team/{team_name}/weak-spot-lifetime/{match_id}` are served
+UNCONDITIONALLY, not gated behind `PUBLIC_DEPLOYMENT` -- consistent with
+both `/coach-mode`'s own existing exemption and Weak-Spot Lifetime
+Analysis's own existing exemption, with the composition checked
+explicitly and found to introduce no new field of either the
+named-individual or precise-location kind.
+
+## Addendum: Decision Quality (`decision_quality.py`)
+
+**Resolved GATED, not exempt** -- the FIRST Phase 4 composition this
+session that genuinely needed the raw/aggregated split, not a "checked
+and found safe" confirmation like every other addendum above. Checked
+explicitly, per this task's own instruction, rather than assumed exempt
+just because its two INPUT signals (Press Resistance, Passing Lane
+Visualizer) are each already exempt/gated appropriately on their own.
+
+**Why the composition itself is different from its inputs.** Press
+Resistance Index is exempt because its own output is a pure per-player
+RATE, with no location or individual event ever enumerated. Passing Lane
+Visualizer already has BOTH treatments depending on the field: its `lanes`
+field (named pair + score, no location) is exempt; its `nodes` field
+(named player + precise average location) is gated, for the EXACT reason
+this ADR's own Pass Network addendum first established (a named
+individual paired with a precise location is individually-attributable).
+Decision Quality's own RAW output is not a rate and not a season average
+-- it is, BY THE QUESTION ITSELF ("was THIS player's choice AT THIS
+MOMENT the right one"), a per-decision record: a named player
+(`player_id`/`player_name`), their own precise, single-instant location
+(`location`, the real StatsBomb pass-event coordinate, not an average),
+and a real derived score (`chosen_lane_openness`/`best_alternative_lane_openness`/
+`openness_gap`). This is structurally the Pass-Network/`nodes` risk
+pattern exactly -- a named individual's own precise location, individually
+attributable to one real, identifiable moment -- not the Press-Resistance-
+Index shape its own per-event pressure/success SIGNAL happens to be
+sourced from. Reusing an already-exempt SIGNAL does not automatically make
+a NEW composition of it exempt; the composition's own output shape is
+what actually governs, and this one names a location.
+
+**Resolution, mirroring Pass Network's/Passing Lanes' own established
+raw/aggregated split exactly (ADR-014's precedent: scope the constraint,
+do not remove the capability):**
+- `decision_quality.generate_decision_quality_analysis` (raw, real
+  per-decision `location`/`player_name`/openness values) is LOCAL/PRIVATE
+  USE ONLY.
+- `decision_quality.generate_decision_quality_analysis_aggregated` is the
+  condition-2-compliant counterpart -- real per-PLAYER TOTALS only
+  (`total_decisions`, `good_decision_count`, `successful_count`, and their
+  derived shares), no location, no individual decision -- the SAME
+  aggregate-rate-plus-name shape Press Resistance Index's/Pass Network's
+  own aggregated `player_summary` already established as exempt (a named
+  individual + a rate, no location, no pairwise anything).
+- `GET /reports/team/{team_name}/decision-quality/{match_id}` follows the
+  SAME `PUBLIC_DEPLOYMENT` branching pattern the shot map/Pass Network/
+  Passing Lanes/touch-map endpoints already established: the raw variant
+  is served only when `PUBLIC_DEPLOYMENT` is unset; the aggregated variant
+  otherwise. Verified directly against the real raw HTTP response body
+  (not just the parsed dict) under both flag states -- see
+  `test_api.py::test_decision_quality_endpoint_public_deployment_serves_aggregated_only_no_raw_leak`.
+- The dashboard panel mirrors the shot map/Pass Network panels' own exact
+  defense-in-depth check: inspects whether the actual API response still
+  carries a raw `decisions` field, and fails closed (a visible
+  configuration error, nothing rendered) if its own flag says public but
+  the response says otherwise.
+
+Not chosen: exempting Decision Quality unconditionally on the theory that
+its two SOURCE signals are each already safe. Rejected because that
+reasoning proves too much -- Pass Network's own raw `nodes` field is ALSO
+"just" an average of already-individually-legal `location` values, and
+this ADR already rejected that exact argument once; a composition's own
+condition-2 status must be checked against what IT outputs, not
+inherited from its inputs' own separate, individually-correct
+resolutions.

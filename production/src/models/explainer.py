@@ -142,6 +142,81 @@ def load_deterministic_mlp() -> tuple[torch.nn.Module, torch.Tensor, torch.Tenso
     return model, normalization_mean, normalization_std, run_id
 
 
+def select_deterministic_ensemble_run_id() -> str:
+    """The `DeepEnsembleDeepHit` sibling of `select_deterministic_mlp_run_id`
+    above -- SAME explicit-filter, lowest-`val_brier_15s` selection rule,
+    just against `model_type = 'DeepEnsemble_MLP'` (the tag
+    `train.py::_train_and_log_deep_ensemble` logs, confirmed directly
+    against this project's real MLflow store before writing this function
+    -- 3 real runs found, all `stabilization_bundle='True'`,
+    `saturation_check_v2='True'`) instead of `'MLP'`. Added here
+    (additive only) because no serving-layer loader for the trained
+    ensemble existed anywhere in this project before now -- `train.py`
+    logs it, but only `load_deterministic_mlp` above had a matching
+    inference-time loader, for the single MLP specifically.
+    """
+    mlflow.set_tracking_uri("file:./mlruns")
+    client = mlflow.tracking.MlflowClient()
+    experiment = client.get_experiment_by_name(MLFLOW_EXPERIMENT_NAME)
+    if experiment is None:
+        raise RuntimeError(
+            f"MLflow experiment {MLFLOW_EXPERIMENT_NAME!r} not found -- run "
+            "`python -m production.src.pipeline.train` at least once first."
+        )
+
+    runs = client.search_runs(
+        [experiment.experiment_id],
+        filter_string=(
+            "params.model_type = 'DeepEnsemble_MLP' and params.stabilization_bundle = 'True' "
+            "and params.saturation_check_v2 = 'True'"
+        ),
+        order_by=["metrics.val_brier_15s ASC"],
+    )
+    if not runs:
+        raise RuntimeError(
+            "No DeepEnsemble run found tagged model_type=DeepEnsemble_MLP, stabilization_bundle=True, "
+            "saturation_check_v2=True -- run `python -m production.src.pipeline.train` first."
+        )
+
+    selected = runs[0]
+    logger.info(
+        f"Selected DeepEnsemble run_id={selected.info.run_id} "
+        f"(lowest val_brier_15s={selected.data.metrics.get('val_brier_15s')}, "
+        f"among {len(runs)} matching run(s))"
+    )
+    return selected.info.run_id
+
+
+def load_deterministic_ensemble() -> tuple[torch.nn.Module, torch.Tensor, torch.Tensor, str]:
+    """`load_deterministic_mlp`'s sibling for the Deep Ensemble -- same
+    shape, same normalization-artifact loading (`train.py`'s own
+    `_train_and_log_deep_ensemble` logs it under the identical
+    `artifact_path="normalization"` convention), only the MLflow artifact
+    name differs (`deep_ensemble_model`, matching
+    `mlflow.pytorch.log_model(model, name="deep_ensemble_model", ...)` in
+    `train.py`).
+
+    Returns (ensemble_model, normalization_mean, normalization_std, run_id).
+    `ensemble_model` is a real `DeepEnsembleDeepHit` -- unmodified, only
+    loaded here, not altered -- its own `predict_with_uncertainty` method
+    is the caller's route to real member-disagreement values.
+    """
+    run_id = select_deterministic_ensemble_run_id()
+
+    model = mlflow.pytorch.load_model(f"runs:/{run_id}/deep_ensemble_model")
+    model.eval()
+
+    local_dir = mlflow.artifacts.download_artifacts(run_id=run_id, artifact_path="normalization")
+    json_file = next(Path(local_dir).glob("*.json"))
+    with open(json_file) as f:
+        stats = json.load(f)
+
+    normalization_mean = torch.tensor(stats["mean"], dtype=torch.float32)
+    normalization_std = torch.tensor(stats["std"], dtype=torch.float32)
+
+    return model, normalization_mean, normalization_std, run_id
+
+
 def _cumulative_incidence_forward(model: torch.nn.Module, x: torch.Tensor, time_bin: int = 3) -> torch.Tensor:
     """model(x) -> PMF -> inclusive cumsum -> cumulative incidence at
     `time_bin`, as a [batch] tensor. Same convention as Milestones 8/13:
