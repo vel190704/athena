@@ -38,6 +38,7 @@ import pytest
 import requests
 import streamlit as st
 import uvicorn
+from streamlit.runtime.media_file_manager import MediaFileManager
 from streamlit.testing.v1 import AppTest
 
 from fastapi.testclient import TestClient
@@ -100,17 +101,20 @@ def live_api_server():
     thread.join(timeout=10)
 
 
-def test_dashboard_loads_all_nine_tabs_no_exception():
-    """Was "...seven tabs..." until this session's Automatic Match Report
-    and AI Tactical Chat tabs were appended (both AFTER every pre-existing
-    tab, so no existing tab's index shifted -- see e.g. `at.tabs[2]` still
-    resolving to Team Reports in other tests in this file)."""
+def test_dashboard_loads_all_ten_tabs_no_exception():
+    """Was "...nine tabs..." until this session's Home tab was added.
+    Unlike every prior tab addition (Match Report/Tactical Chat, appended
+    AFTER every pre-existing tab so no existing index shifted), Home is
+    inserted FIRST/leftmost by design -- so every existing `at.tabs[N]`
+    index used elsewhere in this file shifts by +1 (see e.g. `at.tabs[3]`
+    now resolving to Team Reports, previously `at.tabs[2]`)."""
     at = AppTest.from_file(DASHBOARD_PATH)
     at.run(timeout=APP_TIMEOUT_SECONDS)
 
     assert not at.exception
-    assert len(at.tabs) == 9
+    assert len(at.tabs) == 10
     headers = [h.value for tab in at.tabs for h in tab.header]
+    assert "Home" in headers
     assert "Player Report" in headers
     assert "Team Report" in headers
     assert "Team Trend Report (football-data.co.uk)" in headers
@@ -119,6 +123,92 @@ def test_dashboard_loads_all_nine_tabs_no_exception():
     assert "Alerts History" in headers
     assert "Automatic Match Report" in headers
     assert "AI Tactical Chat" in headers
+
+
+# ============================================================================
+# Home tab (new, this session): a pure read-only orientation layer. Real
+# HTTP through `live_api_server`, same discipline as the Alerts History/
+# Player/Team Reports tabs above (ADR-018) -- `/health`, `/metrics`,
+# `/alerts/history` are all real endpoints on the real FastAPI app, not
+# mocked. `_isolated_alerts_db` keeps this test's logged alerts out of the
+# real `data/app_state/alerts.db`, same as the Alerts History tests.
+# ============================================================================
+
+
+def test_home_tab_renders_real_status_coverage_activity_and_quick_action(live_api_server, _isolated_alerts_db):
+    alert_store_module.log_alert(
+        source="statsbomb", match_id=3857276, video_path=None, minute=10.0,
+        threat_before=0.05, threat_after=0.20, explanation_text="home tab test alert", explanation_source="mock",
+    )
+    st.cache_data.clear()
+
+    at = AppTest.from_file(DASHBOARD_PATH)
+    at.run(timeout=APP_TIMEOUT_SECONDS)
+    at.sidebar.text_input[0].set_value(live_api_server)
+    at.run(timeout=APP_TIMEOUT_SECONDS)
+
+    assert not at.exception
+    home_tab = at.tabs[0]
+    assert home_tab.header[0].value == "Home"
+
+    # --- System status: real /health + /metrics data, not mocked --------
+    subheaders = [s.value for s in home_tab.subheader]
+    assert "System Status" in subheaders
+    metric_labels = [m.label for m in home_tab.metric]
+    assert "Backend Status" in metric_labels
+    backend_status_metric = next(m for m in home_tab.metric if m.label == "Backend Status")
+    assert backend_status_metric.value == "ok"
+    model_loaded_metric = next(m for m in home_tab.metric if m.label == "Model Loaded")
+    assert model_loaded_metric.value == "Yes"
+
+    # --- Data coverage: real candidate_index scan, not fabricated --------
+    assert "Data Coverage" in subheaders
+    players_metric = next(m for m in home_tab.metric if m.label == "Players Cached")
+    teams_metric = next(m for m in home_tab.metric if m.label == "Teams Cached")
+    matches_metric = next(m for m in home_tab.metric if m.label == "Matches Cached")
+    matches_360_metric = next(m for m in home_tab.metric if m.label == "Matches with 360 Coverage")
+    assert int(players_metric.value) > 0
+    assert int(teams_metric.value) > 0
+    assert int(matches_metric.value) > 0
+    # Real invariant, not an assumed fixed number: 360 coverage is a subset of all cached matches.
+    assert int(matches_360_metric.value) <= int(matches_metric.value)
+
+    # --- Recent activity: the real alert just logged above ---------------
+    assert "Recent Activity" in subheaders
+    assert len(home_tab.dataframe) == 1
+    df = home_tab.dataframe[0].value
+    assert df.shape[0] == 1
+    assert df["Match ID"].tolist() == [3857276]
+
+    # --- Quick action: sets the shared Match Report match_id field -------
+    assert len(home_tab.button) == 1
+    assert "3857276" in home_tab.button[0].label
+    home_tab.button[0].click()
+    at.run(timeout=APP_TIMEOUT_SECONDS)
+
+    assert not at.exception
+    match_report_tab = at.tabs[8]
+    assert match_report_tab.text_input[0].value == "3857276"
+
+
+def test_home_tab_no_alerts_shows_info_not_broken_table(live_api_server, _isolated_alerts_db):
+    """An empty, isolated alerts db -- Home's Recent Activity section must
+    render a clean info message and offer no quick-action button, the same
+    'no alerts found' honesty the Alerts History tab's own empty-state test
+    establishes, rather than a broken/empty dataframe or a fabricated
+    shortcut."""
+    st.cache_data.clear()
+
+    at = AppTest.from_file(DASHBOARD_PATH)
+    at.run(timeout=APP_TIMEOUT_SECONDS)
+    at.sidebar.text_input[0].set_value(live_api_server)
+    at.run(timeout=APP_TIMEOUT_SECONDS)
+
+    assert not at.exception
+    home_tab = at.tabs[0]
+    assert len(home_tab.dataframe) == 0
+    assert any("No alerts logged yet" in i.value for i in home_tab.info)
+    assert len(home_tab.button) == 0
 
 
 def test_team_reports_tab_data_tiering_note_renders_statically_no_backend_needed():
@@ -137,7 +227,7 @@ def test_team_reports_tab_data_tiering_note_renders_statically_no_backend_needed
     at.run(timeout=APP_TIMEOUT_SECONDS)
 
     assert not at.exception
-    team_tab = at.tabs[2]
+    team_tab = at.tabs[3]
     info_texts = [i.value for i in team_tab.info]
     assert any("360 freeze-frame coverage" in t and "Tactical Entropy" in t for t in info_texts)
     assert any("event-data-only" in t for t in info_texts)
@@ -415,14 +505,14 @@ def test_player_reports_tab_low_sample_warning_renders_real_data(live_api_server
     at.run(timeout=APP_TIMEOUT_SECONDS)
     at.sidebar.text_input[0].set_value(live_api_server)
 
-    player_tab = at.tabs[1]
+    player_tab = at.tabs[2]
     cho_label = next(o for o in player_tab.selectbox[0].options if "(99479)" in o)
     player_tab.selectbox[0].set_value(cho_label)
     at.run(timeout=APP_TIMEOUT_SECONDS)
-    player_tab = at.tabs[1]
+    player_tab = at.tabs[2]
     player_tab.button[0].click()
     at.run(timeout=APP_TIMEOUT_SECONDS)
-    player_tab = at.tabs[1]
+    player_tab = at.tabs[2]
 
     assert not at.exception
     assert len(player_tab.warning) >= 1
@@ -445,14 +535,14 @@ def test_player_reports_tab_well_supported_no_false_positive_warning_real_data(l
     at.run(timeout=APP_TIMEOUT_SECONDS)
     at.sidebar.text_input[0].set_value(live_api_server)
 
-    player_tab = at.tabs[1]
+    player_tab = at.tabs[2]
     messi_label = next(o for o in player_tab.selectbox[0].options if "(5503)" in o)
     player_tab.selectbox[0].set_value(messi_label)
     at.run(timeout=APP_TIMEOUT_SECONDS)
-    player_tab = at.tabs[1]
+    player_tab = at.tabs[2]
     player_tab.button[0].click()
     at.run(timeout=APP_TIMEOUT_SECONDS)
-    player_tab = at.tabs[1]
+    player_tab = at.tabs[2]
 
     assert not at.exception
     assert len(player_tab.warning) == 0
@@ -495,14 +585,14 @@ def test_player_reports_shot_map_panel_renders_aggregated_when_public_deployment
     at.run(timeout=APP_TIMEOUT_SECONDS)
     at.sidebar.text_input[0].set_value(live_api_server)
 
-    player_tab = at.tabs[1]
+    player_tab = at.tabs[2]
     messi_label = next(o for o in player_tab.selectbox[0].options if "(5503)" in o)
     player_tab.selectbox[0].set_value(messi_label)
     at.run(timeout=APP_TIMEOUT_SECONDS)
-    player_tab = at.tabs[1]
+    player_tab = at.tabs[2]
     player_tab.button[0].click()
     at.run(timeout=APP_TIMEOUT_SECONDS)
-    player_tab = at.tabs[1]
+    player_tab = at.tabs[2]
 
     assert not at.exception
     # No "Configuration error" fail-closed message -- both flags agree, so
@@ -542,14 +632,14 @@ def test_player_reports_shot_map_panel_unaffected_when_public_deployment_unset(l
     at.run(timeout=APP_TIMEOUT_SECONDS)
     at.sidebar.text_input[0].set_value(live_api_server)
 
-    player_tab = at.tabs[1]
+    player_tab = at.tabs[2]
     messi_label = next(o for o in player_tab.selectbox[0].options if "(5503)" in o)
     player_tab.selectbox[0].set_value(messi_label)
     at.run(timeout=APP_TIMEOUT_SECONDS)
-    player_tab = at.tabs[1]
+    player_tab = at.tabs[2]
     player_tab.button[0].click()
     at.run(timeout=APP_TIMEOUT_SECONDS)
-    player_tab = at.tabs[1]
+    player_tab = at.tabs[2]
 
     assert not at.exception
     # 4 images now: player report, shot map (raw scatter), Touch Map
@@ -581,14 +671,14 @@ def test_player_reports_shot_map_panel_fails_closed_on_mismatched_flags(live_api
     at.run(timeout=APP_TIMEOUT_SECONDS)
     at.sidebar.text_input[0].set_value(live_api_server)
 
-    player_tab = at.tabs[1]
+    player_tab = at.tabs[2]
     messi_label = next(o for o in player_tab.selectbox[0].options if "(5503)" in o)
     player_tab.selectbox[0].set_value(messi_label)
     at.run(timeout=APP_TIMEOUT_SECONDS)
-    player_tab = at.tabs[1]
+    player_tab = at.tabs[2]
     player_tab.button[0].click()
     at.run(timeout=APP_TIMEOUT_SECONDS)
-    player_tab = at.tabs[1]
+    player_tab = at.tabs[2]
 
     assert not at.exception
     # 3 configuration errors now: shot map, Touch Map, and Key-Event
@@ -627,19 +717,19 @@ def test_player_dashboard_renders_real_data_default_local_private(live_api_serve
     at.run(timeout=APP_TIMEOUT_SECONDS)
     at.sidebar.text_input[0].set_value(live_api_server)
 
-    player_tab = at.tabs[1]
+    player_tab = at.tabs[2]
     messi_label = next(o for o in player_tab.selectbox[0].options if "(5503)" in o)
     player_tab.selectbox[0].set_value(messi_label)
     at.run(timeout=APP_TIMEOUT_SECONDS)
-    player_tab = at.tabs[1]
+    player_tab = at.tabs[2]
     season_multiselect = player_tab.multiselect[0]
     early_season_label = next(o for o in season_multiselect.options if "2004/2005" in o)
     season_multiselect.set_value([early_season_label])
     at.run(timeout=APP_TIMEOUT_SECONDS)
-    player_tab = at.tabs[1]
+    player_tab = at.tabs[2]
     player_tab.button[0].click()
     at.run(timeout=APP_TIMEOUT_SECONDS)
-    player_tab = at.tabs[1]
+    player_tab = at.tabs[2]
 
     assert not at.exception
     assert len(player_tab.error) == 0
@@ -668,19 +758,19 @@ def test_player_dashboard_touch_map_and_timeline_render_aggregated_when_public_d
     at.run(timeout=APP_TIMEOUT_SECONDS)
     at.sidebar.text_input[0].set_value(live_api_server)
 
-    player_tab = at.tabs[1]
+    player_tab = at.tabs[2]
     messi_label = next(o for o in player_tab.selectbox[0].options if "(5503)" in o)
     player_tab.selectbox[0].set_value(messi_label)
     at.run(timeout=APP_TIMEOUT_SECONDS)
-    player_tab = at.tabs[1]
+    player_tab = at.tabs[2]
     season_multiselect = player_tab.multiselect[0]
     early_season_label = next(o for o in season_multiselect.options if "2004/2005" in o)
     season_multiselect.set_value([early_season_label])
     at.run(timeout=APP_TIMEOUT_SECONDS)
-    player_tab = at.tabs[1]
+    player_tab = at.tabs[2]
     player_tab.button[0].click()
     at.run(timeout=APP_TIMEOUT_SECONDS)
-    player_tab = at.tabs[1]
+    player_tab = at.tabs[2]
 
     assert not at.exception
     assert not any("Configuration error" in e.value for e in player_tab.error)
@@ -705,19 +795,19 @@ def test_player_dashboard_touch_map_and_timeline_unaffected_when_public_deployme
     at.run(timeout=APP_TIMEOUT_SECONDS)
     at.sidebar.text_input[0].set_value(live_api_server)
 
-    player_tab = at.tabs[1]
+    player_tab = at.tabs[2]
     messi_label = next(o for o in player_tab.selectbox[0].options if "(5503)" in o)
     player_tab.selectbox[0].set_value(messi_label)
     at.run(timeout=APP_TIMEOUT_SECONDS)
-    player_tab = at.tabs[1]
+    player_tab = at.tabs[2]
     season_multiselect = player_tab.multiselect[0]
     early_season_label = next(o for o in season_multiselect.options if "2004/2005" in o)
     season_multiselect.set_value([early_season_label])
     at.run(timeout=APP_TIMEOUT_SECONDS)
-    player_tab = at.tabs[1]
+    player_tab = at.tabs[2]
     player_tab.button[0].click()
     at.run(timeout=APP_TIMEOUT_SECONDS)
-    player_tab = at.tabs[1]
+    player_tab = at.tabs[2]
 
     assert not at.exception
     assert len(player_tab.image) == 4
@@ -738,19 +828,19 @@ def test_player_dashboard_touch_map_and_timeline_fail_closed_on_mismatched_flags
     at.run(timeout=APP_TIMEOUT_SECONDS)
     at.sidebar.text_input[0].set_value(live_api_server)
 
-    player_tab = at.tabs[1]
+    player_tab = at.tabs[2]
     messi_label = next(o for o in player_tab.selectbox[0].options if "(5503)" in o)
     player_tab.selectbox[0].set_value(messi_label)
     at.run(timeout=APP_TIMEOUT_SECONDS)
-    player_tab = at.tabs[1]
+    player_tab = at.tabs[2]
     season_multiselect = player_tab.multiselect[0]
     early_season_label = next(o for o in season_multiselect.options if "2004/2005" in o)
     season_multiselect.set_value([early_season_label])
     at.run(timeout=APP_TIMEOUT_SECONDS)
-    player_tab = at.tabs[1]
+    player_tab = at.tabs[2]
     player_tab.button[0].click()
     at.run(timeout=APP_TIMEOUT_SECONDS)
-    player_tab = at.tabs[1]
+    player_tab = at.tabs[2]
 
     assert not at.exception
     # 3 configuration errors: shot map, touch map, timeline all fail closed.
@@ -809,20 +899,20 @@ def test_player_reports_tab_season_subselector_produces_distinct_reports_real_da
     at.run(timeout=APP_TIMEOUT_SECONDS)
     at.sidebar.text_input[0].set_value(live_api_server)
 
-    player_tab = at.tabs[1]
+    player_tab = at.tabs[2]
     messi_label = next(o for o in player_tab.selectbox[0].options if "(5503)" in o)
     player_tab.selectbox[0].set_value(messi_label)
     at.run(timeout=APP_TIMEOUT_SECONDS)
-    player_tab = at.tabs[1]
+    player_tab = at.tabs[2]
 
     season_multiselect = player_tab.multiselect[0]
     early_season_label = next(o for o in season_multiselect.options if "2004/2005" in o)
     season_multiselect.set_value([early_season_label])
     at.run(timeout=APP_TIMEOUT_SECONDS)
-    player_tab = at.tabs[1]
+    player_tab = at.tabs[2]
     player_tab.button[0].click()
     at.run(timeout=APP_TIMEOUT_SECONDS)
-    player_tab = at.tabs[1]
+    player_tab = at.tabs[2]
 
     assert not at.exception
     early_report = json.loads(player_tab.json[0].value)
@@ -864,14 +954,14 @@ def test_team_reports_tab_renders_real_data(live_api_server):
     at.run(timeout=APP_TIMEOUT_SECONDS)
     at.sidebar.text_input[0].set_value(live_api_server)
 
-    team_tab = at.tabs[2]
+    team_tab = at.tabs[3]
     leverkusen_label = next(o for o in team_tab.selectbox[0].options if o.startswith("Bayer Leverkusen "))
     team_tab.selectbox[0].set_value(leverkusen_label)
     at.run(timeout=APP_TIMEOUT_SECONDS)
-    team_tab = at.tabs[2]
+    team_tab = at.tabs[3]
     team_tab.button[0].click()
     at.run(timeout=APP_TIMEOUT_SECONDS)
-    team_tab = at.tabs[2]
+    team_tab = at.tabs[3]
 
     assert not at.exception
     # 2 images, not 1: the pitch-control Team Report's own image, PLUS
@@ -898,15 +988,15 @@ def test_team_reports_tab_low_sample_warning_fires_for_real_low_sample_team_real
     at.run(timeout=APP_TIMEOUT_SECONDS)
     at.sidebar.text_input[0].set_value(live_api_server)
 
-    team_tab = at.tabs[2]
+    team_tab = at.tabs[3]
     real_madrid_label = next(o for o in team_tab.selectbox[0].options if o.startswith("Real Madrid "))
     assert "LOW SAMPLE" in real_madrid_label, f"dropdown label should already flag this: {real_madrid_label!r}"
     team_tab.selectbox[0].set_value(real_madrid_label)
     at.run(timeout=APP_TIMEOUT_SECONDS)
-    team_tab = at.tabs[2]
+    team_tab = at.tabs[3]
     team_tab.button[0].click()
     at.run(timeout=APP_TIMEOUT_SECONDS)
-    team_tab = at.tabs[2]
+    team_tab = at.tabs[3]
 
     assert not at.exception
     # 2 images, not 1: the pitch-control Team Report's own image, PLUS
@@ -940,11 +1030,11 @@ def test_team_reports_tab_default_selection_is_single_most_recent_season_real_da
     at = AppTest.from_file(DASHBOARD_PATH)
     at.run(timeout=APP_TIMEOUT_SECONDS)
 
-    team_tab = at.tabs[2]
+    team_tab = at.tabs[3]
     real_madrid_label = next(o for o in team_tab.selectbox[0].options if o.startswith("Real Madrid "))
     team_tab.selectbox[0].set_value(real_madrid_label)
     at.run(timeout=APP_TIMEOUT_SECONDS)
-    team_tab = at.tabs[2]
+    team_tab = at.tabs[3]
 
     season_multiselect = team_tab.multiselect[0]
     assert len(season_multiselect.options) == 22, "test assumption: Real Madrid has 22 cached seasons"
@@ -966,16 +1056,16 @@ def test_team_reports_tab_warns_before_generate_click_for_wasteful_selection_rea
     at = AppTest.from_file(DASHBOARD_PATH)
     at.run(timeout=APP_TIMEOUT_SECONDS)
 
-    team_tab = at.tabs[2]
+    team_tab = at.tabs[3]
     real_madrid_label = next(o for o in team_tab.selectbox[0].options if o.startswith("Real Madrid "))
     team_tab.selectbox[0].set_value(real_madrid_label)
     at.run(timeout=APP_TIMEOUT_SECONDS)
-    team_tab = at.tabs[2]
+    team_tab = at.tabs[3]
 
     season_multiselect = team_tab.multiselect[0]
     season_multiselect.set_value(season_multiselect.options)  # reproduce the exact reported failure shape
     at.run(timeout=APP_TIMEOUT_SECONDS)
-    team_tab = at.tabs[2]
+    team_tab = at.tabs[3]
 
     # No button click yet -- this warning must already be visible.
     assert any("71 cached match(es)" in w.value and "2 have the 360" in w.value for w in team_tab.warning), (
@@ -1002,21 +1092,21 @@ def test_team_reports_tab_reproduces_and_fixes_timeout_incident_real_data(live_a
     at.run(timeout=APP_TIMEOUT_SECONDS)
     at.sidebar.text_input[0].set_value(live_api_server)
 
-    team_tab = at.tabs[2]
+    team_tab = at.tabs[3]
     real_madrid_label = next(o for o in team_tab.selectbox[0].options if o.startswith("Real Madrid "))
     team_tab.selectbox[0].set_value(real_madrid_label)
     at.run(timeout=APP_TIMEOUT_SECONDS)
-    team_tab = at.tabs[2]
+    team_tab = at.tabs[3]
     season_multiselect = team_tab.multiselect[0]
     season_multiselect.set_value(season_multiselect.options)
     at.run(timeout=APP_TIMEOUT_SECONDS)
-    team_tab = at.tabs[2]
+    team_tab = at.tabs[3]
 
     start = time.monotonic()
     team_tab.button[0].click()
     at.run(timeout=APP_TIMEOUT_SECONDS)
     elapsed = time.monotonic() - start
-    team_tab = at.tabs[2]
+    team_tab = at.tabs[3]
 
     assert not at.exception
     assert elapsed < 30.0, f"took {elapsed:.1f}s -- the whole point of this fix was to make this fast, not just not-timeout"
@@ -1043,15 +1133,15 @@ def test_team_reports_tab_caps_large_valid_selection_real_data(live_api_server):
     at.run(timeout=APP_TIMEOUT_SECONDS)
     at.sidebar.text_input[0].set_value(live_api_server)
 
-    team_tab = at.tabs[2]
+    team_tab = at.tabs[3]
     psg_label = next(o for o in team_tab.selectbox[0].options if o.startswith("Paris Saint-Germain "))
     team_tab.selectbox[0].set_value(psg_label)
     at.run(timeout=APP_TIMEOUT_SECONDS)
-    team_tab = at.tabs[2]
+    team_tab = at.tabs[3]
     season_multiselect = team_tab.multiselect[0]
     season_multiselect.set_value(season_multiselect.options)
     at.run(timeout=APP_TIMEOUT_SECONDS)
-    team_tab = at.tabs[2]
+    team_tab = at.tabs[3]
 
     assert any("capped to 25" in w.value for w in team_tab.warning), (
         f"expected a pre-generation cap warning, got: {[w.value for w in team_tab.warning]}"
@@ -1059,7 +1149,7 @@ def test_team_reports_tab_caps_large_valid_selection_real_data(live_api_server):
 
     team_tab.button[0].click()
     at.run(timeout=APP_TIMEOUT_SECONDS)
-    team_tab = at.tabs[2]
+    team_tab = at.tabs[3]
 
     assert not at.exception
     # 2 images, not 1: the pitch-control Team Report's own image, PLUS
@@ -1080,16 +1170,16 @@ def test_team_comparison_tab_reliability_caveat_renders_as_error_real_data(live_
     at.run(timeout=APP_TIMEOUT_SECONDS)
     at.sidebar.text_input[0].set_value(live_api_server)
 
-    compare_tab = at.tabs[4]
+    compare_tab = at.tabs[5]
     compare_tab.text_input[0].set_value("Real Madrid")
     compare_tab.number_input[0].set_value(2016)
     compare_tab.text_input[1].set_value("Barcelona")
     compare_tab.number_input[1].set_value(2008)
     at.run(timeout=APP_TIMEOUT_SECONDS)
-    compare_tab = at.tabs[4]
+    compare_tab = at.tabs[5]
     compare_tab.button[0].click()
     at.run(timeout=APP_TIMEOUT_SECONDS)
-    compare_tab = at.tabs[4]
+    compare_tab = at.tabs[5]
 
     assert not at.exception
     assert len(compare_tab.error) == 1
@@ -1103,17 +1193,17 @@ def test_team_trends_tab_gap_seasons_render_and_compliance_caption_visible_real_
     at = AppTest.from_file(DASHBOARD_PATH)
     at.run(timeout=APP_TIMEOUT_SECONDS)
 
-    trends_tab = at.tabs[3]
+    trends_tab = at.tabs[4]
     assert any("personal, non-distributed research" in c.value for c in trends_tab.caption)
 
     trends_tab.text_input[0].set_value("Norwich")
     trends_tab.number_input[0].set_value(2018)
     trends_tab.number_input[1].set_value(2025)
     at.run(timeout=APP_TIMEOUT_SECONDS)
-    trends_tab = at.tabs[3]
+    trends_tab = at.tabs[4]
     trends_tab.button[0].click()
     at.run(timeout=APP_TIMEOUT_SECONDS)
-    trends_tab = at.tabs[3]
+    trends_tab = at.tabs[4]
 
     assert not at.exception
     assert len(trends_tab.warning) == 1
@@ -1129,7 +1219,7 @@ def test_team_trends_tab_compare_two_seasons_real_data():
     at = AppTest.from_file(DASHBOARD_PATH)
     at.run(timeout=APP_TIMEOUT_SECONDS)
 
-    trends_tab = at.tabs[3]
+    trends_tab = at.tabs[4]
     # The negative-delta clarification caption (Feature 3.5) must be
     # visible before any button is even clicked -- not buried behind a
     # result the user might never trigger.
@@ -1141,7 +1231,7 @@ def test_team_trends_tab_compare_two_seasons_real_data():
     # straight through with no changes is itself a real test case.
     trends_tab.button[1].click()
     at.run(timeout=APP_TIMEOUT_SECONDS)
-    trends_tab = at.tabs[3]
+    trends_tab = at.tabs[4]
 
     assert not at.exception
     assert len(trends_tab.image) == 1
@@ -1175,13 +1265,13 @@ def test_pass_network_tab_renders_real_data_default_local_private(live_api_serve
     at.run(timeout=APP_TIMEOUT_SECONDS)
     at.sidebar.text_input[0].set_value(live_api_server)
 
-    pn_tab = at.tabs[5]
+    pn_tab = at.tabs[6]
     pn_tab.text_input[0].set_value(PASS_NETWORK_MATCH_ID)
     at.run(timeout=APP_TIMEOUT_SECONDS)
-    pn_tab = at.tabs[5]
+    pn_tab = at.tabs[6]
     pn_tab.button[0].click()
     at.run(timeout=APP_TIMEOUT_SECONDS)
-    pn_tab = at.tabs[5]
+    pn_tab = at.tabs[6]
 
     assert not at.exception
     assert len(pn_tab.error) == 0
@@ -1203,13 +1293,13 @@ def test_pass_network_tab_renders_aggregated_when_public_deployment_set(live_api
     at.run(timeout=APP_TIMEOUT_SECONDS)
     at.sidebar.text_input[0].set_value(live_api_server)
 
-    pn_tab = at.tabs[5]
+    pn_tab = at.tabs[6]
     pn_tab.text_input[0].set_value(PASS_NETWORK_MATCH_ID)
     at.run(timeout=APP_TIMEOUT_SECONDS)
-    pn_tab = at.tabs[5]
+    pn_tab = at.tabs[6]
     pn_tab.button[0].click()
     at.run(timeout=APP_TIMEOUT_SECONDS)
-    pn_tab = at.tabs[5]
+    pn_tab = at.tabs[6]
 
     assert not at.exception
     assert not any("Configuration error" in e.value for e in pn_tab.error)
@@ -1233,13 +1323,13 @@ def test_pass_network_tab_unaffected_when_public_deployment_unset(live_api_serve
     at.run(timeout=APP_TIMEOUT_SECONDS)
     at.sidebar.text_input[0].set_value(live_api_server)
 
-    pn_tab = at.tabs[5]
+    pn_tab = at.tabs[6]
     pn_tab.text_input[0].set_value(PASS_NETWORK_MATCH_ID)
     at.run(timeout=APP_TIMEOUT_SECONDS)
-    pn_tab = at.tabs[5]
+    pn_tab = at.tabs[6]
     pn_tab.button[0].click()
     at.run(timeout=APP_TIMEOUT_SECONDS)
-    pn_tab = at.tabs[5]
+    pn_tab = at.tabs[6]
 
     assert not at.exception
     assert len(pn_tab.image) == 1
@@ -1263,13 +1353,13 @@ def test_pass_network_tab_fails_closed_on_mismatched_flags(live_api_server, monk
     at.run(timeout=APP_TIMEOUT_SECONDS)
     at.sidebar.text_input[0].set_value(live_api_server)
 
-    pn_tab = at.tabs[5]
+    pn_tab = at.tabs[6]
     pn_tab.text_input[0].set_value(PASS_NETWORK_MATCH_ID)
     at.run(timeout=APP_TIMEOUT_SECONDS)
-    pn_tab = at.tabs[5]
+    pn_tab = at.tabs[6]
     pn_tab.button[0].click()
     at.run(timeout=APP_TIMEOUT_SECONDS)
-    pn_tab = at.tabs[5]
+    pn_tab = at.tabs[6]
 
     assert not at.exception
     assert any("Configuration error" in e.value for e in pn_tab.error)
@@ -1322,13 +1412,13 @@ def test_alerts_history_tab_renders_and_filters_by_match_id_real_data(live_api_s
     at.run(timeout=APP_TIMEOUT_SECONDS)
     at.sidebar.text_input[0].set_value(live_api_server)
 
-    alerts_tab = at.tabs[6]
+    alerts_tab = at.tabs[7]
     alerts_tab.text_input[0].set_value("111")
     at.run(timeout=APP_TIMEOUT_SECONDS)
-    alerts_tab = at.tabs[6]
+    alerts_tab = at.tabs[7]
     alerts_tab.button[0].click()
     at.run(timeout=APP_TIMEOUT_SECONDS)
-    alerts_tab = at.tabs[6]
+    alerts_tab = at.tabs[7]
 
     assert not at.exception
     assert len(alerts_tab.dataframe) == 1
@@ -1351,10 +1441,10 @@ def test_alerts_history_tab_empty_result_shows_info_message_not_broken_table(liv
     at.run(timeout=APP_TIMEOUT_SECONDS)
     at.sidebar.text_input[0].set_value(live_api_server)
 
-    alerts_tab = at.tabs[6]
+    alerts_tab = at.tabs[7]
     alerts_tab.button[0].click()
     at.run(timeout=APP_TIMEOUT_SECONDS)
-    alerts_tab = at.tabs[6]
+    alerts_tab = at.tabs[7]
 
     assert not at.exception
     assert len(alerts_tab.dataframe) == 0
@@ -1379,13 +1469,13 @@ def test_alerts_history_tab_source_filter_genuinely_filters_real_data(live_api_s
     at.run(timeout=APP_TIMEOUT_SECONDS)
     at.sidebar.text_input[0].set_value(live_api_server)
 
-    alerts_tab = at.tabs[6]
+    alerts_tab = at.tabs[7]
     alerts_tab.selectbox[0].set_value("cv")
     at.run(timeout=APP_TIMEOUT_SECONDS)
-    alerts_tab = at.tabs[6]
+    alerts_tab = at.tabs[7]
     alerts_tab.button[0].click()
     at.run(timeout=APP_TIMEOUT_SECONDS)
-    alerts_tab = at.tabs[6]
+    alerts_tab = at.tabs[7]
 
     assert not at.exception
     assert len(alerts_tab.dataframe) == 1
@@ -1405,14 +1495,289 @@ def test_alerts_history_tab_invalid_match_id_shows_clean_error_no_crash():
     at = AppTest.from_file(DASHBOARD_PATH)
     at.run(timeout=APP_TIMEOUT_SECONDS)
 
-    alerts_tab = at.tabs[6]
+    alerts_tab = at.tabs[7]
     alerts_tab.text_input[0].set_value("not-a-number")
     at.run(timeout=APP_TIMEOUT_SECONDS)
-    alerts_tab = at.tabs[6]
+    alerts_tab = at.tabs[7]
     alerts_tab.button[0].click()
     at.run(timeout=APP_TIMEOUT_SECONDS)
-    alerts_tab = at.tabs[6]
+    alerts_tab = at.tabs[7]
 
     assert not at.exception
     assert any("must be a whole number" in e.value for e in alerts_tab.error)
     assert len(alerts_tab.dataframe) == 0
+
+
+# ============================================================================
+# UX polish pass: Part A (cross-linking), Part B (export/share), Part C
+# (consistent loading/error states).
+#
+# `_capture_media_managers`: `st.download_button`'s actual file content
+# isn't reachable from AppTest's own public API (its `DownloadButton`
+# wrapper exposes only a `value: bool`, and `Runtime.instance()` is torn
+# down -- set back to `None` -- at the end of every single `AppTest.run()`
+# call, per that method's own source). Monkeypatching `MediaFileManager.
+# __init__` to record every instance as AppTest constructs a fresh one on
+# each `run()` is the only way found (by directly reading AppTest's own
+# source, not guessed) to reach the REAL bytes a real download would
+# serve, so these export tests can assert on genuine file content rather
+# than "the button rendered."
+# ============================================================================
+
+
+@pytest.fixture
+def _capture_media_managers(monkeypatch):
+    managers: list[MediaFileManager] = []
+    real_init = MediaFileManager.__init__
+
+    def _capturing_init(self, *a, **kw):
+        real_init(self, *a, **kw)
+        managers.append(self)
+
+    monkeypatch.setattr(MediaFileManager, "__init__", _capturing_init)
+    return managers
+
+
+def _get_download_button_content(managers: list[MediaFileManager], download_button) -> bytes:
+    file_id = download_button.proto.url.split("/")[-1].rsplit(".", 1)[0]
+    for manager in reversed(managers):
+        try:
+            return manager._storage._files_by_id[file_id].content
+        except KeyError:
+            continue
+    raise AssertionError(f"download button file_id {file_id!r} not found in any captured MediaFileManager")
+
+
+def test_pass_network_to_player_report_cross_link_prefills_correctly(live_api_server):
+    """Part A, real case 1. A real navigation problem (Step 0): a player's
+    name in the Pass Network tab has no path to their own Player Report --
+    confirms the "View full report" button genuinely pre-fills the target
+    tab's Custom fields, not just that it renders. This is also the
+    regression test for two real bugs found and fixed while building this
+    (see `dashboard.py`'s own module comments on `_render_cross_link_button`):
+    (1) a cross-link button nested inside a transient `if ..._clicked:`
+    block silently orphans its own click (fixed by persisting the fetched
+    result in `st.session_state` and rendering unconditionally); (2)
+    `st.rerun()` does NOT bypass Streamlit's "cannot set a widget's
+    session_state after it's instantiated this run" rule (fixed by
+    applying prefills at the top of the script, before `st.tabs()`, not
+    inside the button's own click handler)."""
+    at = AppTest.from_file(DASHBOARD_PATH)
+    at.run(timeout=APP_TIMEOUT_SECONDS)
+    at.sidebar.text_input[0].set_value(live_api_server)
+    at.run(timeout=APP_TIMEOUT_SECONDS)
+
+    pn_tab = at.tabs[6]
+    pn_tab.text_input[0].set_value(str(TACTICAL_STREAM_MATCH_ID))
+    at.run(timeout=APP_TIMEOUT_SECONDS)
+    pn_tab = at.tabs[6]
+    pn_tab.button[0].click()  # "Generate Pass Network"
+    at.run(timeout=APP_TIMEOUT_SECONDS)
+    pn_tab = at.tabs[6]
+
+    assert not at.exception
+    assert len(pn_tab.button) > 1, "expected real per-player cross-link buttons to have rendered"
+    clicked_label = pn_tab.button[1].label
+    pn_tab.button[1].click()
+    at.run(timeout=APP_TIMEOUT_SECONDS)
+
+    assert not at.exception
+    assert at.session_state["player_report_preset_selectbox"] == "Custom"
+    clicked_player_id = at.session_state["player_report_custom_player_id"]
+    assert clicked_player_id.isdigit()
+    assert clicked_label.endswith(" →")  # the button's own label names a player, not their numeric id
+    assert at.session_state["player_report_custom_match_ids"] == str(TACTICAL_STREAM_MATCH_ID)
+
+    player_tab = at.tabs[2]
+    assert player_tab.selectbox[0].value == "Custom"
+    text_input_values = {ti.label: ti.value for ti in player_tab.text_input}
+    assert text_input_values["Player ID (StatsBomb player_id)"] == clicked_player_id
+    assert text_input_values["Match IDs (comma-separated StatsBomb match_id list)"] == str(TACTICAL_STREAM_MATCH_ID)
+
+
+def test_match_report_to_team_report_cross_link_prefills_correctly(live_api_server):
+    """Part A, real case 2. A real navigation problem (Step 0): a team
+    name in a compiled Match Report has no path to that team's own full
+    Team Report."""
+    at = AppTest.from_file(DASHBOARD_PATH)
+    at.run(timeout=APP_TIMEOUT_SECONDS)
+    at.sidebar.text_input[0].set_value(live_api_server)
+    at.run(timeout=APP_TIMEOUT_SECONDS)
+
+    mr_tab = at.tabs[8]
+    mr_tab.text_input[0].set_value(str(TACTICAL_STREAM_MATCH_ID))
+    at.run(timeout=APP_TIMEOUT_SECONDS)
+    mr_tab = at.tabs[8]
+    mr_tab.button[0].click()  # "Generate Match Report"
+    at.run(timeout=APP_TIMEOUT_SECONDS)
+    mr_tab = at.tabs[8]
+
+    assert not at.exception
+    cross_link_buttons = [b for b in mr_tab.button if b.label.startswith("View full")]
+    assert len(cross_link_buttons) == 2, "expected one cross-link button per team in this real 2-team match"
+    target_button = cross_link_buttons[0]
+    target_team = target_button.label.removeprefix("View full ").removesuffix(" Team Report →")
+    target_button.click()
+    at.run(timeout=APP_TIMEOUT_SECONDS)
+
+    assert not at.exception
+    assert at.session_state["team_report_preset_selectbox"] == "Custom"
+    assert at.session_state["team_report_name"] == target_team
+    assert at.session_state["team_report_match_ids"] == str(TACTICAL_STREAM_MATCH_ID)
+
+    team_tab = at.tabs[3]
+    assert team_tab.selectbox[0].value == "Custom"
+    text_input_values = {ti.label: ti.value for ti in team_tab.text_input}
+    assert text_input_values["Team name (StatsBomb team name)"] == target_team
+    assert text_input_values["Match IDs (comma-separated StatsBomb match_id list)"] == str(TACTICAL_STREAM_MATCH_ID)
+
+
+def test_match_report_export_produces_self_contained_html(live_api_server, _capture_media_managers):
+    """Part B, real case 1: the exported Match Report HTML is a genuine,
+    complete, standalone document -- opens with no live server, no
+    external references."""
+    at = AppTest.from_file(DASHBOARD_PATH)
+    at.run(timeout=APP_TIMEOUT_SECONDS)
+    at.sidebar.text_input[0].set_value(live_api_server)
+    at.run(timeout=APP_TIMEOUT_SECONDS)
+
+    mr_tab = at.tabs[8]
+    mr_tab.text_input[0].set_value(str(TACTICAL_STREAM_MATCH_ID))
+    at.run(timeout=APP_TIMEOUT_SECONDS)
+    mr_tab = at.tabs[8]
+    mr_tab.button[0].click()
+    at.run(timeout=APP_TIMEOUT_SECONDS)
+    mr_tab = at.tabs[8]
+
+    assert not at.exception
+    assert len(mr_tab.download_button) == 1
+    content = _get_download_button_content(_capture_media_managers, mr_tab.download_button[0])
+    html_text = content.decode("utf-8")
+
+    assert html_text.strip().lower().startswith("<!doctype html>")
+    assert html_text.strip().lower().endswith("</html>")
+    assert f"match_id={TACTICAL_STREAM_MATCH_ID}" in html_text
+    # Genuinely self-contained: no reference to a live server or the
+    # public internet anywhere in the document.
+    assert "http://" not in html_text
+    assert "https://" not in html_text
+
+
+def test_player_report_export_embeds_real_images_no_external_refs(live_api_server, _capture_media_managers):
+    """Part B, real case 2: the exported Player Report HTML embeds its
+    real rendered images as base64 `data:` URIs, not links to external
+    files -- confirmed by parsing the actual `<img>` tags, not just
+    substring-checking the raw text."""
+    from html.parser import HTMLParser
+
+    class _ImgCollector(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.img_srcs: list[str] = []
+
+        def handle_starttag(self, tag, attrs):
+            if tag == "img":
+                self.img_srcs.append(dict(attrs).get("src", ""))
+
+    at = AppTest.from_file(DASHBOARD_PATH)
+    at.run(timeout=APP_TIMEOUT_SECONDS)
+    at.sidebar.text_input[0].set_value(live_api_server)
+    at.run(timeout=APP_TIMEOUT_SECONDS)
+
+    player_tab = at.tabs[2]
+    player_tab.button[0].click()  # "Generate Player Report" (default preset)
+    at.run(timeout=APP_TIMEOUT_SECONDS)
+    player_tab = at.tabs[2]
+
+    assert not at.exception
+    assert len(player_tab.download_button) == 1
+    content = _get_download_button_content(_capture_media_managers, player_tab.download_button[0])
+    html_text = content.decode("utf-8")
+
+    parser = _ImgCollector()
+    parser.feed(html_text)
+    assert len(parser.img_srcs) >= 1, "expected at least the main report image embedded"
+    for src in parser.img_srcs:
+        assert src.startswith("data:image/png;base64,"), f"image src is not a self-contained data URI: {src[:60]!r}"
+        assert len(src) > 1000, "embedded image data URI looks suspiciously small/empty"
+    assert "http://" not in html_text
+    assert "https://" not in html_text
+
+
+def test_team_trends_network_failure_shows_clean_error_not_crash(monkeypatch, tmp_path):
+    """Part C, real regression test: the Step 0 audit's own finding --
+    Team Trends was the ONE tab in this dashboard with ZERO exception
+    handling around a call that makes a real network request
+    (`team_trend_data.py`'s own internal `requests.get()` against
+    football-data.co.uk) -- confirmed here with a genuinely triggered
+    failure (not reasoned about), by making that underlying call raise a
+    real `requests.exceptions.ConnectionError` and confirming the tab
+    shows a clean, consistent `st.error` instead of an unhandled
+    traceback."""
+    import production.src.reporting.team_trend_data as team_trend_data_module
+
+    def _raise_connection_error(*args, **kwargs):
+        raise requests.exceptions.ConnectionError("simulated: football-data.co.uk unreachable")
+
+    monkeypatch.setattr(team_trend_data_module.requests, "get", _raise_connection_error)
+    # This project's own real local disk cache (data/raw/football_data_co_uk/)
+    # very plausibly already has every league/season CSV this default query
+    # range would touch, from ordinary prior use of this feature -- which
+    # would make `_fetch_season_csv` take its `cache_path.exists()` branch
+    # and never call `requests.get` at all, silently not exercising the
+    # mock above. Redirected to an empty `tmp_path` so every single
+    # league/season fetch is a genuine cache MISS, forcing the real
+    # network path (and therefore the mock) to actually run.
+    monkeypatch.setattr(team_trend_data_module, "CACHE_DIR", tmp_path)
+    # PUBLIC_DEPLOYMENT is unset in this test process (never set anywhere
+    # in production/tests/, per ADR-021) -- Team Trends is not hidden.
+
+    at = AppTest.from_file(DASHBOARD_PATH)
+    at.run(timeout=APP_TIMEOUT_SECONDS)
+    trends_tab = at.tabs[4]
+    trends_tab.text_input[0].set_value("A Team With No Local Cache Whatsoever")
+    at.run(timeout=APP_TIMEOUT_SECONDS)
+    trends_tab = at.tabs[4]
+    trends_tab.button[0].click()  # "Generate Trend Report"
+    at.run(timeout=APP_TIMEOUT_SECONDS)
+    trends_tab = at.tabs[4]
+
+    assert not at.exception, "a real network failure must render a clean st.error, not crash the script"
+    assert any("football-data.co.uk" in e.value for e in trends_tab.error)
+
+
+def test_error_message_template_consistent_across_report_pattern_categories(monkeypatch):
+    """Part C, real case: the SAME error-message template now renders for
+    a connection failure across all three report-generation pattern
+    categories this task named -- live-stream (Live CV Monitor's What-If
+    Simulator), single-entity (Player Reports), and comparison (Team
+    Comparison) -- confirming the Step 0 audit's fix (extracting one
+    shared `_fetch_report_safely` error path) actually reached all three,
+    not just the ~30 call sites that already used it before this pass."""
+    at = AppTest.from_file(DASHBOARD_PATH)
+    at.run(timeout=APP_TIMEOUT_SECONDS)
+    at.sidebar.text_input[0].set_value("http://127.0.0.1:1")  # unreachable, fast refusal
+    at.run(timeout=APP_TIMEOUT_SECONDS)
+
+    expected_fragment = "Backend unreachable at http://127.0.0.1:1"
+
+    cv_tab = at.tabs[1]
+    cv_tab.button[0].click()  # "Run Simulation"
+    at.run(timeout=30)
+    cv_tab = at.tabs[1]
+    assert not at.exception
+    assert any(expected_fragment in e.value for e in cv_tab.error)
+
+    player_tab = at.tabs[2]
+    player_tab.button[0].click()  # "Generate Player Report"
+    at.run(timeout=30)
+    player_tab = at.tabs[2]
+    assert not at.exception
+    assert any(expected_fragment in e.value for e in player_tab.error)
+
+    compare_tab = at.tabs[5]
+    compare_tab.button[0].click()  # "Compare"
+    at.run(timeout=30)
+    compare_tab = at.tabs[5]
+    assert not at.exception
+    assert any(expected_fragment in e.value for e in compare_tab.error)

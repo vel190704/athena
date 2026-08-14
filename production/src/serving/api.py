@@ -13,6 +13,7 @@ main per-frame `threat` stream.
 """
 
 import asyncio
+import hmac
 import logging
 import os
 import time
@@ -30,6 +31,7 @@ os.environ.setdefault("MLFLOW_ALLOW_FILE_STORE", "true")
 
 import torch
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from ultralytics import YOLO
 
@@ -121,6 +123,24 @@ PUBLIC_DEPLOYMENT = os.environ.get("PUBLIC_DEPLOYMENT", "false").strip().lower()
 # os.environ.get(...)-flag convention as PUBLIC_DEPLOYMENT above.
 API_KEY = os.environ.get("API_KEY") or None
 
+# Production-readiness audit (Category 2.1) fix: an explicit, restrictive
+# CORS policy instead of relying on FastAPI's own default (no CORSMiddleware
+# registered at all -- which blocks EVERY cross-origin browser request,
+# including the project's own real frontend if it is ever served from a
+# different origin than this API, e.g. a separate host/port in a real
+# PUBLIC_DEPLOYMENT). `dashboard.py` normally talks to this API server-side
+# (`requests`, not browser JS), so CORS is a non-issue for that path -- this
+# exists for the one browser-facing surface this API has: `/docs`'s
+# "Try it out" UI, and any future browser-based client. Comma-separated
+# allowlist, same os.environ.get(...)-flag convention as PUBLIC_DEPLOYMENT/
+# API_KEY above; defaults to Streamlit's own default local port (this
+# project's actual deployed frontend, per README's Quick Start), not "*".
+CORS_ALLOWED_ORIGINS = [
+    origin.strip()
+    for origin in os.environ.get("CORS_ALLOWED_ORIGINS", "http://localhost:8501").split(",")
+    if origin.strip()
+]
+
 DEFAULT_MATCH_ID = 3857276
 # TIME_BIN (15s horizon, matching Milestones 8/13/14/15) now comes from
 # production.src.constants (engineering-review de-duplication -- was
@@ -187,7 +207,15 @@ async def _require_api_key(x_api_key: str | None = Header(default=None)) -> None
     """
     if API_KEY is None:
         return
-    if x_api_key != API_KEY:
+    # Production-readiness audit (Category 2.3) fix: `hmac.compare_digest`,
+    # not `!=` -- a naive string comparison short-circuits on the first
+    # mismatched character, leaking the length of the correct prefix via
+    # response timing; `compare_digest` runs in time independent of where
+    # (or whether) the strings first differ. `x_api_key or ""` avoids ever
+    # passing `None` to `compare_digest` (it requires str/bytes on both
+    # sides, not None) without weakening the check -- an empty string can
+    # never equal a real, non-empty API_KEY anyway.
+    if not hmac.compare_digest(x_api_key or "", API_KEY):
         raise HTTPException(status_code=401, detail="Missing or invalid X-API-Key header")
 
 
@@ -499,7 +527,37 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(lifespan=lifespan)
+# Production-readiness audit (Category 2.4) fix: FastAPI auto-registers
+# /docs, /redoc, and /openapi.json with NO auth of their own -- they never
+# leak report DATA, but they do leak the full endpoint/parameter surface to
+# anyone, undermining "only people who hold the key can call this" as a
+# complete statement once API_KEY is actually configured for a real
+# deployment. Disabled entirely (not merely gated behind the same key --
+# simpler, and avoids adding a THIRD place `_require_api_key` needs to be
+# wired to a route FastAPI itself constructs) whenever API_KEY is set;
+# left at FastAPI's normal defaults when it's unset, so local development
+# and this project's own test suite (which never sets API_KEY -- ADR-022)
+# are unaffected, including `test_dashboard.py`'s own `live_api_server`
+# fixture, which polls /openapi.json to confirm the server is ready.
+app = FastAPI(
+    lifespan=lifespan,
+    docs_url="/docs" if API_KEY is None else None,
+    redoc_url="/redoc" if API_KEY is None else None,
+    openapi_url="/openapi.json" if API_KEY is None else None,
+)
+
+# Production-readiness audit (Category 2.1) fix: see CORS_ALLOWED_ORIGINS's
+# own comment above for the full reasoning. `allow_credentials=True` because
+# the `X-API-Key` header is a credential; only GET/POST are ever used by any
+# route in this file (confirmed directly -- grepped every `@app.` decorator
+# above), so PUT/DELETE/PATCH are deliberately not allowed.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=CORS_ALLOWED_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["GET", "POST"],
+    allow_headers=["X-API-Key", "Content-Type"],
+)
 
 
 @app.middleware("http")
@@ -859,7 +917,8 @@ async def tactical_stream(
     `CVPipeline` instance for `source="cv"`, or a `live_match_stream`
     generator) before a single message is ever sent.
     """
-    if API_KEY is not None and websocket.headers.get("x-api-key") != API_KEY:
+    # Same constant-time-comparison fix as `_require_api_key` above.
+    if API_KEY is not None and not hmac.compare_digest(websocket.headers.get("x-api-key") or "", API_KEY):
         await websocket.close(code=1008, reason="Missing or invalid X-API-Key header")
         return
 
@@ -1049,7 +1108,18 @@ async def simulate(
     value with a 422 before this function body ever runs -- there is no
     manual validation to fall through incorrectly.
     """
-    result = _find_qualifying_frame_for_minute(match_id, minute)
+    # Production-readiness audit (Category 4.2) fix: `_find_qualifying_frame_for_minute`
+    # does real, uncached file I/O + JSON parse + a linear scan over the full
+    # match's events/360 files on EVERY call (measured directly: ~50-57ms,
+    # ~80-90% of this endpoint's total latency). Previously called directly,
+    # synchronously -- blocking the asyncio event loop, and therefore every
+    # other concurrent request (REST and WebSocket alike), for that entire
+    # duration. The model-inference calls just below already correctly use
+    # `asyncio.to_thread` for exactly this reason; this call was the one
+    # piece of this endpoint's own pipeline that wasn't. Confirmed by direct
+    # measurement before this fix: 8 concurrent /simulate requests took
+    # ~524ms EACH (vs. 62ms sequential) -- serialized, not parallelized.
+    result = await asyncio.to_thread(_find_qualifying_frame_for_minute, match_id, minute)
     if result is None:
         raise HTTPException(
             status_code=404,
@@ -1112,7 +1182,14 @@ async def coach_mode(match_id: int, minute: int):
     `rankings[0]` is this endpoint's actual recommendation
     (`recommended_action`).
     """
-    result = _find_qualifying_frame_for_minute(match_id, minute)
+    # Production-readiness audit (Category 4.2) fix: previously called
+    # directly/synchronously, blocking the event loop for ~50-57ms of real
+    # file I/O + JSON parse on every call (measured: 8 concurrent /simulate
+    # requests took ~524ms EACH vs. 62ms sequential -- serialized, not
+    # parallelized). `asyncio.to_thread` matches this endpoint's own
+    # already-async-safe model-inference calls below. See /simulate's own
+    # copy of this comment for the full measurement.
+    result = await asyncio.to_thread(_find_qualifying_frame_for_minute, match_id, minute)
     if result is None:
         raise HTTPException(
             status_code=404,

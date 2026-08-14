@@ -612,6 +612,85 @@ model "predicts real-world xT shift within predefined bounds" as README's succes
 criterion requires. RQ5 remains, honestly, largely open on its literal question; Thread A
 should not be read as bolstering Thread B's much thinner evidence base.
 
+**Update — Thread B scaled from 1 match to the full ~55-match, 12-competition pool,
+APPENDED, not superseding the single-match finding above (it remains an accurate
+statement of what Milestone 20 found under that narrower scope).** `oracle_validator.py`
+(`find_substitutions`/`validate_oracle_substitutions`) reused completely UNMODIFIED —
+this is a scale-out of the existing, already-validated method, not new methodology — run
+against the same ~55-match, 12-competition dataset Milestone 14B/RQ4's own match-level
+re-validation used (pulled directly from that real, already-logged MLflow run's own
+`match_ids` param, all 55 already cached locally with both events and 360 data).
+
+**Real totals:** 55 of 55 matches processed successfully. **488 real substitutions found**
+(`find_substitutions`) across all 55 matches. **424 of those produced a valid before/after
+result** (the remaining 64 skipped for the same real, already-documented reasons the
+original single-match run established — `minute - 2 < 0`, or no qualifying pre/post
+360-covered frame for that team). A genuine, honest sub-finding: 4 of the 55 matches
+(3895158, 3895266, 3895309, 3923880) contributed **zero** validated results despite having
+5-10 real raw substitutions each — checked directly (not left unexplained): every single
+substitution in those 4 matches failed at "no pre-frame found," meaning 360 coverage for
+the relevant team/window combinations was genuinely too sparse in those specific matches,
+not a bug — the same real, uneven-360-coverage finding Weak-Spot Lifetime Analysis's own
+validation already established, now confirmed to matter at the match level too, not just
+the per-zone level.
+
+**Clean vs. confounded, at scale:** of the 424 validated substitutions, **366 (86.3%) had
+an overlapping ±2-minute window with at least one other substitution** and **58 (13.7%)
+were genuinely isolated (clean)**. This closely matches Milestone 20's own single-match
+rate (9/10 = 90% confounded) — confirming, with real evidence rather than a single data
+point, that confounding is a PERVASIVE, structural feature of real substitution patterns
+(teams very often make multiple changes in the same few real minutes), not an artifact of
+the one match originally tested.
+
+**The clean subset — 58 real, genuinely isolated observations (up from 1):**
+
+| Statistic | Value |
+|---|---|
+| n | 58 |
+| Mean delta | +0.0254 |
+| Median delta | −0.0029 |
+| Std. dev. | 0.2101 |
+| Min / Max | −0.6820 / +0.7042 |
+| Threat increased after sub | 20 (34.5%) |
+| Threat decreased after sub | 21 (36.2%) |
+| No significant change | 17 (29.3%) |
+
+The mean delta (+0.0254) is **not statistically distinguishable from zero** given this
+sample's own real spread (standard error 0.0276, t ≈ 0.92, n=58) — the clean subset shows
+no systematic directional bias toward threat increasing or decreasing after a
+substitution; the three-way split (34.5% / 36.2% / 29.3%) is close to an even partition.
+This is read as a real, honest finding, not a null result to explain away: real
+substitutions are made for both attacking reasons (chasing a goal, expecting threat to
+rise) and defensive/game-management reasons (protecting a lead, expecting threat to fall),
+and a model whose predicted threat shifts genuinely both ways, in a large real sample, with
+no artificial constant or degenerate output, is behaving sensibly given that real mix —
+even though this observational method still cannot say whether any INDIVIDUAL shift was
+"caused" by the substitution specifically. Every one of the 424 validated results
+(clean and confounded alike) passed the `perspective_verified` same-team-perspective check
+with no exceptions — the measurement's own internal integrity holds at scale, not just in
+the original single match. The original Milestone 20 clean case (Morocco, Hakimi → Jabrane,
+minute 84, 4.2% → 46.5%, delta +0.4234) reappears in this larger run with the EXACT same
+value, confirming the scale-out reproduces the original finding exactly rather than
+silently diverging from it.
+
+**Updated verdict, hedged honestly:** the evidence base grew substantially (58 genuinely
+clean observations vs. 1), and two real, useful findings emerged that did not exist before:
+confounding is confirmed pervasive at scale (not match-specific), and the model's
+substitution-window threat shift is confirmed non-degenerate and roughly symmetric (real
+variation in both directions, not a constant or one-sided artifact). **But RQ5's own
+literal success criterion — "predicts real-world xT shift within predefined bounds" —
+remains, honestly, still NOT directly assessable by this method, at any scale.** The
+method is, and always was, an OBSERVATIONAL before/after snapshot (see this section's own
+permanent methodological caveat in `oracle_validator.py`): there is no independent,
+externally-known "correct" xT shift for any of these 58 real substitutions to check the
+model's own before/after reading against. More clean data makes the method's OWN behavior
+better characterized (stable, real, bidirectional, internally consistent) — it does not by
+itself convert an observational correlation into the kind of predict-vs.-ground-truth
+validation RQ5's literal question asks for. RQ5 Thread B therefore moves from "one
+anecdote" to "a real, substantial, well-characterized observational dataset" — a genuine,
+meaningful improvement in evidence quality — but the RQ's own literal question remains open
+for the same structural reason it was open after Milestone 20, not a new or different one.
+
 ---
 
 ## 3. Architectural Decisions (ADRs)
@@ -825,7 +904,14 @@ Prioritized, not exhaustive:
    model. RQ3's literal "pass landing error" success criterion remains unmeasured
    against real trajectories and would require real ball-tracking/velocity data this
    open dataset does not include (see ADR-008's Update section).
-6. **RQ5 Thread B's single-match sample size**: Oracle Substitution Validation has only
-   ever been run on one match, yielding one unconfounded observation. Running it across
-   many matches — and explicitly stratifying by whether a substitution's window overlaps
-   another — is necessary before Thread B can support any real conclusion.
+6. ~~**RQ5 Thread B's single-match sample size**~~ **— addressed: scaled from 1 match to
+   the full ~55-match, 12-competition pool**, `oracle_validator.py` reused completely
+   unmodified. 488 real substitutions found, 424 validated, stratified explicitly by
+   overlapping-window confounding (366 confounded / 58 clean) exactly as this item asked.
+   The confounded rate held at scale (86.3% vs. the original single match's 90%) and the
+   clean-subset sample grew from 1 to 58 real observations — see RQ5's own "Update"
+   subsection above for the full distribution and the honest conclusion this larger
+   sample still supports (and does not support): the method's own behavior is now
+   well-characterized at scale, but RQ5's literal "predicts... within predefined bounds"
+   question remains open for the same structural, observational-method reason it always
+   was, not a sample-size problem after all.

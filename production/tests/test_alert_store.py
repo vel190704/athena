@@ -124,6 +124,87 @@ def test_fetch_alerts_filters_correctly():
     assert all_rows[0]["explanation_text"] == "C"
 
 
+# ============================================================================
+# SQL injection proof-of-safety (production-readiness audit, Priority 0).
+# The audit's own exhaustive re-search (every `.execute(`/`sqlite3`/`SELECT`/
+# `INSERT` call site in `production/`, not just this file) found `fetch_alerts`
+# already parameterized correctly: `where_sql` is built only from a FIXED
+# whitelist of clause strings ("match_id = ?", "source = ?", ...), never from
+# a raw value, and every actual value is bound via `?`. No fix was needed --
+# these tests exist to PROVE that directly, with a real triggered malicious
+# payload, rather than rest on code-review confirmation alone. Exercises the
+# persistence layer itself (not FastAPI's own `Literal["statsbomb", "cv"]`
+# typing on `source`, which is a separate, shallower defense at the API layer
+# -- see test_api.py's own endpoint-level version of this same check) so this
+# proves the INNERMOST layer is safe regardless of what validation exists
+# above it.
+# ============================================================================
+
+
+def test_fetch_alerts_sql_injection_payload_in_source_is_inert_literal_not_executed():
+    """A malicious `source` value, passed directly to `fetch_alerts` (below
+    FastAPI's own `Literal` type check, which would reject this before it
+    ever reached here in the real request path) -- must be treated as an
+    inert string to compare against the `source` column, never as executable
+    SQL. Proven by: (1) no exception: a real DROP TABLE, if it executed,
+    would leave the table gone and the SECOND query below would raise
+    `sqlite3.OperationalError: no such table: alerts`, not return cleanly;
+    (2) the seeded real rows are still all there afterward."""
+    alert_store.log_alert(
+        source="statsbomb", match_id=1, video_path=None, minute=1.0,
+        threat_before=0.05, threat_after=0.10, explanation_text="real alert", explanation_source="mock",
+    )
+
+    payload = "cv'; DROP TABLE alerts; --"
+    result = alert_store.fetch_alerts(source=payload)
+    assert result == [], "the malicious value must not match the real 'statsbomb' row -- inert literal comparison"
+
+    # The table must still exist and still contain the real row -- proves
+    # the injected `DROP TABLE` was never executed, not merely that this
+    # one call didn't crash.
+    survivors = alert_store.fetch_alerts()
+    assert len(survivors) == 1
+    assert survivors[0]["explanation_text"] == "real alert"
+
+
+def test_fetch_alerts_sql_injection_payload_in_date_range_is_inert_literal_not_executed():
+    """Same proof, for `start_utc`/`end_utc` -- the two genuinely free-text
+    fields a real caller controls via `GET /alerts/history`'s own query
+    params (see test_api.py for the full HTTP-level version)."""
+    alert_store.log_alert(
+        source="statsbomb", match_id=2, video_path=None, minute=2.0,
+        threat_before=0.05, threat_after=0.10, explanation_text="real alert 2", explanation_source="mock",
+    )
+
+    payload = "2020-01-01T00:00:00+00:00'; DROP TABLE alerts; --"
+    result = alert_store.fetch_alerts(start_utc=payload, end_utc="2099-01-01T00:00:00+00:00")
+    # A plain string comparison (`logged_at_utc >= payload`) -- not asserting
+    # which side of a lexicographic string compare it lands on, only that it
+    # executed as ONE inert comparison, not as injected SQL.
+    assert isinstance(result, list)
+
+    survivors = alert_store.fetch_alerts()
+    assert len(survivors) == 1
+    assert survivors[0]["explanation_text"] == "real alert 2"
+
+
+def test_log_alert_sql_injection_payload_in_text_fields_is_inert_literal_not_executed():
+    """The write path (`log_alert`'s own INSERT): a malicious payload in
+    `explanation_text`/`video_path` must be stored verbatim as data, never
+    executed, and must round-trip byte-for-byte on read -- the strongest
+    possible proof it was never interpreted as SQL along the way."""
+    payload = "'; DROP TABLE alerts; --"
+    alert_store.log_alert(
+        source="cv", match_id=None, video_path=payload, minute=3.0,
+        threat_before=0.05, threat_after=0.10, explanation_text=payload, explanation_source="mock",
+    )
+
+    rows = alert_store.fetch_alerts()
+    assert len(rows) == 1
+    assert rows[0]["explanation_text"] == payload
+    assert rows[0]["video_path"] == payload
+
+
 def test_init_db_is_idempotent_and_wal_mode_is_active():
     """CREATE TABLE/INDEX IF NOT EXISTS must tolerate being called
     repeatedly (init_db is called from api.py's lifespan AND defensively

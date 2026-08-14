@@ -1,0 +1,41 @@
+# Production-readiness audit, Priority 4: the same direct-process
+# supervision as athena-api.service, for the Streamlit dashboard
+# (production/frontend/dashboard.py). See that file's own header comment
+# for the full install/uninstall steps and the honest scope of what
+# `Restart=on-failure` does and does not provide -- identical here.
+#
+# Deliberately a SEPARATE unit, not bundled with athena-api.service: these
+# are two independent processes today (per README.md's own Quick Start,
+# `uvicorn ...` and `streamlit run ...` are run separately), and systemd
+# restarting one must not depend on or restart the other -- a crashed
+# dashboard should not take down a healthy API process, and vice versa.
+
+[Unit]
+Description=Project Athena -- Streamlit dashboard (production/frontend/dashboard.py)
+After=network.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+
+# REPLACE, same as athena-api.service.
+WorkingDirectory=/opt/project-athena
+ExecStart=/opt/project-athena/.venv/bin/streamlit run production/frontend/dashboard.py --server.address 0.0.0.0 --server.port 8501
+
+# Optional -- see athena-api.service's own comment on this line.
+# EnvironmentFile=/opt/project-athena/deploy/athena-dashboard.env
+
+# IMPORTANT, honestly stated (see README.md's "Production Readiness"
+# section for the full writeup): `Restart=on-failure` here means "restart
+# the Streamlit PROCESS if it exits" -- it does NOT mean this project's own
+# documented Streamlit single-threaded-blocking limitation goes away. A
+# stuck/blocked (not crashed) dashboard -- e.g. mid a long-running Live CV
+# Monitor stream -- is not something systemd can detect or intervene in;
+# systemd only acts on the process actually EXITING, not on it being slow
+# or unresponsive while still alive.
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

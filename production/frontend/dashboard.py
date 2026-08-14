@@ -1,9 +1,10 @@
 """Milestones 17 & 19 (Module 3/9 UI), extended with the reporting track's
-Streamlit integration: Project Athena's dashboard, now nine tabs wide
+Streamlit integration: Project Athena's dashboard, now ten tabs wide
 (Pass Network and Alerts History were added after this docstring's "five
 tabs" count was first written but before this correction; Match Report and
-Tactical Chat are this session's own additions -- see their own tab
-sections below for what each does).
+Tactical Chat are this session's own additions; Home is the newest addition,
+a pure read-only orientation layer positioned leftmost/first -- see their
+own tab sections below for what each does).
 
 "Live CV Monitor" holds the two ORIGINAL panels, unchanged in behavior:
 
@@ -122,6 +123,8 @@ re-verified that approach does not reintroduce the update-then-silently-
 stop failure mode described above.
 """
 
+import base64
+import html
 import json
 import os
 import sys
@@ -902,30 +905,358 @@ def _cached_alerts_history(
     return response.json()
 
 
-def _fetch_report_safely(fetch_fn, rest_base_url: str) -> dict | None:
-    """Calls `fetch_fn()` (a zero-arg closure around one of the `_cached_*`
-    HTTP wrappers above) and returns its parsed JSON, or `None` if the
-    request failed -- rendering a clean `st.error` in the same style this
-    file's original What-If Simulator panel already uses, rather than
-    letting an unhandled `requests` exception crash this tab's script
-    execution (ADR-018: these three tabs now make a real network call,
-    where before they were in-process function calls that could not fail
-    this way)."""
+# --- Home tab helpers ------------------------------------------------------
+# Step 0 scope (all five candidate sections included, none deferred):
+#   1. Data coverage summary -- reuses `_cached_candidate_index` (the exact
+#      cache-bust'd wrapper around `enumerate_cached_candidates` the Player
+#      Reports/Team Reports tabs already use for their dropdowns), so Home
+#      does NOT trigger a second ~15-20s cache scan -- it shares the same
+#      `st.cache_data` entry.
+#   2. Recent activity -- reuses `_cached_alerts_history` (same helper the
+#      Alerts History tab calls), no filters, capped to
+#      `HOME_RECENT_ALERTS_LIMIT` for a compact preview.
+#   3. Quick actions -- derived from the SAME alerts fetch in (2), not a
+#      second query: the most recent alert's `match_id` (alerts are already
+#      returned most-recent-first by `fetch_alerts`'s own `ORDER BY
+#      logged_at_utc DESC`). Tactical Event Detection and Tactical Timeline
+#      both already read match_id from the SAME `match_report_id_input`
+#      session_state key inside `tab_match_report` (confirmed directly --
+#      see both call sites), so one shortcut covers both "deepest views"
+#      named in this task. If there is no alert history yet, this section
+#      states that plainly rather than fabricating a "recent" match.
+#   4. System status -- new `_cached_health`/`_cached_metrics` wrappers
+#      calling the EXISTING `/health`/`/metrics` endpoints (api.py, Fix 3)
+#      exactly like every other `_cached_*` wrapper in this file calls an
+#      existing endpoint -- neither endpoint's own logic is touched.
+#   No section is deferred -- all five of the task's candidate sections are
+#   in scope and genuinely buildable from already-existing calls alone.
+HOME_RECENT_ALERTS_LIMIT = 5
+HEALTH_METRICS_CACHE_TTL_SECONDS = 5  # short: this panel wants to look "live", not stale for a full 30s like Alerts History
+HEALTH_METRICS_REQUEST_TIMEOUT_SECONDS = 5.0  # /health and /metrics are documented as cheap/fast/no-side-effects (api.py) -- a short timeout is appropriate, not conservative-for-a-heavy-call
+
+
+@st.cache_data(show_spinner=False, ttl=HEALTH_METRICS_CACHE_TTL_SECONDS)
+def _cached_health(rest_base_url: str) -> dict:
+    response = requests.get(f"{rest_base_url}/health", timeout=HEALTH_METRICS_REQUEST_TIMEOUT_SECONDS)
+    response.raise_for_status()
+    return response.json()
+
+
+@st.cache_data(show_spinner=False, ttl=HEALTH_METRICS_CACHE_TTL_SECONDS)
+def _cached_metrics(rest_base_url: str) -> dict:
+    response = requests.get(f"{rest_base_url}/metrics", timeout=HEALTH_METRICS_REQUEST_TIMEOUT_SECONDS)
+    response.raise_for_status()
+    return response.json()
+
+
+def _home_data_coverage_summary(teams: list[dict], players: list[dict]) -> dict:
+    """Pure aggregation over `_cached_candidate_index`'s already-scanned
+    output -- no file I/O, no re-scan. `total_matches_cached`/
+    `total_matches_360` are real DISTINCT match counts (a union across every
+    team's own season match_ids), not a sum of each team's own count, which
+    would double-count every match (two teams per match)."""
+    all_match_ids: set[int] = set()
+    all_match_ids_360: set[int] = set()
+    for team in teams:
+        for season in team["seasons"]:
+            all_match_ids.update(season["match_ids"])
+            all_match_ids_360.update(season["match_ids_360"])
+    return {
+        "total_players_cached": len(players),
+        "total_teams_cached": len(teams),
+        "total_matches_cached": len(all_match_ids),
+        "total_matches_360": len(all_match_ids_360),
+    }
+
+
+def _home_most_recent_match_id(recent_alerts: list[dict]) -> int | None:
+    """`recent_alerts` is already most-recent-first (`fetch_alerts`'s own
+    `ORDER BY logged_at_utc DESC`) -- the first entry with a non-null
+    `match_id` is the most recently referenced match. Returns `None` if
+    there is no alert history yet, or no alert carries a `match_id`
+    (`video_path`-sourced CV alerts can be logged with `match_id=None`)."""
+    for alert in recent_alerts:
+        if alert.get("match_id") is not None:
+            return alert["match_id"]
+    return None
+
+
+def _fetch_report_safely(
+    fetch_fn,
+    rest_base_url: str | None = None,
+    *,
+    context_label: str | None = None,
+    not_found_message: str | None = None,
+) -> dict | None:
+    """Calls `fetch_fn()` and returns its parsed JSON (or whatever it
+    returns), or `None` if the call failed -- rendering ONE consistent
+    `st.error` template, rather than letting an exception crash this tab's
+    script execution. This is this file's single canonical error-state
+    pattern (UX polish pass, Part C) -- every tab that can fail (a real
+    network call to `rest_base_url`, OR a real network call to an external
+    source like football-data.co.uk) routes its failure through here, so
+    "connection error" / "timeout" / "server error" all look and read the
+    same everywhere, not just in the ~30 call sites that already used this
+    helper before this pass.
+
+    `rest_base_url`: set for calls to THIS project's own FastAPI backend
+    (the common case -- every `_cached_*` HTTP wrapper above) so the
+    Timeout/ConnectionError messages can name it and suggest starting
+    `uvicorn`. `context_label`: set instead for calls that do NOT talk to
+    this project's own backend (e.g. `team_trend_data.py`'s own direct
+    `requests.get()` against football-data.co.uk from the Team Trends tab)
+    -- produces the same template with backend-appropriate wording, not a
+    misleading "start uvicorn" suggestion for a failure that has nothing to
+    do with this project's own API server. Exactly one of the two should be
+    given; `context_label` takes precedence if both are.
+
+    `not_found_message`: if given, a 404 `HTTPError` renders `st.info(...)`
+    with this message instead of the generic HTTPError `st.error` -- for
+    call sites where "not found" is an expected, non-alarming outcome (e.g.
+    Player Similarity Search's "no similarity index has been built yet,
+    click Rebuild first" -- a real, previously-duplicated special case this
+    parameter absorbs into the shared helper instead of a one-off inline
+    try/except).
+
+    The catch-all `Exception` branch is a real, deliberate addition (UX
+    polish pass): previously, a non-`requests` failure (e.g. a pandas/CSV
+    parsing error from `team_trend_data.py`'s own direct, in-process calls,
+    which were never routed through this helper at all before this pass)
+    would propagate uncaught and crash the whole script with Streamlit's
+    own generic traceback box, not a clean, consistent message.
+    """
+    label = context_label or (f"backend at {rest_base_url}" if rest_base_url else "the backend")
     try:
         return fetch_fn()
     except requests.exceptions.Timeout:
         st.error(
-            f"Report request timed out after {REPORT_REQUEST_TIMEOUT_SECONDS:.0f}s -- the backend "
-            f"at {rest_base_url} did not respond in time."
+            f"Request to {label} timed out after {REPORT_REQUEST_TIMEOUT_SECONDS:.0f}s -- it did "
+            "not respond in time."
         )
     except requests.exceptions.ConnectionError:
-        st.error(
-            f"Backend unreachable at {rest_base_url} -- confirm the FastAPI server is running "
-            "(uvicorn production.src.serving.api:app)."
-        )
+        if rest_base_url and context_label is None:
+            st.error(
+                f"Backend unreachable at {rest_base_url} -- confirm the FastAPI server is running "
+                "(uvicorn production.src.serving.api:app)."
+            )
+        else:
+            st.error(f"Could not reach {label} -- confirm you have a working internet connection.")
     except requests.exceptions.HTTPError as exc:
-        st.error(f"Report request failed: {exc}")
+        if not_found_message and exc.response is not None and exc.response.status_code == 404:
+            st.info(not_found_message)
+        else:
+            st.error(f"Request to {label} failed: {exc}")
+    except Exception as exc:  # noqa: BLE001 -- deliberately broad, see docstring
+        st.error(f"Unexpected error from {label}: {exc}")
     return None
+
+
+# ============================================================================
+# UX polish pass, Part A: cross-linking between tabs.
+#
+# STEP 0 FINDING, verified directly rather than assumed (this Streamlit
+# version, 1.60.0, exactly what `requirements-lock.txt` pins): `st.tabs()`
+# DOES support a real, genuine "open this specific tab" mechanism via its
+# `default=<tab label>` parameter -- confirmed by reading `help(st.tabs)`
+# against the actually-installed version, then confirmed END-TO-END with a
+# real, triggered `AppTest` run (a button click sets `st.session_state` and
+# calls `st.rerun()`; the next run's `st.tabs(..., default=...)` picks it up
+# with no exception). This is a genuinely stronger result than what this
+# task's own Step 0 anticipated ("even if it can't force-switch the active
+# tab") -- `default=` achieves real auto-navigation, not just a pre-filled
+# field the user still has to manually click into.
+#
+# ONE deliberately NOT taken: `st.tabs(..., key=..., on_change="rerun")` --
+# Streamlit's OTHER, bidirectional mechanism for tab control (see the "Set
+# the default tab" vs. "Programmatically control the tab state" examples in
+# `help(st.tabs)`). That mode fundamentally changes what tab-switching DOES
+# for the WHOLE app: switching tabs stops being a free, client-side-only
+# interaction and starts triggering a full server rerun on every click, and
+# tab bodies would need to start using `.open` to skip inactive tabs to make
+# that worthwhile -- this file's own module docstring "PERMANENT CONSEQUENCE"
+# section documents that EVERY tab's code currently runs on EVERY rerun
+# regardless of which tab is visible, an architectural property this whole
+# file depends on (most concretely, `tab_cv`'s blocking loop). Opting into
+# `on_change="rerun"` here would be a real, invasive change to that model as
+# a side effect of a "UI polish" feature -- explicitly out of scope
+# ("no new backend logic" and, in spirit, no unrequested architecture
+# changes). `default=` alone needs neither `key` nor `on_change` and changes
+# nothing about how tab-switching or reruns already work -- confirmed by the
+# same AppTest run above completing with no exception and every tab's
+# content still present.
+#
+# The chosen cross-link TARGET is always "Custom" mode on the destination
+# tab (Player Reports / Team Reports), never a preset -- see the preset
+# selectboxes' own `key=` comments above for why: a preset's OPTION STRING
+# is a long, dynamically-scanned label a cross-link button would have to
+# reconstruct exactly, whereas "Custom" is a stable literal and its own
+# fields take plain player_id/team_name/match_ids values directly.
+#
+# A SECOND real constraint, found and fixed by actually running this (a
+# real, triggered AppTest failure -- clicking a cross-link button silently
+# did nothing, no exception, nothing changed -- not reasoned about in
+# advance): a `_render_cross_link_button` call CANNOT live inside a block
+# gated by `if <some other button>_clicked:` -- e.g. `if
+# pass_network_generate_clicked: ... _render_cross_link_button(...)`.
+# `st.button()`'s own return value is `True` for exactly ONE script run
+# (the run immediately following its own click) and `False` on every
+# subsequent rerun, including the very rerun a NESTED cross-link button's
+# own `st.rerun()` triggers -- so on that next run, `pass_network_generate_
+# clicked` is `False` again, the whole `if` block (cross-link button
+# included) never re-executes, and the pending click is silently orphaned:
+# the code that would have processed it never runs. This is a real bug in
+# the actual browser too, not an AppTest artifact -- confirmed by writing
+# temporary debug prints directly into this function and observing they
+# never fired on the second run. The fix, applied at each of the three
+# real cross-link call sites (Pass Network, Player Similarity Search,
+# Match Report): the FETCH stays gated behind its own "Generate" button
+# (unchanged), but the fetched RESULT is stored in `st.session_state` and
+# the RENDER code (including any cross-link buttons) reads from
+# `st.session_state` and runs unconditionally on every rerun as long as a
+# result is present -- not gated by the transient click boolean at all.
+#
+# A THIRD real constraint, ALSO found by actually running this (not the
+# first guess): fixing the second constraint above made the FIRST
+# constraint's own exception (`st.session_state.<key> cannot be modified
+# after the widget with key <key> is instantiated`) start firing for
+# real -- proving directly that `st.rerun()` does NOT, in fact, bypass
+# that ordering rule the way this docstring originally (incorrectly)
+# claimed. Verified with a minimal, isolated repro outside this file
+# before touching this fix: the exception fires at the exact
+# `st.session_state[key] = value` line itself, synchronously, before
+# `st.rerun()` is ever reached -- so if the target widget (e.g. Player
+# Reports' own preset selectbox) already ran earlier in THIS SAME script
+# execution (true here: Pass Network/Match Report/Player Similarity
+# Search all run physically AFTER Player Reports/Team Reports), setting
+# its session_state directly, from inside the click handler, always
+# raises. The REAL fix: split into two phases. PHASE 1 (here, at click
+# time): store the requested prefills under a key that is NOT any
+# widget's own key (`_pending_cross_link`), then `st.rerun()`. PHASE 2 (at
+# the very top of this script, before `st.tabs()` -- see that call's own
+# comment): pop `_pending_cross_link` and apply each prefill directly,
+# which is legal there because it runs before ANY tab's widgets have been
+# instantiated on the new run at all -- the same reasoning the Home tab's
+# own quick-action button already relies on (session_state must be set
+# before the target widget runs in the SAME execution), just applied at
+# the one point in this file where "before every widget" is actually
+# guaranteed: the top of the script itself.
+def _render_cross_link_button(label: str, *, target_tab: str, prefills: dict[str, str]) -> None:
+    """Renders a "View full report" button; on click, stashes `prefills`
+    and `target_tab` under `_pending_cross_link` (never a widget's own
+    key, so this write is always legal regardless of what else has
+    rendered this run) and calls `st.rerun()`. The actual prefill
+    application happens separately, at the top of this script -- see this
+    function's own module-level comment for why."""
+    if st.button(label):
+        st.session_state["_pending_cross_link"] = {"target_tab": target_tab, "prefills": prefills}
+        st.rerun()
+
+
+# ============================================================================
+# UX polish pass, Part B: export/share for compiled reports.
+#
+# STEP 0 SCOPE, stated explicitly:
+#
+# Format -- static HTML, not PDF. Reuses `build_index.py`'s own established
+# minimal-HTML pattern (plain HTML + inlined CSS, no framework, no build
+# step -- see that module's own docstring) rather than introducing a new
+# dependency: PDF generation would need a real new library this project has
+# never used anywhere (weasyprint/reportlab/pdfkit, each with its own real
+# install/system-dependency footprint); HTML needs nothing beyond the
+# stdlib `html`/`base64` modules this file now imports. The ONE real
+# difference from `build_index.py`'s own pattern: that module links to
+# SEPARATE PNG files on disk (`<img src="filename.png">`, fine for a
+# persistent local directory of files that all stay together); a
+# `st.download_button`-delivered file is a SINGLE file a user can move or
+# open anywhere, possibly with no server or sibling files present at all --
+# so every image here is embedded as a base64 `data:` URI instead
+# (`_image_to_data_uri` below), making the exported file genuinely
+# self-contained, per this task's own explicit requirement.
+#
+# Scope -- Match Report, Player Report, Team Report ONLY, not all 10 tabs.
+# These are this dashboard's three "compiled document" views (a real
+# takeaway someone would want to save/share as one file); the rest are
+# either live/ephemeral (Live CV Monitor, Alerts History, Tactical Chat),
+# comparison/trend views whose own natural output is already a chart+table
+# on-screen rather than a single narrative document (Team Trends, Team
+# Comparison), or a single visualization already easy to screenshot (Pass
+# Network). Within Player/Team Reports specifically, the export mirrors
+# what the tab actually RENDERS on screen for its own MAIN report (the
+# dashboard image + its most central metrics/tables) -- it does not
+# separately capture every optional, separately-triggered sub-panel a tab
+# can also produce (e.g. Team Reports' own opt-in Weak-Spot Lifetime
+# Analysis / Decision Quality panels, each already heavy, separately
+# button-triggered features in their own right) -- stated here explicitly,
+# not silently incomplete.
+def _image_to_data_uri(png_bytes: bytes) -> str:
+    return "data:image/png;base64," + base64.b64encode(png_bytes).decode("ascii")
+
+
+def _html_metric_row(metrics: list[tuple[str, str]]) -> str:
+    """`metrics`: `[(label, value), ...]` -- mirrors `st.metric`'s own
+    label/value shape, rendered as simple bordered cards (no framework)."""
+    cards = "".join(
+        f'<div class="metric"><div class="label">{html.escape(label)}</div>'
+        f'<div class="value">{html.escape(str(value))}</div></div>'
+        for label, value in metrics
+    )
+    return f'<div class="metric-row">{cards}</div>'
+
+
+def _html_table_from_records(records: list[dict]) -> str:
+    """`records`: a list of flat dicts, all sharing the same keys (the
+    shape every `pd.DataFrame`-backed table in this file already uses) --
+    rendered as a plain HTML table, column order taken from the first
+    record."""
+    if not records:
+        return "<p><em>No rows.</em></p>"
+    columns = list(records[0].keys())
+    header = "".join(f"<th>{html.escape(str(c))}</th>" for c in columns)
+    rows = "".join(
+        "<tr>" + "".join(f"<td>{html.escape(str(r.get(c, '')))}</td>" for c in columns) + "</tr>"
+        for r in records
+    )
+    return f"<table><thead><tr>{header}</tr></thead><tbody>{rows}</tbody></table>"
+
+
+def _build_standalone_html_export(*, title: str, generated_note: str, sections: list[str]) -> str:
+    """Wraps `sections` (pre-built HTML fragment strings) in one
+    self-contained document -- same minimal plain-HTML-plus-inlined-CSS
+    convention as `build_index.py`'s own `generate_report_index` (see that
+    function's own docstring for the precedent this mirrors), styled
+    consistently with it (the same card/table look) rather than inventing
+    a new visual language for exported files."""
+    body = "\n".join(sections)
+    return f"""<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>{html.escape(title)}</title>
+<style>
+  body {{ font-family: -apple-system, Segoe UI, Helvetica, Arial, sans-serif; margin: 2rem; background: #f5f5f5; color: #222; }}
+  .doc {{ max-width: 1000px; margin: 0 auto; }}
+  h1 {{ margin-bottom: 0.2rem; }}
+  p.subtitle {{ color: #555; margin-top: 0; }}
+  h2 {{ margin-top: 2.2rem; border-bottom: 2px solid #ddd; padding-bottom: 0.3rem; }}
+  img {{ max-width: 100%; border-radius: 4px; display: block; margin: 1rem 0; border: 1px solid #ddd; background: white; }}
+  table {{ border-collapse: collapse; width: 100%; margin: 1rem 0; background: white; }}
+  th, td {{ border: 1px solid #ddd; padding: 6px 10px; text-align: left; font-size: 0.9rem; }}
+  th {{ background: #eee; }}
+  .metric-row {{ display: flex; flex-wrap: wrap; gap: 0.6rem; margin: 0.8rem 0; }}
+  .metric {{ background: white; border: 1px solid #ddd; border-radius: 6px; padding: 0.6rem 1rem; }}
+  .metric .label {{ font-size: 0.8rem; color: #666; }}
+  .metric .value {{ font-size: 1.3rem; font-weight: bold; }}
+</style>
+</head>
+<body>
+<div class="doc">
+<h1>{html.escape(title)}</h1>
+<p class="subtitle">{html.escape(generated_note)}</p>
+{body}
+</div>
+</body>
+</html>
+"""
 
 
 def _fetch_chat_reply_safely(rest_base_url: str, session_id: str, match_id: int, message: str) -> dict | None:
@@ -984,15 +1315,70 @@ with st.sidebar:
     )
     st.divider()
 
+# UX polish pass, Part A (cross-linking): PHASE 2 of the two-phase design
+# `_render_cross_link_button`'s own module comment explains in full --
+# consuming `_pending_cross_link` HERE, before `st.tabs()` and therefore
+# before every tab's own widgets instantiate this run, is what makes
+# setting a target widget's session_state (e.g.
+# `player_report_preset_selectbox`) legal: Streamlit only forbids setting
+# a widget's session_state AFTER that widget has already rendered in the
+# SAME run, and nothing has rendered yet at this point in the script.
+# `.pop`, not `.get` -- clears the pending request in the SAME step it's
+# applied, so a cross-link jump fires exactly once, not on every
+# subsequent rerun.
+_pending_cross_link = st.session_state.pop("_pending_cross_link", None)
+_cross_link_target_tab = None
+if _pending_cross_link is not None:
+    for _cl_key, _cl_value in _pending_cross_link["prefills"].items():
+        st.session_state[_cl_key] = _cl_value
+    _cross_link_target_tab = _pending_cross_link["target_tab"]
+
 (
-    tab_cv, tab_player, tab_team, tab_trends, tab_compare, tab_pass_network, tab_alerts,
+    tab_home, tab_cv, tab_player, tab_team, tab_trends, tab_compare, tab_pass_network, tab_alerts,
     tab_match_report, tab_chat,
 ) = st.tabs(
     [
-        "Live CV Monitor", "Player Reports", "Team Reports", "Team Trends", "Team Comparison",
+        "Home", "Live CV Monitor", "Player Reports", "Team Reports", "Team Trends", "Team Comparison",
         "Pass Network", "Alerts History", "Match Report", "Tactical Chat",
-    ]
+    ],
+    default=_cross_link_target_tab,
 )
+
+# `tab_home`'s LABEL is first above -- deliberately, so it renders as the
+# leftmost/default-visible tab -- but its own `with tab_home:` body is
+# written right after `with tab_cv:` below, NOT here and NOT at the end of
+# the file. Two independent constraints, both real, both checked directly
+# rather than assumed:
+#
+# 1. `st.tabs()` decouples VISUAL tab order (the labels list above) from
+#    PHYSICAL source order (where each `with tab_x:` block sits in this
+#    script) -- Streamlit renders each returned tab object into the visual
+#    slot matching its position in the labels list, regardless of where its
+#    `with` block appears in the file. The module docstring's "PERMANENT
+#    CONSEQUENCE" section establishes a real invariant this file depends
+#    on: `with tab_cv:`'s blocking WebSocket loop must stay FIRST in
+#    physical source order (this script reruns top-to-bottom on every
+#    interaction, and every tab body physically AFTER that loop is blocked
+#    from updating until it ends) -- so `tab_home`'s body cannot be placed
+#    ahead of `tab_cv`'s without breaking that invariant for every other
+#    tab, even though doing so would not change Home's own VISUAL position
+#    at all.
+#
+# 2. Home's "Quick actions" section (Step 0 §3) sets
+#    `st.session_state["match_report_id_input"]` to jump the Match
+#    Report/Tactical Timeline tab's shared match_id field to whatever match
+#    was most recently referenced. Streamlit forbids setting a widget's
+#    session_state key AFTER that widget has already been instantiated
+#    within the SAME script run -- so `with tab_home:` must execute BEFORE
+#    `with tab_match_report:` does, in physical source order, or that
+#    assignment would raise `StreamlitAPIException` on every button click.
+#
+# Both constraints are satisfied by placing `with tab_home:` immediately
+# after `with tab_cv:` -- second in physical order, well before
+# `tab_match_report`. This also happens to be a strictly BETTER position
+# for a lightweight landing tab than appending it last (tonight's usual
+# convention for new tabs): Home is blocked only by an active CV stream in
+# `tab_cv` (rare, user-triggered), not by every other tab's code as well.
 
 # ============================================================================
 # TAB: Live CV Monitor -- the two ORIGINAL panels (Milestones 17-19, 33),
@@ -1068,53 +1454,50 @@ with tab_cv:
     minute = st.number_input("Match Minute", min_value=0, value=10, step=1)
     run_simulation_clicked = st.button("Run Simulation")
 
-    simulation_result_placeholder = st.empty()
+    def _fetch_simulation() -> dict:
+        response = requests.get(
+            f"{rest_base_url}/simulate",
+            params={"match_id": match_id, "minute": int(minute), "action": action},
+            timeout=SIMULATE_REQUEST_TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+        return response.json()
 
     if run_simulation_clicked:
-        simulation_result_placeholder.info("Running simulation...")
-        try:
-            response = requests.get(
-                f"{rest_base_url}/simulate",
-                params={"match_id": match_id, "minute": int(minute), "action": action},
-                timeout=SIMULATE_REQUEST_TIMEOUT_SECONDS,
-            )
-            response.raise_for_status()
-            result = response.json()
-        except requests.exceptions.Timeout:
-            simulation_result_placeholder.error(
-                f"Request timed out after {SIMULATE_REQUEST_TIMEOUT_SECONDS:.0f}s -- the backend at "
-                f"{rest_base_url} did not respond in time."
-            )
-        except requests.exceptions.ConnectionError:
-            simulation_result_placeholder.error(
-                f"Backend unreachable at {rest_base_url} -- confirm the FastAPI server is running "
-                "(uvicorn production.src.serving.api:app)."
-            )
-        except requests.exceptions.HTTPError as exc:
-            simulation_result_placeholder.error(f"Simulation request failed: {exc}")
-        except Exception as exc:
-            simulation_result_placeholder.error(f"Simulation request failed: {exc}")
-        else:
+        # UX polish pass (Part C): this was this file's own ORIGINAL
+        # loading/error pattern (a `st.empty()` placeholder + 4 duplicated
+        # inline `except` clauses) -- `_fetch_report_safely`'s own
+        # docstring even claimed to mirror it, but this panel was never
+        # actually migrated to use the shared helper. `st.empty()` isn't
+        # load-bearing here: this whole block only runs on the exact rerun
+        # `run_simulation_clicked` is True, and Streamlit resets button
+        # state every rerun, so there's no stale-content-from-a-previous-run
+        # case for it to guard against -- confirmed by checking, not
+        # assumed. Now the SAME `st.spinner` + `_fetch_report_safely`
+        # pattern every other tab uses.
+        with st.spinner("Running simulation..."):
+            result = _fetch_report_safely(_fetch_simulation, rest_base_url)
+
+        if result is not None:
             baseline = result["baseline_threat_15s"]
             simulated = result["simulated_threat_15s"]
             delta = result["delta"]
 
-            with simulation_result_placeholder.container():
-                metric_cols = st.columns(3)
-                metric_cols[0].metric("Baseline Threat (15s)", f"{baseline * 100:.2f}%")
-                metric_cols[1].metric("Simulated Threat (15s)", f"{simulated * 100:.2f}%")
-                # delta_color="inverse" is deliberate: st.metric's DEFAULT
-                # coloring shows a positive delta as green ("good news"), which
-                # is backwards here -- a positive delta means predicted THREAT
-                # went UP. "inverse" makes an increase render red/warning and a
-                # decrease render green/reassuring, matching what the number
-                # actually means tactically.
-                metric_cols[2].metric(
-                    "Delta (simulated - baseline)",
-                    f"{delta * 100:+.2f} pp",
-                    delta=f"{delta * 100:+.2f} pp",
-                    delta_color="inverse",
-                )
+            metric_cols = st.columns(3)
+            metric_cols[0].metric("Baseline Threat (15s)", f"{baseline * 100:.2f}%")
+            metric_cols[1].metric("Simulated Threat (15s)", f"{simulated * 100:.2f}%")
+            # delta_color="inverse" is deliberate: st.metric's DEFAULT
+            # coloring shows a positive delta as green ("good news"), which
+            # is backwards here -- a positive delta means predicted THREAT
+            # went UP. "inverse" makes an increase render red/warning and a
+            # decrease render green/reassuring, matching what the number
+            # actually means tactically.
+            metric_cols[2].metric(
+                "Delta (simulated - baseline)",
+                f"{delta * 100:+.2f} pp",
+                delta=f"{delta * 100:+.2f} pp",
+                delta_color="inverse",
+            )
 
     # ========================================================================
     # Panel 1b: Coach Mode (new reporting track, Part C) -- the narrow,
@@ -1132,7 +1515,6 @@ with tab_cv:
         "threat (GET /coach-mode)."
     )
     coach_mode_clicked = st.button("Run Coach Mode")
-    coach_mode_result_placeholder = st.empty()
 
     def _fetch_coach_mode() -> dict:
         response = requests.get(
@@ -1144,21 +1526,24 @@ with tab_cv:
         return response.json()
 
     if coach_mode_clicked:
-        coach_mode_result_placeholder.info("Ranking all tactical actions...")
-        coach_mode_result = _fetch_report_safely(_fetch_coach_mode, rest_base_url)
+        # UX polish pass (Part C): was its own `st.empty()` placeholder --
+        # same simplification as the What-If Simulator panel above, same
+        # reasoning (not load-bearing; button-click gating already
+        # prevents stale content across unrelated reruns).
+        with st.spinner("Ranking all tactical actions..."):
+            coach_mode_result = _fetch_report_safely(_fetch_coach_mode, rest_base_url)
         if coach_mode_result is not None:
-            with coach_mode_result_placeholder.container():
-                st.metric("Baseline Threat (15s)", f"{coach_mode_result['baseline_threat_15s'] * 100:.2f}%")
-                st.success(f"Recommended action: **{coach_mode_result['recommended_action']}**")
-                rankings_df = pd.DataFrame(coach_mode_result["rankings"])
-                rankings_df["simulated_threat_15s"] = rankings_df["simulated_threat_15s"] * 100
-                rankings_df["delta"] = rankings_df["delta"] * 100
-                rankings_df = rankings_df.rename(columns={
-                    "action": "Action",
-                    "simulated_threat_15s": "Simulated Threat (15s) %",
-                    "delta": "Delta (pp)",
-                })
-                st.dataframe(rankings_df, width="stretch")
+            st.metric("Baseline Threat (15s)", f"{coach_mode_result['baseline_threat_15s'] * 100:.2f}%")
+            st.success(f"Recommended action: **{coach_mode_result['recommended_action']}**")
+            rankings_df = pd.DataFrame(coach_mode_result["rankings"])
+            rankings_df["simulated_threat_15s"] = rankings_df["simulated_threat_15s"] * 100
+            rankings_df["delta"] = rankings_df["delta"] * 100
+            rankings_df = rankings_df.rename(columns={
+                "action": "Action",
+                "simulated_threat_15s": "Simulated Threat (15s) %",
+                "delta": "Delta (pp)",
+            })
+            st.dataframe(rankings_df, width="stretch")
 
     st.divider()
 
@@ -1372,6 +1757,109 @@ with tab_cv:
                 )
 
 # ============================================================================
+# TAB: Home -- landing/orientation view. VISUALLY leftmost (see the
+# `st.tabs()` call's own comment above for why this `with` block is
+# nonetheless physically SECOND, right after `tab_cv`, not first or last).
+# Pure read-only summary/orchestration layer: every figure below is reused
+# from an existing scan (`candidate_index.py`), an existing query
+# (`alert_store.py`, via the same `/alerts/history` endpoint the Alerts
+# History tab already calls), or an existing endpoint (`/health`,
+# `/metrics`) -- nothing here is computed fresh, and no report-generation/
+# model/physics logic is touched. See the "Home tab helpers" section above
+# for the full Step 0 scope writeup.
+# ============================================================================
+with tab_home:
+    st.header("Home")
+    st.caption(
+        "Orientation before picking a tab -- what's cached locally, what's happened recently, "
+        "quick shortcuts into the deepest views, and whether the backend is up. Every figure "
+        "on this tab is reused from an existing scan, query, or endpoint; nothing here is "
+        "computed fresh."
+    )
+
+    # --- System status (Step 0 §4: existing GET /health, GET /metrics) -----
+    st.subheader("System Status")
+    home_health = _fetch_report_safely(lambda: _cached_health(rest_base_url), rest_base_url)
+    home_metrics = _fetch_report_safely(lambda: _cached_metrics(rest_base_url), rest_base_url)
+
+    status_cols = st.columns(4)
+    if home_health is not None:
+        status_cols[0].metric("Backend Status", home_health["status"])
+        status_cols[1].metric("Model Loaded", "Yes" if home_health["model_loaded"] else "No")
+        home_uptime = home_health.get("uptime_seconds")
+        status_cols[2].metric("Uptime", f"{home_uptime / 60:.1f} min" if home_uptime is not None else "n/a")
+    else:
+        status_cols[0].metric("Backend Status", "unreachable")
+        status_cols[1].metric("Model Loaded", "n/a")
+        status_cols[2].metric("Uptime", "n/a")
+    status_cols[3].metric(
+        "Alerts Logged (Total)",
+        home_metrics.get("total_alerts_logged", "n/a") if home_metrics is not None else "n/a",
+    )
+
+    st.divider()
+
+    # --- Data coverage summary (Step 0 §1) ----------------------------------
+    st.subheader("Data Coverage")
+    home_cache_bust = st.session_state.get("candidate_cache_bust", 0)
+    home_teams, home_players = _cached_candidate_index(home_cache_bust)
+    home_coverage = _home_data_coverage_summary(home_teams, home_players)
+
+    coverage_cols = st.columns(4)
+    coverage_cols[0].metric("Players Cached", home_coverage["total_players_cached"])
+    coverage_cols[1].metric("Teams Cached", home_coverage["total_teams_cached"])
+    coverage_cols[2].metric("Matches Cached", home_coverage["total_matches_cached"])
+    coverage_cols[3].metric("Matches with 360 Coverage", home_coverage["total_matches_360"])
+    st.caption("See the Player Reports / Team Reports tabs to explore this data.")
+
+    st.divider()
+
+    # --- Recent activity (Step 0 §2) + Quick actions (Step 0 §3) -----------
+    st.subheader("Recent Activity")
+    home_recent_alerts = _fetch_report_safely(
+        lambda: _cached_alerts_history(rest_base_url, None, None, None, None, HOME_RECENT_ALERTS_LIMIT),
+        rest_base_url,
+    )
+
+    if home_recent_alerts is None:
+        st.info("Could not fetch alert history -- see the error above.")
+    elif len(home_recent_alerts) == 0:
+        st.info("No alerts logged yet. Once activity starts, it will show here and in the Alerts History tab.")
+    else:
+        home_display_df = pd.DataFrame(home_recent_alerts)[[
+            "logged_at_utc", "source", "match_id", "minute", "delta",
+        ]].rename(columns={
+            "logged_at_utc": "Timestamp (UTC)",
+            "source": "Source",
+            "match_id": "Match ID",
+            "minute": "Minute",
+            "delta": "Threat Delta",
+        })
+        st.dataframe(home_display_df, width="stretch")
+
+        home_total_logged = home_metrics.get("total_alerts_logged") if home_metrics is not None else None
+        if home_total_logged is not None:
+            st.caption(
+                f"Showing {len(home_recent_alerts)} most recent of {home_total_logged} total -- "
+                "see the Alerts History tab for full history and filters."
+            )
+        else:
+            st.caption("See the Alerts History tab for full history and filters.")
+
+        st.markdown("**Quick actions**")
+        home_recent_match_id = _home_most_recent_match_id(home_recent_alerts)
+        if home_recent_match_id is not None:
+            if st.button(f"Jump to match_id={home_recent_match_id} in Match Report / Tactical Timeline"):
+                st.session_state["match_report_id_input"] = str(home_recent_match_id)
+                st.success(
+                    f"Match ID field in the Match Report tab is now set to {home_recent_match_id} -- "
+                    "click that tab to view. Covers both Automatic Match Report/Tactical Event "
+                    "Detection and Tactical Timeline, which share the same Match ID field."
+                )
+        else:
+            st.caption("No recent alert carries a match_id yet -- no quick-action shortcut to offer.")
+
+# ============================================================================
 # TAB: Player Reports -- report DATA now fetched over HTTP from api.py's
 # /reports/player/{player_id} (ADR-018); PNG rendering still calls
 # player_visualizer.py directly (pure client-side rendering of an
@@ -1399,10 +1887,33 @@ with tab_player:
         _label = f"{_p['name']} ({_p['player_id']}) -- {_tag}, {len(_p['seasons'])} season(s) cached"
         _player_labels[_label] = _p
 
-    preset_label = st.selectbox("Player", list(_player_labels.keys()) + ["Custom"])
+    # `key=` on these three widgets (UX polish pass, Part A): added so a
+    # "View full report" cross-link button elsewhere in this file can
+    # pre-fill them via `st.session_state` before an `st.rerun()` -- see
+    # `_render_cross_link_button`'s own docstring for why "Custom" mode
+    # specifically (not the preset dropdown) is the cross-link target: a
+    # preset's own OPTION STRING is a long, dynamically-scanned label
+    # ("Name (id) -- well-supported, N season(s) cached") a cross-link
+    # button would have to reconstruct byte-for-byte to select it via
+    # session_state, which is fragile and tightly coupled to
+    # candidate_index.py's own label formatting; "Custom" is always a
+    # stable, literal string in both this list and Team Reports' own preset
+    # list, and its own fields take plain player_id/match_ids values
+    # directly -- a far more robust target. Zero behavior change for a user
+    # who never uses a cross-link button: an explicit `key` only enables
+    # EXTERNAL control via session_state, it doesn't change a widget's
+    # default behavior otherwise.
+    preset_label = st.selectbox(
+        "Player", list(_player_labels.keys()) + ["Custom"], key="player_report_preset_selectbox"
+    )
     if preset_label == "Custom":
-        player_id_input = st.text_input("Player ID (StatsBomb player_id)", value="")
-        match_ids_input = st.text_input("Match IDs (comma-separated StatsBomb match_id list)", value="")
+        player_id_input = st.text_input(
+            "Player ID (StatsBomb player_id)", value="", key="player_report_custom_player_id"
+        )
+        match_ids_input = st.text_input(
+            "Match IDs (comma-separated StatsBomb match_id list)", value="",
+            key="player_report_custom_match_ids",
+        )
         player_id = int(player_id_input) if player_id_input.strip() else None
         match_ids = (
             tuple(int(m.strip()) for m in match_ids_input.split(",") if m.strip())
@@ -1492,6 +2003,12 @@ with tab_player:
                 # generate_player_shot_map's docstring).
                 st.divider()
                 st.subheader("Shot Map")
+                # UX polish pass (Part B): tracks whether an exportable shot
+                # map image actually got rendered this run -- stays None on
+                # the "no data"/"configuration error" paths below, so the
+                # Export button (further down this tab) can honestly omit
+                # it rather than reference an undefined variable.
+                _export_shot_map_png = None
                 with st.spinner("Generating shot map..."):
                     shot_map = _fetch_report_safely(
                         lambda: _cached_player_shot_map(rest_base_url, player_id, match_ids), rest_base_url
@@ -1544,6 +2061,7 @@ with tab_player:
                         )
                         with st.expander("Raw shot map data (aggregated grids only -- no per-shot data)"):
                             st.json(shot_map)
+                        _export_shot_map_png = shot_map_png
                     else:
                         # Local/private mode, response confirmed to carry
                         # real per-shot data -- unchanged from before this
@@ -1552,6 +2070,7 @@ with tab_player:
                         st.image(shot_map_png, caption=f"Shot Map -- player_id={player_id}", width="stretch")
                         with st.expander("Raw shot map data"):
                             st.json(shot_map)
+                        _export_shot_map_png = shot_map_png
 
                 # --- Player Dashboard: match-level views (additive new feature) ---
                 # A THIRD section, alongside (not replacing) the positional-
@@ -1588,8 +2107,44 @@ with tab_player:
                         st.dataframe(summary_df, width="stretch")
                         with st.expander("Raw match summary data (full event-type counts per match)"):
                             st.json(match_summary)
+                        _export_match_summary_records = summary_df.to_dict("records")
                     else:
                         st.info("No match-level data -- player did not appear in any requested match.")
+                        _export_match_summary_records = []
+
+                    # --- Export (UX polish pass, Part B) --------------------
+                    # Scope, stated explicitly: the main dashboard image,
+                    # the Shot Map, and the match summary table -- the
+                    # report's three "always attempted on Generate" panels.
+                    # Press Resistance Index / touch map / timeline /
+                    # Player Similarity Search below are each their OWN,
+                    # separately-triggered sub-panel (own button, own
+                    # spinner) -- consistent with Team Report's own export
+                    # scoping (see this file's Part B module-level comment).
+                    _player_report_sections = [
+                        f"<h2>Report</h2><img src=\"{_image_to_data_uri(png_bytes)}\" alt=\"Player report\">"
+                    ]
+                    if _export_shot_map_png is not None:
+                        _player_report_sections.append(
+                            f"<h2>Shot Map</h2><img src=\"{_image_to_data_uri(_export_shot_map_png)}\" alt=\"Shot map\">"
+                        )
+                    _player_report_sections.append(
+                        "<h2>Match-by-Match Summary</h2>" + _html_table_from_records(_export_match_summary_records)
+                    )
+                    _player_report_html = _build_standalone_html_export(
+                        title=f"Player Report -- player_id={player_id}",
+                        generated_note=(
+                            "Project Athena -- Player Report. Static, self-contained HTML -- opens "
+                            "directly from the filesystem, no server required."
+                        ),
+                        sections=_player_report_sections,
+                    )
+                    st.download_button(
+                        "Export Player Report (HTML)",
+                        data=_player_report_html,
+                        file_name=f"player_report_{player_id}.html",
+                        mime="text/html",
+                    )
 
                     st.markdown("**Press Resistance Index** (successful action while under pressure)")
                     with st.spinner("Generating Press Resistance Index..."):
@@ -1726,43 +2281,58 @@ with tab_player:
                         "population) operation, manually triggered ONLY -- there is no automatic "
                         "rebuild. Run this once after fetching new player data, not on every visit."
                     )):
+                        # UX polish pass (Part C): was its own inline
+                        # try/except catching only the broad
+                        # `RequestException` parent class (Timeout/
+                        # ConnectionError/HTTPError all collapsed into one
+                        # generic message, unlike every other tab's own
+                        # 3-way-differentiated error). Now the same shared
+                        # helper, same message templates, everywhere.
                         with st.spinner("Rebuilding similarity index (this genuinely takes a while)..."):
-                            try:
-                                rebuild_result = _rebuild_similarity_index(rest_base_url)
-                            except requests.exceptions.RequestException as exc:
-                                st.error(f"Rebuild failed: {exc}")
-                            else:
-                                st.success(
-                                    f"Indexed {rebuild_result['searchable_population_size']} of "
-                                    f"{rebuild_result['total_cached_population_size']} cached players "
-                                    f"in {rebuild_result['build_duration_seconds']:.1f}s."
-                                )
-                                st.cache_data.clear()
+                            rebuild_result = _fetch_report_safely(
+                                lambda: _rebuild_similarity_index(rest_base_url), rest_base_url
+                            )
+                        if rebuild_result is not None:
+                            st.success(
+                                f"Indexed {rebuild_result['searchable_population_size']} of "
+                                f"{rebuild_result['total_cached_population_size']} cached players "
+                                f"in {rebuild_result['build_duration_seconds']:.1f}s."
+                            )
+                            st.cache_data.clear()
 
                 top_k = st.number_input("Top-K similar players", min_value=1, max_value=20, value=5, step=1)
                 if st.button("Find Similar Players"):
+                    # UX polish pass (Part C): was its own inline try/except
+                    # duplicating `_fetch_report_safely`'s logic (plus a
+                    # special 404 case) -- now absorbed into the shared
+                    # helper via `not_found_message`, so this special case
+                    # no longer needs its own copy of the other 3 exception
+                    # branches.
                     with st.spinner("Querying similarity index..."):
-                        try:
-                            similar = _cached_similar_players(rest_base_url, player_id, int(top_k))
-                        except requests.exceptions.HTTPError as exc:
-                            if exc.response is not None and exc.response.status_code == 404:
-                                st.info(
-                                    "No similarity index found yet -- click 'Rebuild similarity index' "
-                                    "above first."
-                                )
-                            else:
-                                st.error(f"Request failed: {exc}")
-                            similar = None
-                        except requests.exceptions.RequestException as exc:
-                            st.error(f"Request failed: {exc}")
-                            similar = None
+                        similar = _fetch_report_safely(
+                            lambda: _cached_similar_players(rest_base_url, player_id, int(top_k)),
+                            rest_base_url,
+                            not_found_message=(
+                                "No similarity index found yet -- click 'Rebuild similarity index' above first."
+                            ),
+                        )
+                    # UX polish pass (Part A): stored in session_state and
+                    # rendered below, outside this transient `if
+                    # ..._clicked:` gate -- see `_render_cross_link_button`'s
+                    # own module comment for the "orphaned click" bug this
+                    # fixes (found by actually testing it, not assumed).
+                    st.session_state["_similar_players_result"] = {"player_id": player_id, "data": similar}
 
+                _sp_result = st.session_state.get("_similar_players_result")
+                if _sp_result is not None:
+                    _sp_player_id = _sp_result["player_id"]
+                    similar = _sp_result["data"]
                     if similar is not None:
                         if similar.get("no_data"):
                             st.info(similar.get("reason", "This player is not in the searchable population."))
                         else:
                             st.write(
-                                f"Players most similar to **{similar['name']}** (player_id={player_id}), "
+                                f"Players most similar to **{similar['name']}** (player_id={_sp_player_id}), "
                                 f"out of {similar['searchable_population_size']} searchable players:"
                             )
                             similar_df = pd.DataFrame([
@@ -1777,6 +2347,50 @@ with tab_player:
                             st.dataframe(similar_df, width="stretch")
                             with st.expander("Raw player similarity data"):
                                 st.json(similar)
+
+                            # --- Cross-linking (UX polish pass, Part A) -----
+                            # Real navigation problem this closes (Step 0):
+                            # a similar player's name/player_id appears here
+                            # with no path to their own Player Report.
+                            # HONEST LIMITATION, stated explicitly rather
+                            # than silently guessed: this endpoint's own
+                            # response (`find_similar_players`) carries no
+                            # match_ids for the MATCHED players -- only
+                            # name/player_id/similarity/matched_features
+                            # (confirmed directly in player_similarity.py).
+                            # Cross-referencing `_cached_players` (already
+                            # loaded in this same tab, no new call) recovers
+                            # match_ids for any matched player who is ALSO
+                            # in the local cache -- the common case, since
+                            # the similarity index itself is built from that
+                            # same cached population. When a match isn't
+                            # found (an edge case, not the norm), the button
+                            # still pre-fills player_id and gets the user to
+                            # the right tab in Custom mode -- they supply
+                            # match_ids themselves -- rather than being
+                            # silently omitted.
+                            st.markdown("**Jump to a similar player's full report:**")
+                            _similar_match_ids_by_player: dict[int, list[int]] = {
+                                _p["player_id"]: sorted(
+                                    {mid for _s in _p["seasons"] for mid in _s["match_ids"]}
+                                )
+                                for _p in _cached_players
+                            }
+                            _similar_cols = st.columns(3)
+                            for _sim_i, _sim_player in enumerate(similar["similar_players"]):
+                                _sim_match_ids = _similar_match_ids_by_player.get(_sim_player["player_id"], [])
+                                with _similar_cols[_sim_i % 3]:
+                                    _render_cross_link_button(
+                                        f"{_sim_player['name']} →",
+                                        target_tab="Player Reports",
+                                        prefills={
+                                            "player_report_preset_selectbox": "Custom",
+                                            "player_report_custom_player_id": str(_sim_player["player_id"]),
+                                            "player_report_custom_match_ids": ",".join(
+                                                str(m) for m in _sim_match_ids
+                                            ),
+                                        },
+                                    )
 
 # ============================================================================
 # TAB: Team Reports -- report DATA now fetched over HTTP from api.py's
@@ -1829,7 +2443,13 @@ with tab_team:
         _label = f"{_t['team_name']} -- {_tag} (of {_t['total_matches_cached']} cached), {len(_t['seasons'])} season(s)"
         _team_labels[_label] = _t
 
-    team_preset_label = st.selectbox("Team", list(_team_labels.keys()) + ["Custom"])
+    # `key=` added for the same cross-link reason as the Player Reports
+    # tab's own preset selectbox -- see that widget's own comment. Team
+    # Reports' own "Custom" fields (`team_report_name`/`team_report_match_ids`
+    # below) already had explicit keys before this pass.
+    team_preset_label = st.selectbox(
+        "Team", list(_team_labels.keys()) + ["Custom"], key="team_report_preset_selectbox"
+    )
     if team_preset_label == "Custom":
         team_name_input = st.text_input("Team name (StatsBomb team name)", value="", key="team_report_name")
         team_match_ids_input = st.text_input(
@@ -2072,6 +2692,72 @@ with tab_team:
 
                 with st.expander("Raw report data"):
                     st.json(team_report_dict)
+
+                # --- Export (UX polish pass, Part B) ------------------------
+                # Scope, stated explicitly: the main dashboard image plus
+                # Tactical Entropy/Opposition Analysis for this SAME single
+                # variant (`_single_variant`) -- both re-fetched here via
+                # their own already-`st.cache_data`-wrapped functions, so
+                # this is a real cache HIT (no new network cost), not a
+                # second computation; simpler than threading an accumulator
+                # through their own per-variant render loops further below,
+                # which also cover the rarer multi-variant case this export
+                # button does not (a team whose name changed across the
+                # requested seasons -- disclosed, not silently dropped).
+                # Weak-Spot Lifetime Analysis / Decision Quality below are
+                # each their OWN separately-triggered sub-panel (own
+                # button, own spinner, real extra compute cost) -- excluded
+                # from this export for the same reason Player Report's own
+                # Press Resistance Index/touch map/timeline are.
+                _team_export_sections = [
+                    f"<h2>Report</h2><img src=\"{_image_to_data_uri(team_png_bytes)}\" alt=\"Team report\">"
+                ]
+                # Raw (un-360-filtered) match_ids for this SAME variant --
+                # Tactical Entropy/Opposition Analysis both need no 360
+                # coverage, so they use the raw selection, not
+                # `_single_match_ids` (which is 360-filtered/capped, for
+                # the pitch-control report above only). Falls back to
+                # `_single_match_ids` only if this variant is somehow
+                # absent from the raw dict (not expected in practice --
+                # `_variant_to_match_ids_360` is derived FROM
+                # `_variant_to_match_ids`).
+                _export_raw_match_ids = _variant_to_match_ids.get(_single_variant, _single_match_ids)
+                _export_entropy = _cached_team_pass_entropy(rest_base_url, _single_variant, _export_raw_match_ids)
+                if _export_entropy is not None and _export_entropy["conditional_entropy_bits"] is not None:
+                    _team_export_sections.append(
+                        "<h2>Tactical Entropy</h2>"
+                        + _html_metric_row([
+                            ("Conditional Entropy", f"{_export_entropy['conditional_entropy_bits']:.3f} bits"),
+                            ("Normalized (0=predictable, 1=random)", f"{_export_entropy['normalized_entropy']:.3f}"),
+                            ("Real Transitions Observed", str(_export_entropy["total_transitions"])),
+                        ])
+                    )
+                _export_opposition = _cached_team_opposition_analysis(rest_base_url, _single_variant, _export_raw_match_ids)
+                if _export_opposition is not None:
+                    _opp_metrics: list[tuple[str, str]] = []
+                    _long_pass_share = (_export_opposition.get("build_up_tendency") or {}).get("long_pass_share")
+                    if _long_pass_share is not None:
+                        _opp_metrics.append(("Build-up long-pass share", f"{_long_pass_share * 100:.1f}%"))
+                    _set_piece_share = (_export_opposition.get("set_piece_reliance") or {}).get("set_piece_shot_share")
+                    if _set_piece_share is not None:
+                        _opp_metrics.append(("Set-piece shot share", f"{_set_piece_share * 100:.1f}%"))
+                    if _opp_metrics:
+                        _team_export_sections.append("<h2>Opposition Analysis</h2>" + _html_metric_row(_opp_metrics))
+
+                _team_export_html = _build_standalone_html_export(
+                    title=f"Team Report -- {team_name}",
+                    generated_note=(
+                        "Project Athena -- Team Report. Static, self-contained HTML -- opens directly "
+                        "from the filesystem, no server required."
+                    ),
+                    sections=_team_export_sections,
+                )
+                st.download_button(
+                    "Export Team Report (HTML)",
+                    data=_team_export_html,
+                    file_name=f"team_report_{team_name.replace(' ', '_')}.html",
+                    mime="text/html",
+                )
 
         # Tactical Entropy (additive new feature): rendered for EVERY
         # variant in `_variant_to_match_ids` (the RAW, un-360-filtered
@@ -2571,50 +3257,77 @@ with tab_trends:
             if trend_start_season > trend_end_season:
                 st.error("Start season must be <= end season.")
             else:
+                # UX polish pass (Part C): this call is direct/in-process,
+                # not an HTTP call to this project's own backend
+                # (team_trend_data.py's own module docstring: it must never
+                # be served over api.py) -- but it DOES make its own real
+                # network call to football-data.co.uk internally, and that
+                # call previously had ZERO exception handling anywhere on
+                # this path (a real gap the Step 0 audit found: this was
+                # the one tab in the whole dashboard where a genuine
+                # network failure -- no internet, football-data.co.uk down
+                # -- would crash the script with an unhandled traceback
+                # instead of a clean message). Routed through the SAME
+                # shared helper every other tab already uses, via
+                # `context_label` since there is no `rest_base_url` here.
                 with st.spinner("Fetching and aggregating season data..."):
-                    trend_report = _cached_team_trend_report(trend_team_name.strip(), int(trend_start_season), int(trend_end_season))
-
-                st.write(
-                    f"Seasons found: {trend_report['seasons_found']} / {trend_report['seasons_requested']} requested."
-                )
-
-                # gap_seasons: reused directly, shown honestly -- never silently
-                # omitted just because this is now a UI instead of a printed dict.
-                if trend_report["gap_seasons"]:
-                    st.warning(
-                        "Gap seasons (team not found in any of the five covered top-flight leagues -- "
-                        "relegated, not yet promoted, or otherwise absent that year): "
-                        + ", ".join(trend_report["gap_seasons"])
+                    trend_report = _fetch_report_safely(
+                        lambda: _cached_team_trend_report(
+                            trend_team_name.strip(), int(trend_start_season), int(trend_end_season)
+                        ),
+                        context_label="football-data.co.uk",
+                    )
+                if trend_report is None:
+                    pass  # _fetch_report_safely already rendered the error
+                else:
+                    st.write(
+                        f"Seasons found: {trend_report['seasons_found']} / {trend_report['seasons_requested']} requested."
                     )
 
-                season_stats = trend_report["season_stats"]
-                if season_stats:
-                    trend_df = pd.DataFrame.from_dict(season_stats, orient="index")
-                    trend_df.index.name = "season"
+                    # gap_seasons: reused directly, shown honestly -- never silently
+                    # omitted just because this is now a UI instead of a printed dict.
+                    if trend_report["gap_seasons"]:
+                        st.warning(
+                            "Gap seasons (team not found in any of the five covered top-flight leagues -- "
+                            "relegated, not yet promoted, or otherwise absent that year): "
+                            + ", ".join(trend_report["gap_seasons"])
+                        )
 
-                    st.subheader("Year-by-year trend")
-                    chart_metrics = [m for m in ["points", "goals_scored", "goals_conceded", "win_rate"] if m in trend_df.columns]
-                    if chart_metrics:
-                        st.line_chart(trend_df[chart_metrics])
+                    season_stats = trend_report["season_stats"]
+                    if season_stats:
+                        trend_df = pd.DataFrame.from_dict(season_stats, orient="index")
+                        trend_df.index.name = "season"
 
-                    st.subheader("Raw per-season data")
-                    st.dataframe(trend_df)
+                        st.subheader("Year-by-year trend")
+                        chart_metrics = [m for m in ["points", "goals_scored", "goals_conceded", "win_rate"] if m in trend_df.columns]
+                        if chart_metrics:
+                            st.line_chart(trend_df[chart_metrics])
 
-                    if trend_report["year_over_year_deltas"]:
-                        st.subheader("Year-over-year deltas")
-                        deltas_df = pd.DataFrame(trend_report["year_over_year_deltas"])
-                        st.dataframe(deltas_df)
-                        non_consecutive = deltas_df[~deltas_df["consecutive"]]
-                        if not non_consecutive.empty:
-                            st.info(
-                                "Rows marked consecutive=False span a gap season -- not an "
-                                "adjacent-year comparison, shown as such rather than implied to be one."
-                            )
-                else:
-                    st.error(f"No seasons found for {trend_team_name!r} in the requested range across any covered league.")
+                        st.subheader("Raw per-season data")
+                        st.dataframe(trend_df)
 
-                with st.expander("Raw report data"):
-                    st.json(trend_report)
+                        if trend_report["year_over_year_deltas"]:
+                            st.subheader("Year-over-year deltas")
+                            deltas_df = pd.DataFrame(trend_report["year_over_year_deltas"])
+                            st.dataframe(deltas_df)
+                            non_consecutive = deltas_df[~deltas_df["consecutive"]]
+                            if not non_consecutive.empty:
+                                st.info(
+                                    "Rows marked consecutive=False span a gap season -- not an "
+                                    "adjacent-year comparison, shown as such rather than implied to be one."
+                                )
+                    else:
+                        # UX polish pass (Part C): was `st.error` -- an
+                        # empty RESULT (this team genuinely has no seasons
+                        # in the requested range) is not a SYSTEM failure;
+                        # every other tab's analogous "found nothing" case
+                        # (Pass Network, Match Report, Alerts History) uses
+                        # `st.info`, not the alarming red error box. Same
+                        # visual language now, not just the same wording.
+                        st.info(f"No seasons found for {trend_team_name!r} in the requested range across any covered league.")
+
+                    with st.expander("Raw report data"):
+                        st.json(trend_report)
 
         # --- Compare Two Seasons (Feature 3, additive) -----------------
         # A SEPARATE section, alongside (not replacing) the year-by-year
@@ -2650,12 +3363,20 @@ with tab_trends:
         compare_clicked = st.button("Compare Seasons")
 
         if compare_clicked:
+            # UX polish pass (Part C): same fix as "Generate Trend Report"
+            # above -- this call previously had no exception handling at
+            # all around its own real football-data.co.uk network call.
             with st.spinner("Fetching and comparing both seasons..."):
-                comparison = _cached_team_trend_comparison(
-                    compare_team_name.strip(), int(compare_season_a), int(compare_season_b)
+                comparison = _fetch_report_safely(
+                    lambda: _cached_team_trend_comparison(
+                        compare_team_name.strip(), int(compare_season_a), int(compare_season_b)
+                    ),
+                    context_label="football-data.co.uk",
                 )
 
-            if not comparison["season_a_found"] or not comparison["season_b_found"]:
+            if comparison is None:
+                pass  # _fetch_report_safely already rendered the error
+            elif not comparison["season_a_found"] or not comparison["season_b_found"]:
                 st.warning(comparison["summary"])
             else:
                 st.write(comparison["summary"])
@@ -2666,8 +3387,9 @@ with tab_trends:
                     width="stretch",
                 )
 
-            with st.expander("Raw comparison data"):
-                st.json(comparison)
+            if comparison is not None:
+                with st.expander("Raw comparison data"):
+                    st.json(comparison)
 
 # ============================================================================
 # TAB: Team Comparison -- report DATA now fetched over HTTP from api.py's
@@ -2821,54 +3543,91 @@ with tab_pass_network:
             pass_network_match_id = int(pass_network_match_id_input.strip())
         except ValueError:
             st.error(f"Match ID must be a whole number -- got {pass_network_match_id_input!r}.")
+            st.session_state.pop("_pass_network_result", None)
         else:
             with st.spinner("Generating pass network..."):
                 pass_network = _fetch_report_safely(
                     lambda: _cached_pass_network(rest_base_url, pass_network_match_id), rest_base_url
                 )
+            # UX polish pass (Part A): stored in session_state and RENDERED
+            # BELOW, outside this transient `if ..._clicked:` gate -- see
+            # `_render_cross_link_button`'s own module comment for why a
+            # cross-link button cannot safely live inside this block
+            # directly (its own `st.rerun()` would silently orphan itself,
+            # a real bug found by actually testing this, not assumed).
+            st.session_state["_pass_network_result"] = {"match_id": pass_network_match_id, "data": pass_network}
 
-            if pass_network is not None:
-                if pass_network.get("no_data"):
-                    st.info(pass_network.get("reason", "No pass network data available for this match_id."))
+    _pn_result = st.session_state.get("_pass_network_result")
+    if _pn_result is not None:
+        pass_network_match_id = _pn_result["match_id"]
+        pass_network = _pn_result["data"]
+        if pass_network is not None:
+            if pass_network.get("no_data"):
+                st.info(pass_network.get("reason", "No pass network data available for this match_id."))
+            else:
+                # ADR-021 condition-2 compliance fix. DEFENSE IN DEPTH,
+                # deliberately checking BOTH signals rather than trusting
+                # either alone -- see the Shot Map panel's own comment
+                # (Player Reports tab) for the full reasoning; mirrored
+                # here unchanged:
+                #   1. response_has_raw_network -- the ACTUAL shape of
+                #      what api.py returned (ground truth: api.py's own
+                #      PUBLIC_DEPLOYMENT flag already decided server-side
+                #      whether generate_pass_network's raw nodes/edges
+                #      were ever computed at all).
+                #   2. this process's OWN PUBLIC_DEPLOYMENT flag.
+                response_has_raw_network = "nodes" in pass_network
+
+                if PUBLIC_DEPLOYMENT and response_has_raw_network:
+                    st.error(
+                        "Configuration error: this dashboard process has PUBLIC_DEPLOYMENT=true, "
+                        "but the API server returned raw per-player location/edge data -- refusing "
+                        "to render or display it. Set PUBLIC_DEPLOYMENT=true on the API server "
+                        "process too (see README.md's 'Public deployment mode' section)."
+                    )
+                elif PUBLIC_DEPLOYMENT or not response_has_raw_network:
+                    pass_network_png = _cached_pass_network_aggregated_png(pass_network)
+                    st.image(
+                        pass_network_png,
+                        caption=f"Pass Network (aggregated) -- match_id={pass_network_match_id}",
+                        width="stretch",
+                    )
+                    with st.expander("Raw pass network data (per-player totals only -- no location/edges)"):
+                        st.json(pass_network)
                 else:
-                    # ADR-021 condition-2 compliance fix. DEFENSE IN DEPTH,
-                    # deliberately checking BOTH signals rather than trusting
-                    # either alone -- see the Shot Map panel's own comment
-                    # (Player Reports tab) for the full reasoning; mirrored
-                    # here unchanged:
-                    #   1. response_has_raw_network -- the ACTUAL shape of
-                    #      what api.py returned (ground truth: api.py's own
-                    #      PUBLIC_DEPLOYMENT flag already decided server-side
-                    #      whether generate_pass_network's raw nodes/edges
-                    #      were ever computed at all).
-                    #   2. this process's OWN PUBLIC_DEPLOYMENT flag.
-                    response_has_raw_network = "nodes" in pass_network
+                    pass_network_png = _cached_pass_network_png(pass_network)
+                    st.image(
+                        pass_network_png,
+                        caption=f"Pass Network -- match_id={pass_network_match_id}",
+                        width="stretch",
+                    )
+                    with st.expander("Raw pass network data"):
+                        st.json(pass_network)
 
-                    if PUBLIC_DEPLOYMENT and response_has_raw_network:
-                        st.error(
-                            "Configuration error: this dashboard process has PUBLIC_DEPLOYMENT=true, "
-                            "but the API server returned raw per-player location/edge data -- refusing "
-                            "to render or display it. Set PUBLIC_DEPLOYMENT=true on the API server "
-                            "process too (see README.md's 'Public deployment mode' section)."
-                        )
-                    elif PUBLIC_DEPLOYMENT or not response_has_raw_network:
-                        pass_network_png = _cached_pass_network_aggregated_png(pass_network)
-                        st.image(
-                            pass_network_png,
-                            caption=f"Pass Network (aggregated) -- match_id={pass_network_match_id}",
-                            width="stretch",
-                        )
-                        with st.expander("Raw pass network data (per-player totals only -- no location/edges)"):
-                            st.json(pass_network)
-                    else:
-                        pass_network_png = _cached_pass_network_png(pass_network)
-                        st.image(
-                            pass_network_png,
-                            caption=f"Pass Network -- match_id={pass_network_match_id}",
-                            width="stretch",
-                        )
-                        with st.expander("Raw pass network data"):
-                            st.json(pass_network)
+                    # --- Cross-linking (UX polish pass, Part A) -------------
+                    # RAW variant only, deliberately -- the aggregated
+                    # variant's own `player_summary` carries no player
+                    # NAME (see generate_pass_network_aggregated's own
+                    # docstring), so there is no entity here to link to
+                    # in that mode. Real navigation problem this closes
+                    # (Step 0): a player's name appears in this tab only
+                    # baked into the PNG image itself -- there was
+                    # previously no way to jump from a name seen here to
+                    # that same player's own Player Report.
+                    st.markdown("**Jump to a player's full report:**")
+                    _pn_nodes = sorted(pass_network["nodes"], key=lambda n: (n["team"], n["name"]))
+                    _pn_cols = st.columns(3)
+                    for _pn_i, _pn_node in enumerate(_pn_nodes):
+                        with _pn_cols[_pn_i % 3]:
+                            _render_cross_link_button(
+                                f"{_pn_node['name']} ({_pn_node['team']}) →",
+                                target_tab="Player Reports",
+                                prefills={
+                                    "player_report_preset_selectbox": "Custom",
+                                    "player_report_custom_player_id": str(_pn_node["player_id"]),
+                                    "player_report_custom_match_ids": str(pass_network_match_id),
+                                },
+                            )
 
 
 # ============================================================================
@@ -3012,47 +3771,123 @@ with tab_match_report:
             match_report_match_id = int(match_report_id_input.strip())
         except ValueError:
             st.error(f"Match ID must be a whole number -- got {match_report_id_input!r}.")
+            st.session_state.pop("_match_report_result", None)
         else:
             with st.spinner("Compiling match report (this aggregates two full Team Reports -- can take a while)..."):
                 match_report = _fetch_report_safely(
                     lambda: _cached_match_report(rest_base_url, match_report_match_id), rest_base_url
                 )
+            # UX polish pass (Part A/B): stored in session_state and
+            # rendered below, outside this transient `if ..._clicked:` gate
+            # -- both the cross-link buttons AND the Export download button
+            # need to keep working across reruns they themselves trigger
+            # (or any other rerun elsewhere in the app); see
+            # `_render_cross_link_button`'s own module comment for the full
+            # "orphaned click" bug this fixes, found by actually testing it.
+            st.session_state["_match_report_result"] = {
+                "match_id": match_report_match_id, "data": match_report,
+            }
 
-            if match_report is not None:
-                if match_report.get("no_data"):
-                    st.info(match_report.get("reason", "No match report data available for this match_id."))
-                else:
-                    st.subheader(f"{' vs '.join(match_report['teams'])} (match_id={match_report_match_id})")
+    _mr_result = st.session_state.get("_match_report_result")
+    if _mr_result is not None:
+        match_report_match_id = _mr_result["match_id"]
+        match_report = _mr_result["data"]
+        if match_report is not None:
+            if match_report.get("no_data"):
+                st.info(match_report.get("reason", "No match report data available for this match_id."))
+            else:
+                st.subheader(f"{' vs '.join(match_report['teams'])} (match_id={match_report_match_id})")
 
-                    narrative_source = match_report.get("narrative_source", "unknown")
-                    st.markdown(f"**Narrative** _(source: {narrative_source})_")
-                    st.write(match_report.get("narrative", ""))
+                narrative_source = match_report.get("narrative_source", "unknown")
+                st.markdown(f"**Narrative** _(source: {narrative_source})_")
+                st.write(match_report.get("narrative", ""))
 
-                    team_cols = st.columns(len(match_report["teams"]))
-                    for col, team in zip(team_cols, match_report["teams"]):
-                        with col:
-                            st.markdown(f"**{team}**")
-                            team_report = match_report["team_reports"].get(team, {})
-                            if team_report.get("matches_used", 0) > 0:
-                                threat_by_zone = team_report.get("threat_by_pitch_zone") or {}
-                                for zone, value in threat_by_zone.items():
-                                    if value is not None:
-                                        st.metric(f"Threat ({zone})", f"{value * 100:.1f}%")
-                            else:
-                                st.caption("No 360 coverage for this match -- no zone/control data.")
+                team_cols = st.columns(len(match_report["teams"]))
+                for col, team in zip(team_cols, match_report["teams"]):
+                    with col:
+                        st.markdown(f"**{team}**")
+                        team_report = match_report["team_reports"].get(team, {})
+                        if team_report.get("matches_used", 0) > 0:
+                            threat_by_zone = team_report.get("threat_by_pitch_zone") or {}
+                            for zone, value in threat_by_zone.items():
+                                if value is not None:
+                                    st.metric(f"Threat ({zone})", f"{value * 100:.1f}%")
+                        else:
+                            st.caption("No 360 coverage for this match -- no zone/control data.")
 
-                            opposition = match_report["opposition_analysis"].get(team, {})
-                            long_pass_share = (opposition.get("build_up_tendency") or {}).get("long_pass_share")
-                            if long_pass_share is not None:
-                                st.metric("Build-up long-pass share", f"{long_pass_share * 100:.1f}%")
-                            set_piece_share = (opposition.get("set_piece_reliance") or {}).get("set_piece_shot_share")
-                            if set_piece_share is not None:
-                                st.metric("Set-piece shot share", f"{set_piece_share * 100:.1f}%")
+                        opposition = match_report["opposition_analysis"].get(team, {})
+                        long_pass_share = (opposition.get("build_up_tendency") or {}).get("long_pass_share")
+                        if long_pass_share is not None:
+                            st.metric("Build-up long-pass share", f"{long_pass_share * 100:.1f}%")
+                        set_piece_share = (opposition.get("set_piece_reliance") or {}).get("set_piece_shot_share")
+                        if set_piece_share is not None:
+                            st.metric("Set-piece shot share", f"{set_piece_share * 100:.1f}%")
 
-                    st.metric("Tactical alerts this match", match_report.get("alert_count", 0))
+                        # Cross-linking (UX polish pass, Part A). Real
+                        # navigation problem this closes (Step 0): a
+                        # team name appears in this compiled report with
+                        # no path to that team's own full Team Report.
+                        _render_cross_link_button(
+                            f"View full {team} Team Report →",
+                            target_tab="Team Reports",
+                            prefills={
+                                "team_report_preset_selectbox": "Custom",
+                                "team_report_name": team,
+                                "team_report_match_ids": str(match_report_match_id),
+                            },
+                        )
 
-                    with st.expander("Raw compiled match report data"):
-                        st.json(match_report)
+                st.metric("Tactical alerts this match", match_report.get("alert_count", 0))
+
+                with st.expander("Raw compiled match report data"):
+                    st.json(match_report)
+
+                # --- Export (UX polish pass, Part B) --------------------
+                # Mirrors exactly what's rendered above -- narrative,
+                # per-team metrics, alert count -- not the raw
+                # `pass_network`/`opposition_analysis` sub-dicts this
+                # tab itself never visualizes beyond the raw-JSON
+                # expander (see this section's own module-level comment
+                # for the full Step 0 scope).
+                _match_report_sections = [
+                    f"<h2>Narrative <em>(source: {html.escape(narrative_source)})</em></h2>"
+                    f"<p>{html.escape(match_report.get('narrative', ''))}</p>",
+                ]
+                for _team in match_report["teams"]:
+                    _team_report = match_report["team_reports"].get(_team, {})
+                    _opposition = match_report["opposition_analysis"].get(_team, {})
+                    _team_metrics: list[tuple[str, str]] = []
+                    if _team_report.get("matches_used", 0) > 0:
+                        for _zone, _value in (_team_report.get("threat_by_pitch_zone") or {}).items():
+                            if _value is not None:
+                                _team_metrics.append((f"Threat ({_zone})", f"{_value * 100:.1f}%"))
+                    _long_pass_share = (_opposition.get("build_up_tendency") or {}).get("long_pass_share")
+                    if _long_pass_share is not None:
+                        _team_metrics.append(("Build-up long-pass share", f"{_long_pass_share * 100:.1f}%"))
+                    _set_piece_share = (_opposition.get("set_piece_reliance") or {}).get("set_piece_shot_share")
+                    if _set_piece_share is not None:
+                        _team_metrics.append(("Set-piece shot share", f"{_set_piece_share * 100:.1f}%"))
+                    _match_report_sections.append(
+                        f"<h2>{html.escape(_team)}</h2>" + _html_metric_row(_team_metrics)
+                    )
+                _match_report_sections.append(
+                    _html_metric_row([("Tactical alerts this match", str(match_report.get("alert_count", 0)))])
+                )
+
+                _match_report_html = _build_standalone_html_export(
+                    title=f"Match Report -- {' vs '.join(match_report['teams'])} (match_id={match_report_match_id})",
+                    generated_note=(
+                        "Project Athena -- Automatic Match Report. Static, self-contained HTML -- "
+                        "opens directly from the filesystem, no server required."
+                    ),
+                    sections=_match_report_sections,
+                )
+                st.download_button(
+                    "Export Match Report (HTML)",
+                    data=_match_report_html,
+                    file_name=f"match_report_{match_report_match_id}.html",
+                    mime="text/html",
+                )
 
     # ========================================================================
     # Tactical Event Detection (new reporting track): OWN dedicated button/

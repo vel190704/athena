@@ -1,0 +1,69 @@
+# Production-readiness audit, Priority 4: the lightest viable direct-process
+# supervision for the FastAPI/uvicorn serving layer -- no container
+# infrastructure (Docker was tried, never validated end-to-end on this
+# machine, and has been removed -- see README.md's Docker row). This is a
+# real, if modest, improvement over "no supervision at all" (the prior real
+# state: a crashed process just stays down until a human notices and
+# re-runs the command by hand) -- NOT container-orchestration-grade
+# reliability. See README.md's "Production Readiness" section for exactly
+# what this does and does not provide.
+#
+# INSTALL (adjust the placeholders below for your machine first):
+#   sudo cp deploy/systemd/athena-api.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now athena-api.service
+#   systemctl status athena-api.service   # confirm it's running
+#   journalctl -u athena-api.service -f   # follow its logs
+#
+# UNINSTALL:
+#   sudo systemctl disable --now athena-api.service
+#   sudo rm /etc/systemd/system/athena-api.service
+#   sudo systemctl daemon-reload
+
+[Unit]
+Description=Project Athena -- FastAPI/uvicorn serving layer (production/src/serving/api.py)
+After=network.target
+# After 5 restarts within 60s, systemd gives up and leaves the service
+# stopped/failed -- the correct behavior for a genuinely broken process
+# (e.g. a bad deploy that crashes on every startup), not a tight forever
+# crash loop. See Restart=/RestartSec= below in [Service] for the restart
+# behavior itself.
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+
+# REPLACE with this project's real, absolute checkout path on the target
+# machine (the placeholder below matches this project's own directory name,
+# not a guess at where you keep it).
+WorkingDirectory=/opt/project-athena
+
+# REPLACE with the real, absolute path to this project's own .venv (created
+# per README.md's Quick Start, `python -m venv .venv && pip install -r
+# requirements-lock.txt`). Deliberately NOT `--reload` -- that is a
+# DEVELOPMENT flag (a file-watcher that restarts on every source change,
+# with real extra overhead); it is the wrong flag for anything this unit
+# file is meant to keep running unattended.
+ExecStart=/opt/project-athena/.venv/bin/uvicorn production.src.serving.api:app --host 0.0.0.0 --port 8000
+
+# Optional: PUBLIC_DEPLOYMENT, API_KEY, CORS_ALLOWED_ORIGINS, and any other
+# environment this process needs, kept OUT of this tracked unit file (same
+# reason `.env` is gitignored elsewhere in this project -- a secret does
+# not belong in a file that gets `cp`'d into /etc/systemd/system/ and read
+# by anyone with local access to inspect unit files). Create this file
+# yourself; it is entirely optional -- omit both this line and the file if
+# you have nothing to set.
+# EnvironmentFile=/opt/project-athena/deploy/athena-api.env
+
+# Real restart behavior this unit file actually provides: if the uvicorn
+# process exits for ANY reason other than a clean, explicit
+# `systemctl stop` (an unhandled exception, an OOM kill, a segfault) --
+# systemd restarts it automatically, waiting RestartSec between attempts.
+# See [Unit]'s own StartLimitIntervalSec/StartLimitBurst above for what
+# stops this from becoming an infinite crash loop.
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

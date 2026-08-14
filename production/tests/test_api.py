@@ -10,6 +10,8 @@ fixtures.
 import json
 import os
 import queue
+import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -387,6 +389,56 @@ def test_cv_source_does_not_block_event_loop_for_other_requests(monkeypatch):
         f"/simulate took {get_elapsed:.2f}s, close to or exceeding the CV stream's "
         f"{_SlowFakeCVPipeline.SLEEP_SECONDS}s blocking sleep -- the event loop may have been "
         "blocked by the CV connection rather than offloading it to a worker thread"
+    )
+
+
+def test_simulate_frame_lookup_does_not_block_event_loop_for_other_requests():
+    """Production-readiness audit (Category 4.2) fix: `_find_qualifying_frame_for_minute`
+    (real, uncached file I/O + JSON parse + linear scan, ~50-57ms measured)
+    was previously called directly/synchronously inside `/simulate`,
+    blocking the event loop for that whole duration -- confirmed directly:
+    8 concurrent /simulate requests took ~524ms EACH (vs. 62ms sequential)
+    before this fix, serialized rather than parallelized. Now wrapped in
+    `asyncio.to_thread`, the same pattern
+    `test_cv_source_does_not_block_event_loop_for_other_requests` above
+    already proves for the CV-source WebSocket path. This is the REST-side
+    equivalent proof: while several real /simulate requests are in flight
+    on background threads, a concurrent /health request must still return
+    quickly, not queue up behind them."""
+    with TestClient(app) as client:
+        health_latencies = []
+        stop_event = threading.Event()
+
+        def _poll_health():
+            while not stop_event.is_set():
+                t0 = time.monotonic()
+                response = client.get("/health")
+                assert response.status_code == 200
+                health_latencies.append(time.monotonic() - t0)
+                time.sleep(0.02)
+
+        def _hit_simulate():
+            client.get("/simulate?match_id=3857276&minute=10&action=no_change")
+
+        health_thread = threading.Thread(target=_poll_health)
+        health_thread.start()
+        time.sleep(0.05)  # let a few /health probes land before the /simulate batch starts
+
+        simulate_threads = [threading.Thread(target=_hit_simulate) for _ in range(8)]
+        for t in simulate_threads:
+            t.start()
+        for t in simulate_threads:
+            t.join(timeout=30)
+
+        time.sleep(0.05)
+        stop_event.set()
+        health_thread.join(timeout=10)
+
+    assert len(health_latencies) >= 3, "not enough /health samples collected during the /simulate batch"
+    median_latency = sorted(health_latencies)[len(health_latencies) // 2]
+    assert median_latency < 0.1, (
+        f"/health's median latency during a concurrent /simulate batch was {median_latency * 1000:.1f}ms -- "
+        "the event loop appears to still be blocked by the frame lookup"
     )
 
 
@@ -1153,6 +1205,32 @@ def test_alerts_history_endpoint_filters_by_source_and_match_id(isolated_alert_d
     assert len(all_rows) == 2
 
 
+def test_alerts_history_endpoint_sql_injection_payload_in_query_params_is_inert(isolated_alert_db):
+    """Production-readiness audit, Priority 0.3: a real, triggered proof
+    against the actual public entrypoint an attacker would use (query
+    params on GET /alerts/history), not just the underlying alert_store.py
+    functions directly (see test_alert_store.py for those). `source` gets
+    FastAPI's own `Literal["statsbomb", "cv"]` rejection (a 422, a separate,
+    shallower defense) -- this test targets `start_utc`, the one free-text
+    field FastAPI does NOT constrain, which reaches `fetch_alerts`'s real
+    SQL query unvalidated except by parameterization itself."""
+    alert_store.log_alert(
+        source="statsbomb", match_id=MATCH_ID, video_path=None, minute=10.0,
+        threat_before=0.05, threat_after=0.11, explanation_text="real alert", explanation_source="mock",
+    )
+
+    payload = "2020-01-01T00:00:00+00:00'; DROP TABLE alerts; --"
+    with TestClient(app) as client:
+        response = client.get("/alerts/history", params={"start_utc": payload})
+        assert response.status_code == 200, "must be treated as an inert string comparison, not a 500/SQL error"
+
+        # The table must still exist and still contain the real row --
+        # proves the injected DROP TABLE was never executed.
+        survivors = client.get("/alerts/history").json()
+    assert len(survivors) == 1
+    assert survivors[0]["explanation_text"] == "real alert"
+
+
 # ============================================================================
 # ADR-022: the single, optional API-key check. `api_module.API_KEY` is
 # monkeypatched directly (the same established pattern this file already
@@ -1220,6 +1298,110 @@ def test_api_key_set_websocket_rejects_missing_key_accepts_correct_one(monkeypat
         ) as websocket:
             message = websocket.receive_json()
             assert message["type"] == "threat"
+
+
+def test_api_key_check_uses_constant_time_comparison(monkeypatch):
+    """Production-readiness audit (Category 2.3) fix: guards against a
+    future regression back to naive `==` string comparison (a real
+    timing-attack surface -- an early-exit comparison leaks the length of
+    the correct prefix via response timing). This is about HOW the
+    comparison is done, not just whether it accepts/rejects correctly
+    (already covered above) -- confirms `_require_api_key` genuinely calls
+    `hmac.compare_digest`, by spying on the real function and letting it
+    still run for real underneath."""
+    monkeypatch.setattr(api_module, "API_KEY", "test-secret-key")
+    calls = []
+    real_compare_digest = api_module.hmac.compare_digest
+
+    def _spy_compare_digest(a, b):
+        calls.append((a, b))
+        return real_compare_digest(a, b)
+
+    monkeypatch.setattr(api_module.hmac, "compare_digest", _spy_compare_digest)
+
+    with TestClient(app) as client:
+        response = client.get(
+            "/reports/team/Argentina",
+            params={"match_ids": ARGENTINA_MATCH_IDS},
+            headers={"X-API-Key": "test-secret-key"},
+        )
+    assert response.status_code == 200
+    assert len(calls) == 1
+    assert calls[0] == ("test-secret-key", "test-secret-key")
+
+
+# ============================================================================
+# Production-readiness audit (Category 2.1): CORS.
+# ============================================================================
+
+
+def test_cors_headers_present_for_allowed_origin_absent_for_disallowed():
+    """A real, restrictive CORS policy, not FastAPI's own no-middleware
+    default. CORS is enforced by the BROWSER reading response headers, not
+    by the server refusing the request -- so the correct proof is "is the
+    right header present/absent," not "does the request succeed" (a
+    disallowed-origin request still reaches this server and gets a normal
+    200; a real browser would simply refuse to let its own JS read the
+    response body, which this test cannot observe directly, but the
+    ABSENCE of the allow-origin header is exactly what makes it do so)."""
+    with TestClient(app) as client:
+        allowed = client.get("/health", headers={"Origin": "http://localhost:8501"})
+        disallowed = client.get("/health", headers={"Origin": "http://evil.example.com"})
+
+    assert allowed.status_code == 200
+    assert allowed.headers.get("access-control-allow-origin") == "http://localhost:8501"
+    assert "access-control-allow-origin" not in disallowed.headers
+
+
+# ============================================================================
+# Production-readiness audit (Category 2.4): /docs, /redoc, /openapi.json
+# must be fully disabled once API_KEY is configured for a real deployment.
+# ============================================================================
+
+
+def test_docs_and_openapi_enabled_when_api_key_unset_the_real_default():
+    """The real, unmodified default every other test in this file already
+    depends on (API_KEY is never set anywhere in production/tests/, per
+    ADR-022) -- confirmed directly on the already-imported module, and via
+    a real request, not just an attribute check."""
+    assert api_module.API_KEY is None
+    assert app.docs_url == "/docs"
+    assert app.redoc_url == "/redoc"
+    assert app.openapi_url == "/openapi.json"
+
+    with TestClient(app) as client:
+        assert client.get("/docs").status_code == 200
+        assert client.get("/openapi.json").status_code == 200
+
+
+def test_docs_and_openapi_disabled_when_api_key_set_at_process_start():
+    """`docs_url`/`redoc_url`/`openapi_url` are baked into `FastAPI(...)`
+    at MODULE IMPORT time from the real `API_KEY` env var -- monkeypatching
+    `api_module.API_KEY` on the already-imported, already-constructed `app`
+    singleton (as every other ADR-022 test above does) cannot exercise this
+    construction-time branch; the app object already exists by then. This
+    launches a genuinely fresh subprocess with `API_KEY` set in its
+    environment -- the same way a real deployment would set it -- and
+    inspects the resulting app object directly, so the actual import-time
+    code path is really exercised, not merely reasoned about."""
+    env = {**os.environ, "API_KEY": "test-secret-key", "MLFLOW_ALLOW_FILE_STORE": "true"}
+    script = (
+        "import production.src.serving.api as api_module\n"
+        "assert api_module.API_KEY == 'test-secret-key'\n"
+        "assert api_module.app.docs_url is None, api_module.app.docs_url\n"
+        "assert api_module.app.redoc_url is None, api_module.app.redoc_url\n"
+        "assert api_module.app.openapi_url is None, api_module.app.openapi_url\n"
+        "from fastapi.testclient import TestClient\n"
+        "with TestClient(api_module.app) as client:\n"
+        "    assert client.get('/docs').status_code == 404\n"
+        "    assert client.get('/openapi.json').status_code == 404\n"
+        "print('OK')\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script], env=env, capture_output=True, text=True, timeout=60
+    )
+    assert result.returncode == 0, f"stdout={result.stdout}\nstderr={result.stderr}"
+    assert "OK" in result.stdout
 
 
 # ============================================================================
